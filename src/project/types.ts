@@ -26,12 +26,25 @@ export type BezierPoint = {
   handlesParallel?: boolean;
 };
 
+/**
+ * Seam allowance: the fabric left outside the seam line. `defaultCm` covers every
+ * edge that has no entry of its own in `edges`, which is keyed by the id of the
+ * point an edge starts at (it runs to the next point in winding order).
+ * Absent altogether means the standard allowance (half an inch) — see
+ * `src/pattern/seamAllowance.ts`.
+ */
+export type SeamAllowance = {
+  defaultCm: number;
+  edges?: Record<string, number>;
+};
+
 export type PatternPiece = {
   id: string;
   name: string;
   closed: boolean;
   points: BezierPoint[];
   grainline?: { from: Vec2; to: Vec2 };
+  seamAllowance?: SeamAllowance;
 };
 
 /**
@@ -92,6 +105,57 @@ export type PatternRuler = {
   half: boolean;
 };
 
+/**
+ * A point a measurement reads from.
+ *
+ * Neither kind is a control point of the piece, so measuring never changes what
+ * is being measured. An `edge` anchor is a *measure point*: the software drops
+ * it where a measure line crossed an edge, and it stores only a fraction along
+ * that edge — so a point halfway along an edge stays halfway when the outline is
+ * dragged, bent or resized, and deleting the measurement leaves the piece
+ * untouched.
+ */
+export type MeasureAnchor =
+  | { kind: 'point'; pieceId: string; pointId: string }
+  | {
+      kind: 'edge';
+      pieceId: string;
+      /** The edge it sits on, keyed the way every per-edge record in a document is. */
+      fromPointId: string;
+      toPointId: string;
+      /** Where along that edge, 0..1 of the edge's own parametrisation. */
+      t: number;
+    };
+
+/**
+ * One thing a measurement reads: a whole edge (its arc length), or the straight
+ * gap between two anchors. A measurement's value is the sum of its items.
+ */
+export type MeasureItem =
+  | { kind: 'edge'; pieceId: string; fromPointId: string; toPointId: string }
+  | { kind: 'span'; a: MeasureAnchor; b: MeasureAnchor };
+
+/**
+ * A measurement laid over the pattern, in a ruler-like drawing.
+ *
+ * It is the counterpart to a `PatternRuler`: a ruler is a physical rule whose
+ * length is a *person's* number, while a measurement reads the pattern itself
+ * and follows it live. Like a ruler it is a drafting reference, so editing one
+ * never leaves a mesh stale.
+ */
+export type PatternMeasure = {
+  id: string;
+  /** Where the readout sits in pattern space — dragged wherever you want it. */
+  label: Vec2;
+  items: MeasureItem[];
+  /**
+   * How many measurements this one totals, when it was made by summing others.
+   * Its `items` are copies of theirs, so it reads the same geometry live; the
+   * count is kept so the readout can say what it is.
+   */
+  sumOf?: number;
+};
+
 export type PatternDocument = {
   id: string;
   name: string;
@@ -99,6 +163,11 @@ export type PatternDocument = {
   seams: SeamBinding[];
   /** Drafting reference rulers (see `PatternRuler`). */
   rulers?: PatternRuler[];
+  /**
+   * Measurements taken off the pattern itself (see `PatternMeasure`). References
+   * only, like rulers — they record what was measured where, never geometry.
+   */
+  measures?: PatternMeasure[];
   /**
    * Parametric block instances (see `BlockInstance`). Their pieces live in
    * `pieces` like any other, so meshing, seams and export need no special case.

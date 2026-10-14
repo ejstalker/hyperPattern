@@ -10,6 +10,9 @@
   --wire: #c45c26aa;
   --border: #4a433a;
   --active: #2f6f4e;
+  /* IBM Plex is the whole type system: Sans everywhere the UI speaks, Mono for
+     anything read as a number, a code or a key. Both come from Google Fonts
+     (see the stylesheet link in index.html). */
   --font: "IBM Plex Sans", "Segoe UI", sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, monospace;
   /* Shared by the drape's "Draw pattern points" markers and the remesh view. */
@@ -19,6 +22,8 @@
   --block-tint: #bda6f0;
   /* The "this number moves that" highlight, distinct from selection and readouts. */
   --block-highlight: #ffc65c;
+  /* The seam allowance line: outside the seam line, so it is its own colour. */
+  --allowance: #6fb3a6;
 }
 
 * {
@@ -33,6 +38,17 @@ body {
   color: var(--ink);
   font-family: var(--font);
   overflow: hidden;
+}
+
+/* Form controls do not inherit the page font on their own, and every one of
+   them here is UI text. Element-level, so any rule that wants the mono face
+   still wins on its class. */
+button,
+input,
+select,
+textarea,
+optgroup {
+  font-family: inherit;
 }
 
 #app {
@@ -79,7 +95,8 @@ body {
   background: var(--panel);
   border: 1px solid var(--border);
   color: var(--ink);
-  padding: 5px 10px;
+  /* Icon-only: square, so the bar reads as a row of glyphs. */
+  padding: 6px;
   border-radius: 4px;
   cursor: pointer;
   font: inherit;
@@ -106,6 +123,75 @@ body {
 .studio-toolbar button:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+/* A banner button that owns a popover underneath it. */
+.toolbar-flyout {
+  position: relative;
+  display: inline-flex;
+}
+
+.toolbar-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 176px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+.toolbar-popover[hidden] {
+  display: none !important;
+}
+
+.toolbar-popover-title {
+  margin: 2px 4px 5px;
+  padding: 0 4px 6px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* Rows are full-width, not the banner's square icon buttons. */
+.studio-toolbar .toolbar-popover button {
+  width: 100%;
+  height: auto;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.studio-toolbar .toolbar-popover button:hover {
+  background: #3a342c;
+}
+
+.studio-toolbar .toolbar-popover button.is-active {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.toolbar-popover-code {
+  color: var(--muted);
+  font: 11px var(--mono);
+}
+
+.studio-toolbar .toolbar-popover button.is-active .toolbar-popover-code {
+  color: var(--ink);
+}
+
+.unit-popover {
+  min-width: 196px;
 }
 
 .studio-modal-toolbar .autosave-field {
@@ -369,6 +455,16 @@ body {
   outline-offset: -6px;
 }
 
+/* ⌘/Ctrl-drag on empty board: the node rectangle select. */
+.board-marquee {
+  position: absolute;
+  border: 1px solid var(--accent-2);
+  background: rgba(61, 126, 166, 0.16);
+  border-radius: 2px;
+  pointer-events: none;
+  z-index: 8;
+}
+
 .canvas-node > .node-body {
   border-radius: 0 0 8px 8px;
   overflow: hidden;
@@ -429,6 +525,77 @@ body {
 
 .canvas-node.sim-active {
   border-color: var(--active);
+}
+
+/*
+ * Where a node's own top-anchored overlays (the pattern ribbons, the viewport
+ * gnomon and shading control, the transform toggles) start inside the body.
+ *
+ * On the board the chrome strip rides *over* the viewport, so those overlays are
+ * pushed below it; expanded — and anywhere else the chrome is a real bar — the
+ * default stands.
+ */
+.canvas-node {
+  --node-top-inset: 8px;
+}
+
+.studio-board .canvas-node:not(.is-expanded):not(.node-text) {
+  --node-top-inset: 46px;
+}
+
+/*
+ * On the board a node's title and fullscreen button are drawn over the preview
+ * rather than taking a bar off the top of it, so the viewport gets the whole
+ * rectangle. The strip itself is transparent to the pointer — only the title
+ * chip and the button are live — so a gesture near the top of the viewport
+ * still lands on the viewport.
+ *
+ * Text notes keep their bar: it is a plain editor with no viewport to overlay,
+ * and the bar doubles as its drag handle.
+ */
+.studio-board .canvas-node:not(.is-expanded):not(.node-text) > .node-chrome {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9;
+  min-height: 0;
+  padding: 6px 8px;
+  background: none;
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  pointer-events: none;
+}
+
+/* The pattern rail is off the board (see "Chrome hidden on the board"), so the
+   strip needs no lateral offset: the title sits at the node's own corner, and
+   the bars that do stay up — the allowance and sew ribbons — are pushed below it
+   by `--node-top-inset`. */
+.studio-board .canvas-node:not(.is-expanded):not(.node-text) > .node-chrome > * {
+  pointer-events: auto;
+}
+
+/* Over a viewport the two chrome items need their own ground to sit on, so each
+   is a chip with the node panel's own translucency behind it. */
+.studio-board .canvas-node:not(.is-expanded):not(.node-text) > .node-chrome .node-title,
+.studio-board .canvas-node:not(.is-expanded):not(.node-text) > .node-chrome .node-expand-btn {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(18, 16, 14, 0.78);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.studio-board .canvas-node:not(.is-expanded):not(.node-text) > .node-chrome .node-title {
+  padding: 3px 8px;
+  border-radius: 5px;
+}
+
+.studio-board .canvas-node:not(.is-expanded):not(.node-text) > .node-chrome .node-expand-btn:hover {
+  background: rgba(38, 34, 29, 0.92);
+}
+
+/* The body is the whole node now, so it is rounded on every corner. */
+.studio-board .canvas-node:not(.is-expanded):not(.node-text) > .node-body {
+  border-radius: 8px;
 }
 
 .node-chrome {
@@ -707,6 +874,7 @@ body {
 .pattern-point-bar,
 .pattern-ruler-bar,
 .pattern-tool-settings,
+.pattern-allowance-bar,
 .pattern-block-bar,
 .pattern-avatar-bar,
 .pattern-xray-bar {
@@ -729,6 +897,7 @@ body {
 .pattern-point-bar[hidden],
 .pattern-ruler-bar[hidden],
 .pattern-tool-settings[hidden],
+.pattern-allowance-bar[hidden],
 .pattern-block-bar[hidden],
 .pattern-avatar-bar[hidden],
 .pattern-xray-bar[hidden] {
@@ -738,7 +907,7 @@ body {
 /* Selection chrome: the same top-left slot, never both at once (selecting a
    ruler clears the point selection, and vice versa). */
 .pattern-point-bar {
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   left: 8px;
   gap: 14px;
   color: var(--muted, #8a8278);
@@ -767,7 +936,7 @@ body {
 /* Tool settings: what the tool in hand is set to, in the top-left slot the
    point settings use — the two are never up together. */
 .pattern-tool-settings {
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   left: 8px;
   flex-wrap: wrap;
   gap: 10px;
@@ -776,6 +945,52 @@ body {
 
 .pattern-settings-title {
   color: var(--muted);
+}
+
+/* Seam allowance: the piece's allowance and the picked edge's own, plus the two
+   ways to spread a value around. */
+.pattern-allowance-bar {
+  top: var(--node-top-inset, 8px);
+  left: 8px;
+  flex-wrap: wrap;
+  gap: 8px;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+}
+
+.pattern-allowance-edge {
+  color: var(--ink);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pattern-allowance-unit {
+  color: var(--muted);
+}
+
+/* An edge following the piece default reads as a placeholder, not a value. */
+.pattern-allowance-bar input.is-inherited {
+  color: var(--muted);
+}
+
+.pattern-allowance-bar button {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pattern-allowance-bar button:hover:not(:disabled) {
+  border-color: var(--accent-2);
+}
+
+.pattern-allowance-bar button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 /* Segmented toggle: one button per setting, the one in force filled in — the
@@ -890,6 +1105,121 @@ body {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+
+/* ── Viewport zoom ──────────────────────────────────────────────────────────
+   A typed zoom, a lock that holds the level, and the hicon projection. They sit
+   just above the seam allowance button, in the rail's bottom cluster. */
+.pattern-zoom-menu {
+  width: 168px;
+  gap: 6px;
+  padding: 8px;
+}
+
+.pattern-zoom-title {
+  color: var(--muted);
+  font: 600 10px/1 var(--font);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.pattern-zoom-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pattern-toolbar .pattern-zoom-row button {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  padding: 0;
+  font-size: 14px;
+  justify-content: center;
+}
+
+.pattern-zoom-field {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+
+.pattern-zoom-field input {
+  width: 100%;
+  min-width: 0;
+  padding: 4px 0;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  font: 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.pattern-zoom-field input:focus {
+  outline: none;
+}
+
+.pattern-zoom-field:focus-within {
+  border-color: var(--accent);
+}
+
+.pattern-zoom-unit {
+  color: var(--muted);
+  font: 11px var(--mono);
+}
+
+.pattern-toolbar .pattern-zoom-menu .pattern-zoom-fit {
+  justify-content: center;
+}
+
+.pattern-toolbar .pattern-zoom-menu .pattern-zoom-lock {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.pattern-toolbar .pattern-zoom-menu .pattern-zoom-lock svg {
+  flex: 0 0 auto;
+}
+
+/* The lock lives in the popover, so the rail button carries the marker: a dot
+   when the level is held, readable with the popover shut. */
+.pattern-toolbar .pattern-zoom-btn.is-locked {
+  position: relative;
+  border-color: var(--accent);
+}
+
+.pattern-toolbar .pattern-zoom-btn.is-locked::after {
+  content: '';
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.pattern-zoom-hint {
+  color: var(--muted);
+  font: 10px/1.4 var(--mono);
+}
+
+.pattern-zoom-menu.is-locked .pattern-zoom-field,
+.pattern-toolbar .pattern-zoom-menu button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.pattern-toolbar .pattern-zoom-menu button:disabled:hover {
+  border-color: var(--border);
 }
 
 /* Hold-open measurement picker under the ruler tool. */
@@ -1292,7 +1622,7 @@ body {
 }
 
 .pattern-xray-bar {
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   right: 8px;
   font: 12px var(--font);
 }
@@ -1334,6 +1664,43 @@ body {
 
 .pattern-editor.is-xray .pattern-grain {
   opacity: max(0.4, var(--pattern-xray-opacity, 0.35));
+}
+
+/* Hicon projection: the pattern as a line drawing on paper — outlines and their
+   measurements in white, no fill, the allowance shown, and the grid doubled so
+   it still reads as a grid under all that white. Everything you cannot take off
+   the sheet with a pen is put away: seams, points, handles, grain, the selection
+   box and block containers. The fill keeps hit-testing (opacity 0, not `none`),
+   so pieces can still be picked and dragged. */
+.pattern-editor.is-hicon .pattern-grid {
+  opacity: 0.16;
+}
+
+.pattern-editor.is-hicon .pattern-fill {
+  fill-opacity: 0;
+  stroke: #fff;
+}
+
+.pattern-editor.is-hicon .pattern-length {
+  fill: #fff;
+  opacity: 1;
+}
+
+.pattern-editor.is-hicon .pattern-point,
+.pattern-editor.is-hicon .pattern-point.is-block,
+.pattern-editor.is-hicon .pattern-point.selected,
+.pattern-editor.is-hicon .pattern-handle,
+.pattern-editor.is-hicon .pattern-handle-line,
+.pattern-editor.is-hicon .pattern-grain,
+.pattern-editor.is-hicon .pattern-block-outline,
+.pattern-editor.is-hicon .pattern-block-driver,
+.pattern-editor.is-hicon .pattern-block-driver-point,
+.pattern-editor.is-hicon .pattern-selection-box,
+.pattern-editor.is-hicon .pattern-scale-handle,
+.pattern-editor.is-hicon .pattern-rotate-ring,
+.pattern-editor.is-hicon .pattern-seam-edge,
+.pattern-editor.is-hicon .pattern-seam-connector {
+  display: none;
 }
 
 .pattern-avatar-bar {
@@ -1775,6 +2142,226 @@ body {
   stroke: var(--block-tint);
 }
 
+/* ── Measurements ───────────────────────────────────────────────────────────
+   What a measurement reads is drawn like a dimension on a technical drawing:
+   the thing measured is lit underneath, and the value rides above it in a chip
+   you can take hold of and park anywhere. Artwork is pointer-events:none — the
+   editor hit-tests it analytically, like the rulers. */
+.pattern-measure-ref {
+  stroke: var(--accent-2);
+  opacity: 0.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pattern-measure-ref.is-hot {
+  stroke: #ffc65c;
+  opacity: 1;
+}
+
+.pattern-measure-ref-point {
+  fill: none;
+  stroke: var(--accent-2);
+  opacity: 0.9;
+}
+
+.pattern-measure-ref-point.is-hot {
+  stroke: #ffc65c;
+  fill: rgba(255, 198, 92, 0.35);
+}
+
+.pattern-measure-span,
+.pattern-measure-tick {
+  stroke: var(--accent-2);
+  stroke-linecap: round;
+  fill: none;
+}
+
+.pattern-measure.is-hot .pattern-measure-span,
+.pattern-measure.is-hot .pattern-measure-tick {
+  stroke: #ffc65c;
+}
+
+.pattern-measure-edge,
+.pattern-measure-dim {
+  stroke: var(--accent-2);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pattern-measure.is-hot .pattern-measure-edge,
+.pattern-measure.is-hot .pattern-measure-dim {
+  stroke: #ffc65c;
+}
+
+/* A mark at each end of what is measured, so the stops are visible even when
+   nothing is hovered. The ring marks a measure point — one the software placed
+   on an edge, which is not a control point of the piece. */
+.pattern-measure-stop {
+  fill: var(--accent-2);
+  stroke: #1c1a17;
+}
+
+.pattern-measure-stop.is-hot {
+  fill: #ffc65c;
+}
+
+.pattern-measure-stop-ring {
+  stroke: var(--accent-2);
+  opacity: 0.75;
+}
+
+.pattern-measure-stop-ring.is-hot {
+  stroke: #ffc65c;
+  opacity: 1;
+}
+
+.pattern-measure-value {
+  fill: var(--ink);
+  font-family: var(--mono);
+  pointer-events: none;
+}
+
+.pattern-measure-leader {
+  stroke: var(--accent-2);
+  opacity: 0.4;
+  fill: none;
+}
+
+.pattern-measure-chip {
+  fill: rgba(28, 26, 23, 0.86);
+  stroke: var(--border);
+}
+
+.pattern-measure.is-hot .pattern-measure-chip {
+  stroke: #ffc65c;
+}
+
+/* Stroke *widths* stay out of here: inside the SVG a bare number in CSS is user
+   units, not screen pixels, so a chip outline that reads as 1.6 comes out tens of
+   times too thick. The editor sets those through `px()` instead.
+
+   Gathered with Shift, waiting to be totalled. */
+.pattern-measure.is-gathered .pattern-measure-chip {
+  stroke: var(--accent);
+}
+
+.pattern-measure.is-gathered .pattern-measure-total {
+  fill: #ffc65c;
+}
+
+/* A measurement that stands for a total: its readout carries more weight, since
+   it is the number the others were gathered for. Nothing here may set a font
+   size in `em` — inside the SVG that resolves against the document root rather
+   than the `font-size` attribute the label is drawn with, which blows the text
+   up across the viewport. */
+.pattern-measure.is-sum .pattern-measure-chip {
+  fill: rgba(35, 31, 27, 0.94);
+  stroke: var(--accent-2);
+}
+
+.pattern-measure.is-sum .pattern-measure-total {
+  fill: #cfe6f5;
+  font-weight: 600;
+}
+
+.pattern-measure.is-sum .pattern-measure-parts {
+  fill: var(--accent-2);
+}
+
+.pattern-measure.is-sum .pattern-measure-dim,
+.pattern-measure.is-sum .pattern-measure-span,
+.pattern-measure.is-sum .pattern-measure-tick {
+  opacity: 0.5;
+}
+
+.pattern-measure-total {
+  fill: var(--ink);
+  font-family: var(--mono);
+  font-weight: 500;
+}
+
+.pattern-measure-parts {
+  fill: var(--muted);
+  font-family: var(--mono);
+}
+
+.pattern-measure.is-stale .pattern-measure-chip {
+  stroke: #a07020;
+}
+
+.pattern-measure.is-stale .pattern-measure-total {
+  fill: #d8a34a;
+}
+
+.pattern-measure.is-stale .pattern-measure-span,
+.pattern-measure.is-stale .pattern-measure-tick,
+.pattern-measure.is-stale .pattern-measure-edge,
+.pattern-measure.is-stale .pattern-measure-dim {
+  stroke: #a07020;
+}
+
+.pattern-measure.is-stale .pattern-measure-stop {
+  fill: #a07020;
+}
+
+.pattern-measure-line-draft {
+  stroke: var(--accent-2);
+  stroke-linecap: round;
+}
+
+/* The measure bar rides with the other bottom ribbons (see the shared rules
+   below); only its own pieces are set here. */
+.pattern-measure-title {
+  color: var(--muted);
+  font-weight: 600;
+  font-family: var(--font);
+}
+
+.pattern-measure-readout {
+  color: var(--ink);
+  max-width: 52ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pattern-measure-bar button.danger {
+  border-color: #a33b2c;
+  color: #f0a091;
+}
+
+.pattern-measure-bar button.danger:hover:not(:disabled) {
+  background: #a33b2c;
+  border-color: #a33b2c;
+  color: #fff;
+}
+
+/* The action the bar is really for once readouts are gathered. */
+.pattern-measure-bar [data-measure-sum] {
+  border-color: var(--accent);
+}
+
+.pattern-measure-bar [data-measure-sum]:disabled {
+  border-color: var(--border);
+}
+
+/* The two rows that put a ruler or a measure line in hand, above the picker. */
+.pattern-ruler-menu-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 4px 0;
+}
+
+.pattern-toolbar .pattern-ruler-menu-tools .pattern-ruler-item.is-tool {
+  font-family: var(--font);
+  font-size: 12px;
+}
+
+.pattern-toolbar .pattern-ruler-menu-tools .pattern-ruler-item.is-tool .pattern-ruler-item-value {
+  font-family: var(--font);
+}
+
 /* ── Rulers ─────────────────────────────────────────────────────────────────
    Drafting reference lines pinned over the pattern. They carry their person
    and measurement as text, so they read as a physical ruler left on the table
@@ -1857,7 +2444,7 @@ body {
 
 /* Ruler settings take over the same top-left slot while a ruler is selected. */
 .pattern-ruler-bar {
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   left: 8px;
   flex-wrap: wrap;
   gap: 8px;
@@ -1874,13 +2461,13 @@ body {
  * exclusive by selection.
  * ------------------------------------------------------------------------- */
 .pattern-block-bar {
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   left: 8px;
   flex-direction: column;
   align-items: stretch;
   gap: 6px;
   width: 348px;
-  max-height: calc(100% - 16px);
+  max-height: calc(100% - var(--node-top-inset, 8px) - 8px);
   padding: 7px 8px;
   box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
 }
@@ -2347,6 +2934,39 @@ body {
 }
 
 /* Sewing seams (Marvelous Designer–style edge bindings) */
+/* Seam allowance: the line outside the seam line, dashed the way a cutter reads
+   one, with the edge in hand lit up against it. */
+.pattern-allowance {
+  stroke: var(--allowance);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pattern-allowance-edge {
+  stroke: var(--allowance);
+  stroke-linecap: round;
+  fill: none;
+  pointer-events: none;
+}
+
+.pattern-allowance-edge.is-hover,
+.pattern-allowance-span.is-hover {
+  stroke: var(--accent-2);
+  opacity: 0.85;
+}
+
+.pattern-allowance-edge.is-picked,
+.pattern-allowance-span.is-picked {
+  stroke: var(--accent);
+}
+
+.pattern-allowance-span {
+  stroke: var(--allowance);
+  stroke-linecap: round;
+  fill: none;
+  pointer-events: none;
+}
+
 .pattern-seam-edge {
   stroke: var(--seam);
   stroke-linecap: round;
@@ -2394,7 +3014,7 @@ body {
 
 .pattern-sew-bar {
   position: absolute;
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   left: 50%;
   z-index: 8;
   display: flex;
@@ -2581,7 +3201,7 @@ body {
 
 .sim-transform-toggle {
   position: absolute;
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   left: 8px;
   z-index: 6;
   min-width: 62px;
@@ -2740,7 +3360,7 @@ body {
 /* "Draw pattern points" — sits to the right of the Move/Rotate toggle. */
 .sim-points-toggle {
   position: absolute;
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   left: 78px;
   z-index: 6;
   padding: 4px 9px;
@@ -2869,7 +3489,7 @@ body {
 
 .viewport-gnomon {
   position: absolute;
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   right: 8px;
   z-index: 4;
   display: flex;
@@ -2886,7 +3506,7 @@ body {
  */
 .viewport-shading {
   position: absolute;
-  top: 8px;
+  top: var(--node-top-inset, 8px);
   right: 100px;
   z-index: 5;
   display: flex;
@@ -3238,7 +3858,7 @@ body {
   fill: #fff;
   font-size: 9px;
   font-weight: 700;
-  font-family: "IBM Plex Sans", sans-serif;
+  font-family: var(--font);
   pointer-events: none;
 }
 
@@ -3254,7 +3874,7 @@ body {
   background: rgba(28, 26, 23, 0.75);
   color: #f2ebe3;
   cursor: pointer;
-  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-family: var(--mono);
 }
 
 .gnomon-proj-btn.is-ortho {
@@ -3330,6 +3950,30 @@ body {
 .studio-inspector h3 {
   margin: 0 0 12px;
   font-size: 15px;
+}
+
+/* Group selection: sits above the primary node's own panel. */
+.node-selection-notice {
+  border: 1px solid var(--accent-2);
+  background: color-mix(in srgb, var(--accent-2) 14%, transparent);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 0 0 12px;
+}
+
+.node-selection-notice p {
+  margin: 0 0 6px;
+}
+
+.node-selection-notice ul {
+  margin: 0 0 8px;
+  padding-left: 16px;
+  color: var(--ink);
+}
+
+.node-selection-actions {
+  display: flex;
+  gap: 6px;
 }
 
 .studio-inspector label {
@@ -3477,6 +4121,36 @@ body {
 }
 
 .studio-inspector button.danger:hover {
+  background: #5a2020;
+  color: #fff;
+}
+
+/* The group-selection notice's pair of actions: flat, side by side, and not the
+   full-width accent button the node panels use. */
+.studio-inspector .node-selection-actions button {
+  flex: 1;
+  margin-top: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 6px;
+}
+
+.studio-inspector .node-selection-actions button:hover {
+  border-color: var(--accent-2);
+}
+
+.studio-inspector .node-selection-actions button.danger {
+  width: auto;
+  background: transparent;
+  border-color: #a33;
+  color: #e88;
+}
+
+.studio-inspector .node-selection-actions button.danger:hover {
   background: #5a2020;
   color: #fff;
 }
@@ -4676,10 +5350,26 @@ body {
   color: #f0a091;
 }
 
+/* The Add menu: the same popover, its rows carrying which space the node opens
+   in (2D drafting or the 3D drape). */
+.board-context-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.board-menu-kind {
+  color: var(--muted);
+  font: 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+
 /* Join bar: where the two ends of a fuse are read, bottom centre with the other
    tool bars. */
 .pattern-join-bar,
-.pattern-bridge-bar {
+.pattern-bridge-bar,
+.pattern-measure-bar {
   position: absolute;
   bottom: 12px;
   left: 50%;
@@ -4699,7 +5389,8 @@ body {
 }
 
 .pattern-join-bar[hidden],
-.pattern-bridge-bar[hidden] {
+.pattern-bridge-bar[hidden],
+.pattern-measure-bar[hidden] {
   display: none !important;
 }
 
@@ -4721,14 +5412,16 @@ body {
 }
 
 .pattern-join-bar button,
-.pattern-bridge-bar button {
+.pattern-bridge-bar button,
+.pattern-measure-bar button {
   min-height: 24px;
   padding: 3px 7px;
   font-size: 11px;
 }
 
 .pattern-join-bar button[hidden],
-.pattern-bridge-bar button[hidden] {
+.pattern-bridge-bar button[hidden],
+.pattern-measure-bar button[hidden] {
   display: none !important;
 }
 
@@ -4747,7 +5440,8 @@ body {
 .pattern-simplify-bar button,
 .pattern-knife-bar button,
 .pattern-join-bar button,
-.pattern-bridge-bar button {
+.pattern-bridge-bar button,
+.pattern-measure-bar button {
   min-height: 24px;
   padding: 3px 9px;
   border: 1px solid var(--border);
@@ -4761,7 +5455,8 @@ body {
 .pattern-simplify-bar button:hover:not(:disabled),
 .pattern-knife-bar button:hover:not(:disabled),
 .pattern-join-bar button:hover:not(:disabled),
-.pattern-bridge-bar button:hover:not(:disabled) {
+.pattern-bridge-bar button:hover:not(:disabled),
+.pattern-measure-bar button:hover:not(:disabled) {
   background: #463f35;
   border-color: var(--muted);
 }
@@ -4769,7 +5464,8 @@ body {
 .pattern-simplify-bar button:disabled,
 .pattern-knife-bar button:disabled,
 .pattern-join-bar button:disabled,
-.pattern-bridge-bar button:disabled {
+.pattern-bridge-bar button:disabled,
+.pattern-measure-bar button:disabled {
   opacity: 0.45;
   cursor: default;
 }

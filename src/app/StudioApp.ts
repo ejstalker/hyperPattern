@@ -37,7 +37,7 @@ import type {
   SimCameraState,
 } from '../project/types';
 import { PatternEditor } from '../pattern/PatternEditor';
-import { sameSeamBindingPair } from '../pattern/geometry';
+import { remapSeamAllowance, sameSeamBindingPair } from '../pattern/geometry';
 import { DEFAULT_SEAM_GAP_CM } from '../mesh/triangulate';
 import { generateBlockPieces } from '../pattern/blocks/generate';
 import { getBlockDefinition } from '../pattern/blocks/registry';
@@ -50,6 +50,13 @@ import {
 import { AvatarPreview } from '../avatar/AvatarPreview';
 import { buildMeasurementRulers } from '../avatar/rulerOverlay';
 import { cachedMeasurementLibrary, loadMeasurementLibrary } from '../persistence/measurementLibrary';
+import {
+  isEmbeddedStage,
+  nodesInBoardRect,
+  planNodeDuplicates,
+  simChainIds,
+  type DuplicateLinks,
+} from '../project/nodeDuplicates';
 import { MeshPreview } from '../mesh/MeshPreview';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
 import { Environment, loadEnvironmentSettings } from '../render/environment';
@@ -58,15 +65,10 @@ import { Transform3dRuntime } from '../sim/Transform3dRuntime';
 import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from '../sim/transformDefaults';
 import {
   createIcons,
-  ClipboardList,
   FilePlus2,
   Folder,
-  Image as ImageIcon,
   Redo2,
   Ruler,
-  Scissors,
-  Shirt,
-  StickyNote,
   Undo2,
   UserRound,
 } from 'lucide';
@@ -87,15 +89,7 @@ import {
   setAutosaveIntervalMinutes,
 } from '../project/projectLibrary';
 import { HistoryManager } from '../project/history/HistoryManager';
-import {
-  AVATAR_UNIT_TO_WORLD,
-  avatarStatusLabel,
-  getAvatarPrefs,
-  importAvatarModel,
-  type AvatarCollisionMode,
-} from '../sim/avatarAsset';
 import { resetAvatarOverlayCache } from '../pattern/avatarPatternOverlay';
-import { DEFAULT_SDF_RESOLUTION } from '../mesh/sdfBake';
 import { buildAvatarMeshes, collisionSummaryText, createAvatarBodyFromAvatar } from '../avatar/avatarService';
 import { updateAvatar } from '../persistence/avatarLibrary';
 import type { Avatar } from '../project/avatars';
@@ -181,6 +175,13 @@ export class StudioApp {
   /** Scene materials, shared by every 3D viewport like the environment. */
   private materials = new MaterialLibrary();
   private selectedNodeId: string | null = null;
+  /** Every selected node, in the order they were picked; `selectedNodeId` is the
+   *  primary one (the last picked), which the inspector shows. */
+  private selectedNodeIds: string[] = [];
+  /** True while the node board is the surface the pointer last touched, so
+   *  Backspace / Delete belong to the nodes rather than to a pattern editor
+   *  sitting on the same board. */
+  private boardSurfaceActive = true;
   /** Fixed-position tip host (escapes inspector overflow clipping). */
   private inspectorTipEl: HTMLDivElement | null = null;
   /** Avatar editor dialog, when open. */
@@ -190,7 +191,21 @@ export class StudioApp {
   private avatarRulersVisible = true;
   private panning = false;
   private panLast = { x: 0, y: 0 };
-  private draggingNode: { id: string; ox: number; oy: number } | null = null;
+  /** Nodes in flight, with the grab offset each one started from. */
+  private draggingNodes: { id: string; ox: number; oy: number }[] | null = null;
+  /**
+   * Nodes picked on empty board space, in flight. `base` is the selection the
+   * drag started from, so shrinking the rectangle drops nodes again.
+   */
+  private nodeMarquee: {
+    el: HTMLElement;
+    startX: number;
+    startY: number;
+    x: number;
+    y: number;
+    base: string[];
+    moved: boolean;
+  } | null = null;
   private wireDrag: WireDrag | null = null;
   private resizingNode: {
     id: string;
@@ -207,7 +222,6 @@ export class StudioApp {
   private gpuInitGeneration = 0;
   private modalRoot: HTMLElement;
   private importFileInput: HTMLInputElement;
-  private avatarLoadAbort: AbortController | null = null;
   private undoStack = new HistoryManager();
   private autosaveTimer: ReturnType<typeof setInterval> | null = null;
   private persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -270,6 +284,7 @@ export class StudioApp {
     this.bindImageImport();
     this.bindBoardPan();
     this.bindNodeContextMenu();
+    this.bindBoardHotkeys();
     this.bindUndoHotkey();
     this.bindImagePasteAndDrop();
     window.addEventListener('resize', () => this.drawWires());
@@ -433,6 +448,7 @@ export class StudioApp {
     cameras?: CameraSnapshot
   ): Promise<void> {
     const expandedId = this.expandedNodeId;
+    const prevSelectedNodeIds = this.selectedNodeIds.slice();
     const prevSelectedNodeId = this.selectedNodeId;
     const prevTransformPieceId = this.transformInspectorPieceId;
     const needsRemount =
@@ -444,11 +460,12 @@ export class StudioApp {
       // so undo/redo never moves or zooms the viewport.
       if (cameras) this.applyLiveCameras(cameras);
       void setActiveProjectId(this.project.id);
+      const alive = new Set(this.project.canvas.nodes.map((n) => n.id));
+      this.selectedNodeIds = prevSelectedNodeIds.filter((id) => alive.has(id));
       this.selectedNodeId =
-        prevSelectedNodeId &&
-        this.project.canvas.nodes.some((n) => n.id === prevSelectedNodeId)
+        prevSelectedNodeId && alive.has(prevSelectedNodeId)
           ? prevSelectedNodeId
-          : null;
+          : (this.selectedNodeIds[this.selectedNodeIds.length - 1] ?? null);
       this.transformInspectorPieceId = prevTransformPieceId;
       this.syncProjectChrome();
 
@@ -626,6 +643,65 @@ export class StudioApp {
         : 'Nothing to redo';
     }
   }
+
+  /**
+   * Backspace / Delete on the node board, and Escape to drop the selection.
+   *
+   * Registered in the capture phase while the constructor runs — before any node
+   * (and so any pattern editor, which also listens on document in the capture
+   * phase) is mounted — so the board gets first refusal. When the board is the
+   * surface the pointer last touched, a delete is consumed here and a pattern
+   * editor sitting on the board never sees it.
+   */
+  private bindBoardHotkeys(): void {
+    document.addEventListener('keydown', this.onBoardKeyDown, true);
+    // Which surface owns the keyboard is decided by the press, not by focus: node
+    // and board presses all `preventDefault`, so focus stays wherever it was.
+    document.addEventListener(
+      'pointerdown',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        const wrap = document.getElementById('boardWrap');
+        this.boardSurfaceActive = !!(
+          target &&
+          wrap?.contains(target) &&
+          !target.closest(
+            'button, input, textarea, select, [contenteditable="true"], .pattern-editor, canvas'
+          )
+        );
+      },
+      true
+    );
+  }
+
+  private onBoardKeyDown = (e: KeyboardEvent): void => {
+    // The node menu owns Escape, and a delete underneath an open menu would
+    // leave it pointing at a node that is gone.
+    if (this.expandedNodeId || this.isStudioModalOpen() || this.nodeMenu) return;
+    if (!this.boardSurfaceActive) return;
+    const target = e.target as HTMLElement | null;
+    if (
+      target &&
+      (target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.tagName === 'SELECT' ||
+        target.isContentEditable)
+    ) {
+      return;
+    }
+    if (e.key === 'Backspace' || e.key === 'Delete') {
+      if (this.selectedNodeIds.length === 0) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      this.deleteSelectedNodes();
+      return;
+    }
+    if (e.key === 'Escape' && this.selectedNodeIds.length > 0) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      this.clearNodeSelection();
+    }
+  };
 
   private bindUndoHotkey(): void {
     window.addEventListener('keydown', (e) => {
@@ -813,6 +889,7 @@ export class StudioApp {
     if (images.length === 0) return;
     this.pushUndo();
     const anchor = this.boardPointFromClient(at?.clientX, at?.clientY);
+    const added: string[] = [];
     let offset = 0;
     for (const file of images) {
       try {
@@ -838,12 +915,13 @@ export class StudioApp {
         };
         this.project.canvas.nodes.push(node);
         this.mountNode(node);
-        this.selectedNodeId = node.id;
+        added.push(node.id);
         offset += 24;
       } catch {
         this.setStatus(`Could not load image “${file.name}”`);
       }
     }
+    if (added.length > 0) this.selectNodes(added);
     this.layoutNodes();
     this.drawWires();
     this.renderInspector();
@@ -871,6 +949,7 @@ export class StudioApp {
     this.project = this.prepareLoadedProject(project);
     void setActiveProjectId(project.id);
     this.markDirty();
+    this.selectedNodeIds = [];
     this.selectedNodeId = null;
     this.transformInspectorPieceId = null;
     if (opts.resetUndo !== false) {
@@ -922,8 +1001,6 @@ export class StudioApp {
   private closeModal(): void {
     // Undo/redo remounts the canvas; don't dismiss an open dialog as a side effect.
     if (this.restoringUndo) return;
-    this.avatarLoadAbort?.abort();
-    this.avatarLoadAbort = null;
     // Flushes any pending write before the dialog is torn down.
     this.avatarModal?.close();
     this.avatarModal = null;
@@ -1122,230 +1199,6 @@ export class StudioApp {
   private openProjectsModal(): void {
     this.modalRoot.hidden = false;
     void this.renderProjectsModal();
-  }
-
-  private openAvatarModal(): void {
-    const prefs = getAvatarPrefs();
-    const collisionMode: AvatarCollisionMode = prefs.useSdf
-      ? prefs.sdfFileName
-        ? 'load-sdf'
-        : 'bake-sdf'
-      : 'triangle';
-    this.modalRoot.hidden = false;
-    this.modalRoot.innerHTML = `
-      <div class="studio-modal-backdrop" data-modal-dismiss>
-        <div class="studio-modal studio-modal-sm" role="dialog" aria-labelledby="avatarTitle">
-          <div class="studio-modal-header">
-            <h2 id="avatarTitle">Load avatar model</h2>
-            <button type="button" class="studio-modal-close" data-modal-close aria-label="Close">×</button>
-          </div>
-          <p class="muted avatar-modal-current">Current: ${this.escapeHtml(avatarStatusLabel())}</p>
-          <div class="avatar-modal-form">
-            <label class="avatar-field">
-              <span>Viewport mesh (OBJ)</span>
-              <input type="file" accept=".obj" id="avatarFile" />
-              <small class="muted">Leave empty to keep the current mesh (${this.escapeHtml(prefs.objFileName)}).</small>
-            </label>
-            <label class="avatar-field">
-              <span>Import scale</span>
-              <input type="number" id="avatarScale" min="0.001" step="0.1" value="${prefs.unitToWorld}" />
-              <small class="muted">World units per OBJ unit (default 10 for meter OBJs). Does not rescale an imported SDF.</small>
-            </label>
-            <label class="avatar-field">
-              <span>Collision</span>
-              <select id="avatarCollisionMode">
-                <option value="triangle" ${collisionMode === 'triangle' ? 'selected' : ''}>Triangle mesh</option>
-                <option value="load-sdf" ${collisionMode === 'load-sdf' ? 'selected' : ''}>Load SDF / OpenVDB from disk</option>
-                <option value="bake-sdf" ${collisionMode === 'bake-sdf' ? 'selected' : ''}>Bake SDF from viewport mesh</option>
-              </select>
-            </label>
-            <label class="avatar-field" id="avatarSdfFileWrap" hidden>
-              <span>Collision SDF (.sdf / .vdb)</span>
-              <input type="file" accept=".sdf,.vdb,application/octet-stream" id="avatarSdfFile" />
-              <small class="muted">PCSD .sdf loads instantly. OpenVDB .vdb is densified on import (uses resolution below) and cached as .sdf in refPpl/.</small>
-            </label>
-            <label class="avatar-field" id="avatarSdfResWrap" hidden>
-              <span>SDF resolution</span>
-              <input type="number" id="avatarSdfRes" min="32" max="128" step="8" value="${prefs.sdfResolution || DEFAULT_SDF_RESOLUTION}" />
-              <small class="muted">Used for bake and OpenVDB densify. 48 = fast · 64 = balanced · 96 = high quality.</small>
-            </label>
-            <div class="avatar-progress" id="avatarProgress" hidden>
-              <div class="avatar-progress-bar"><div class="avatar-progress-fill" id="avatarProgressFill"></div></div>
-              <span class="muted" id="avatarProgressText"></span>
-            </div>
-          </div>
-          <div class="studio-modal-actions">
-            <button type="button" data-avatar-act="cancel" id="avatarCancelBtn">Cancel</button>
-            <button type="button" class="primary" data-avatar-act="load" disabled id="avatarLoadBtn">Load</button>
-          </div>
-        </div>
-      </div>
-    `;
-
-    const fileInput = this.modalRoot.querySelector('#avatarFile') as HTMLInputElement;
-    const sdfFileInput = this.modalRoot.querySelector('#avatarSdfFile') as HTMLInputElement;
-    const loadBtn = this.modalRoot.querySelector('#avatarLoadBtn') as HTMLButtonElement;
-    const cancelBtn = this.modalRoot.querySelector('#avatarCancelBtn') as HTMLButtonElement;
-    const modeSelect = this.modalRoot.querySelector('#avatarCollisionMode') as HTMLSelectElement;
-    const sdfFileWrap = this.modalRoot.querySelector('#avatarSdfFileWrap') as HTMLElement;
-    const sdfResWrap = this.modalRoot.querySelector('#avatarSdfResWrap') as HTMLElement;
-
-    const syncModeUi = () => {
-      const mode = modeSelect.value as AvatarCollisionMode;
-      sdfFileWrap.hidden = mode !== 'load-sdf';
-      // Resolution applies to bake and OpenVDB densify.
-      sdfResWrap.hidden = mode === 'triangle';
-      updateLoadEnabled();
-    };
-
-    const updateLoadEnabled = () => {
-      const mode = modeSelect.value as AvatarCollisionMode;
-      const hasSdf = !!sdfFileInput.files?.length;
-      if (mode === 'load-sdf') {
-        loadBtn.disabled = !hasSdf;
-      } else {
-        // Bake / triangle can use the current mesh if no new OBJ is chosen.
-        loadBtn.disabled = false;
-      }
-    };
-
-    modeSelect.addEventListener('change', syncModeUi);
-    fileInput.addEventListener('change', updateLoadEnabled);
-    sdfFileInput.addEventListener('change', updateLoadEnabled);
-    syncModeUi();
-
-    this.modalRoot.querySelector('[data-modal-dismiss]')?.addEventListener('click', (e) => {
-      if (e.target === e.currentTarget) {
-        if (this.avatarLoadAbort) this.avatarLoadAbort.abort();
-        else this.closeModal();
-      }
-    });
-    this.modalRoot.querySelector('[data-modal-close]')?.addEventListener('click', () => {
-      if (this.avatarLoadAbort) this.avatarLoadAbort.abort();
-      else this.closeModal();
-    });
-    cancelBtn.addEventListener('click', () => {
-      if (this.avatarLoadAbort) {
-        this.avatarLoadAbort.abort();
-        return;
-      }
-      this.closeModal();
-    });
-    this.modalRoot.querySelector('[data-avatar-act="load"]')?.addEventListener('click', () => {
-      void this.handleAvatarLoad();
-    });
-  }
-
-  private async handleAvatarLoad(): Promise<void> {
-    const fileInput = this.modalRoot.querySelector('#avatarFile') as HTMLInputElement;
-    const sdfFileInput = this.modalRoot.querySelector('#avatarSdfFile') as HTMLInputElement;
-    const scaleInput = this.modalRoot.querySelector('#avatarScale') as HTMLInputElement;
-    const modeSelect = this.modalRoot.querySelector('#avatarCollisionMode') as HTMLSelectElement;
-    const sdfResInput = this.modalRoot.querySelector('#avatarSdfRes') as HTMLInputElement;
-    const progressWrap = this.modalRoot.querySelector('#avatarProgress') as HTMLElement;
-    const progressFill = this.modalRoot.querySelector('#avatarProgressFill') as HTMLElement;
-    const progressText = this.modalRoot.querySelector('#avatarProgressText') as HTMLElement;
-    const loadBtn = this.modalRoot.querySelector('#avatarLoadBtn') as HTMLButtonElement;
-    const cancelBtn = this.modalRoot.querySelector('#avatarCancelBtn') as HTMLButtonElement;
-
-    const meshFile = fileInput.files?.[0] ?? null;
-    const sdfFile = sdfFileInput.files?.[0] ?? null;
-    const collisionMode = modeSelect.value as AvatarCollisionMode;
-
-    if (collisionMode === 'load-sdf' && !sdfFile) {
-      this.setStatus('Choose a collision SDF file');
-      return;
-    }
-
-    if (!this.device) {
-      try {
-        const gpu = await createSharedGpu();
-        this.device = gpu.device;
-      } catch (err) {
-        this.setStatus(`WebGPU unavailable: ${err}`);
-        return;
-      }
-    }
-
-    const unitToWorld = parseFloat(scaleInput.value) || AVATAR_UNIT_TO_WORLD;
-    const sdfResolution = parseInt(sdfResInput.value, 10) || DEFAULT_SDF_RESOLUTION;
-
-    this.avatarLoadAbort?.abort();
-    const abort = new AbortController();
-    this.avatarLoadAbort = abort;
-
-    loadBtn.disabled = true;
-    fileInput.disabled = true;
-    sdfFileInput.disabled = true;
-    scaleInput.disabled = true;
-    modeSelect.disabled = true;
-    sdfResInput.disabled = true;
-    cancelBtn.textContent =
-      collisionMode === 'bake-sdf' || collisionMode === 'load-sdf' ? 'Cancel import' : 'Cancel';
-    progressWrap.hidden = false;
-    progressFill.style.width = '0%';
-    progressText.textContent = 'Starting…';
-
-    const resetForm = () => {
-      this.avatarLoadAbort = null;
-      loadBtn.disabled = false;
-      fileInput.disabled = false;
-      sdfFileInput.disabled = false;
-      scaleInput.disabled = false;
-      modeSelect.disabled = false;
-      sdfResInput.disabled = false;
-      cancelBtn.textContent = 'Cancel';
-    };
-
-    try {
-      const body = await importAvatarModel({
-        meshFile,
-        sdfFile,
-        unitToWorld,
-        collisionMode,
-        sdfResolution,
-        device: this.device,
-        signal: abort.signal,
-        onProgress: (message, progress) => {
-          progressText.textContent = message;
-          if (progress !== undefined) {
-            progressFill.style.width = `${Math.round(progress * 100)}%`;
-          }
-        },
-      });
-
-      for (const rt of this.simRuntimes.values()) {
-        rt.setAvatarBody(body);
-      }
-      for (const rt of this.transformRuntimes.values()) {
-        rt.setAvatarBody(body);
-      }
-      resetAvatarOverlayCache();
-      for (const ed of this.editors.values()) {
-        ed.reloadAvatarOverlay();
-      }
-
-      this.avatarLoadAbort = null;
-      this.closeModal();
-      const modeLabel =
-        collisionMode === 'load-sdf'
-          ? 'SDF from disk'
-          : collisionMode === 'bake-sdf'
-            ? 'baked SDF'
-            : 'triangle collision';
-      this.setStatus(`Avatar loaded (${modeLabel}) — ${avatarStatusLabel()}`);
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        progressText.textContent = 'Cancelled — previous avatar unchanged.';
-        progressFill.style.width = '0%';
-        this.setStatus('Avatar import cancelled');
-        resetForm();
-        return;
-      }
-      progressText.textContent = err instanceof Error ? err.message : String(err);
-      this.setStatus(`Avatar import failed: ${err}`);
-      resetForm();
-    }
   }
 
   private async renderProjectsModal(): Promise<void> {
@@ -1569,23 +1422,24 @@ export class StudioApp {
 
   private buildToolbar(): void {
     this.toolbar.innerHTML = `
-      <button type="button" data-act="new"><i data-lucide="file-plus-2" aria-hidden="true"></i><span>New</span></button>
-      <button type="button" data-act="projects"><i data-lucide="folder" aria-hidden="true"></i><span>Projects</span></button>
+      <button type="button" data-act="new" title="New project" aria-label="New project"><i data-lucide="file-plus-2" aria-hidden="true"></i></button>
+      <button type="button" data-act="projects" title="Projects" aria-label="Projects"><i data-lucide="folder" aria-hidden="true"></i></button>
       <div class="toolbar-sep"></div>
       <input class="project-name" id="projectName" value="" aria-label="Project name" />
       <div class="toolbar-sep"></div>
-      <button type="button" data-act="undo" disabled title="Nothing to undo" aria-label="Undo"><i data-lucide="undo-2" aria-hidden="true"></i><span>Undo</span></button>
-      <button type="button" data-act="redo" disabled title="Nothing to redo" aria-label="Redo"><i data-lucide="redo-2" aria-hidden="true"></i><span>Redo</span></button>
+      <button type="button" data-act="undo" disabled title="Nothing to undo" aria-label="Undo"><i data-lucide="undo-2" aria-hidden="true"></i></button>
+      <button type="button" data-act="redo" disabled title="Nothing to redo" aria-label="Redo"><i data-lucide="redo-2" aria-hidden="true"></i></button>
       <div class="toolbar-sep"></div>
-      <button type="button" data-act="loadAvatar"><i data-lucide="user-round" aria-hidden="true"></i><span>Load avatar model</span></button>
-      <button type="button" data-act="avatars" title="Avatars: measurements + generated 3D models"><i data-lucide="clipboard-list" aria-hidden="true"></i><span>Avatars</span></button>
+      <button type="button" data-act="avatars" title="Avatars: measurements + generated 3D models" aria-label="Avatars"><i data-lucide="user-round" aria-hidden="true"></i></button>
       <div class="toolbar-sep"></div>
-      <button type="button" data-act="unit" title="Display units"><i data-lucide="ruler" aria-hidden="true"></i><span>Units</span></button>
-      <div class="toolbar-sep"></div>
-      <button type="button" data-act="addPattern"><i data-lucide="scissors" aria-hidden="true"></i><span>+ Pattern</span></button>
-      <button type="button" data-act="addSim"><i data-lucide="shirt" aria-hidden="true"></i><span>+ Sim</span></button>
-      <button type="button" data-act="addText"><i data-lucide="sticky-note" aria-hidden="true"></i><span>+ Note</span></button>
-      <button type="button" data-act="addImage" title="Add image reference (or paste / drop on canvas)"><i data-lucide="image" aria-hidden="true"></i><span>+ Image</span></button>
+      <div class="toolbar-flyout">
+        <button type="button" data-act="unit" title="Display units" aria-label="Display units" aria-haspopup="true" aria-expanded="false"><i data-lucide="ruler" aria-hidden="true"></i></button>
+        <div class="toolbar-popover unit-popover" hidden role="dialog" aria-label="Display units">
+          <span class="toolbar-popover-title">Display units</span>
+          <button type="button" data-unit="cm" role="menuitemradio">Centimetres <span class="toolbar-popover-code">cm</span></button>
+          <button type="button" data-unit="in" role="menuitemradio">Inches <span class="toolbar-popover-code">in</span></button>
+        </div>
+      </div>
     `;
     this.syncProjectChrome();
     this.updateHistoryButtons();
@@ -1594,10 +1448,18 @@ export class StudioApp {
       this.project.name = (e.target as HTMLInputElement).value;
     });
     this.toolbar.addEventListener('click', (e) => {
+      const unitChoice = (e.target as HTMLElement).closest(
+        'button[data-unit]'
+      ) as HTMLButtonElement | null;
+      if (unitChoice) {
+        this.setDisplayUnit(unitChoice.dataset.unit === 'in' ? 'in' : 'cm');
+        return;
+      }
       const btn = (e.target as HTMLElement).closest('button[data-act]') as HTMLButtonElement | null;
       if (!btn || btn.disabled) return;
       void this.onToolbar(btn.dataset.act!);
     });
+    this.bindUnitPopover();
     this.updateUnitButton();
     // Swap every <i data-lucide="…"> for its inline SVG.
     createIcons({
@@ -1606,22 +1468,70 @@ export class StudioApp {
         Folder,
         Undo2,
         Redo2,
-        UserRound,
         Ruler,
-        ClipboardList,
-        Scissors,
-        Shirt,
-        StickyNote,
-        Image: ImageIcon,
+        UserRound,
       },
     });
   }
 
+  /**
+   * The banner ruler button opens a small popover rather than toggling: the unit
+   * is a setting with two named values, and a button that silently flips between
+   * them reads as "toggle something" — the popover says which one is live.
+   */
+  private bindUnitPopover(): void {
+    const btn = this.toolbar.querySelector('button[data-act="unit"]') as HTMLButtonElement;
+    const popover = this.unitPopover()!;
+    // The toggle itself runs through the toolbar's delegated click handler
+    // (`onToolbar('unit')`), so the button does not get a second listener.
+    document.addEventListener('pointerdown', (e) => {
+      if (popover.hidden) return;
+      const target = e.target as Node;
+      if (popover.contains(target) || btn.contains(target)) return;
+      this.setUnitPopoverOpen(false);
+    });
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !popover.hidden) this.setUnitPopoverOpen(false);
+    });
+    window.addEventListener('resize', () => this.setUnitPopoverOpen(false));
+  }
+
+  private unitPopover(): HTMLElement | null {
+    return this.toolbar.querySelector('.unit-popover') as HTMLElement | null;
+  }
+
+  private setUnitPopoverOpen(open: boolean): void {
+    const popover = this.unitPopover();
+    const btn = this.toolbar.querySelector('button[data-act="unit"]') as HTMLButtonElement | null;
+    if (!popover || !btn) return;
+    popover.hidden = !open;
+    btn.setAttribute('aria-expanded', String(open));
+  }
+
+  /** Both units spelled out on the popover's rows; the live one is marked. */
   private updateUnitButton(): void {
-    const btn = this.toolbar.querySelector('[data-act="unit"]') as HTMLButtonElement | null;
-    // Leave the icon in place — only the label changes.
-    const label = btn?.querySelector('span');
-    if (label) label.textContent = `Units: ${this.project.displayUnit}`;
+    const btn = this.toolbar.querySelector('button[data-act="unit"]') as HTMLButtonElement | null;
+    if (btn) btn.title = `Display units: ${this.project.displayUnit} · click to choose`;
+    this.unitPopover()
+      ?.querySelectorAll('button[data-unit]')
+      .forEach((row) => {
+        const el = row as HTMLButtonElement;
+        const mine = el.dataset.unit === this.project.displayUnit;
+        el.classList.toggle('is-active', mine);
+        el.setAttribute('aria-checked', String(mine));
+      });
+  }
+
+  /** Display units are document data, so every canvas follows and the file records it. */
+  private setDisplayUnit(unit: 'cm' | 'in'): void {
+    this.setUnitPopoverOpen(false);
+    if (this.project.displayUnit === unit) return;
+    this.pushUndo();
+    this.project.displayUnit = unit;
+    this.updateUnitButton();
+    this.editors.forEach((ed) => ed.setUnit(unit));
+    this.meshPreviews.forEach((p) => p.setUnit(unit));
+    this.markDirty();
   }
 
   private async onToolbar(act: string): Promise<void> {
@@ -1638,53 +1548,32 @@ export class StudioApp {
       case 'projects':
         this.openProjectsModal();
         break;
-      case 'loadAvatar':
-        this.openAvatarModal();
-        break;
       case 'measurements':
       case 'avatars':
         this.openAvatarEditor();
         break;
       case 'unit':
-        this.pushUndo();
-        this.project.displayUnit = this.project.displayUnit === 'cm' ? 'in' : 'cm';
-        this.updateUnitButton();
-        this.editors.forEach((ed) => ed.setUnit(this.project.displayUnit));
-        this.meshPreviews.forEach((p) => p.setUnit(this.project.displayUnit));
-        // The unit is document data — make sure the choice reaches the file.
-        this.markDirty();
-        break;
-      case 'addPattern':
-        this.pushUndo();
-        this.addPatternFrame();
-        break;
-      case 'addSim':
-        this.pushUndo();
-        this.addSimViewport();
-        break;
-      case 'addText':
-        this.pushUndo();
-        this.addTextNote();
-        break;
-      case 'addImage':
-        this.imageFileInput.click();
+        this.setUnitPopoverOpen(this.unitPopover()?.hidden ?? true);
         break;
     }
   }
 
   private nodeMenu: HTMLElement | null = null;
 
-  /** Right-click a node on the board for its duplicate / delete popover. */
+  /**
+   * Right-click on the board: a node gets its duplicate / delete popover, empty
+   * canvas gets the Add menu that puts a new node under the pointer.
+   */
   private bindNodeContextMenu(): void {
-    this.board.addEventListener('contextmenu', (e) => {
+    const wrap = document.getElementById('boardWrap')!;
+    wrap.addEventListener('contextmenu', (e) => {
       const el = (e.target as HTMLElement).closest('.canvas-node') as HTMLElement | null;
       const node = el
         ? this.project.canvas.nodes.find((n) => n.id === el.dataset.nodeId)
         : undefined;
-      // Empty board keeps the browser menu.
-      if (!node) return;
       e.preventDefault();
-      this.showNodeMenu(node, e.clientX, e.clientY);
+      if (node) this.showNodeMenu(node, e.clientX, e.clientY);
+      else this.showBoardMenu(e.clientX, e.clientY);
     });
     // Any press elsewhere, plus Esc / resize / pan / zoom, dismisses the popover.
     document.addEventListener('pointerdown', () => this.closeNodeMenu());
@@ -1695,21 +1584,29 @@ export class StudioApp {
   }
 
   private showNodeMenu(node: CanvasNode, clientX: number, clientY: number): void {
-    this.selectedNodeId = node.id;
-    this.layoutNodes();
-    this.renderInspector();
+    // Right-clicking inside a group keeps it: the menu then acts on all of it.
+    if (this.isNodeSelected(node.id)) this.selectNodes(this.selectedNodeIds, node.id);
+    else this.selectNodes([node.id]);
     this.openNodeMenu(node, clientX, clientY);
   }
 
   private openNodeMenu(node: CanvasNode, clientX: number, clientY: number): void {
     this.closeNodeMenu();
+    const count = this.selectedNodeIds.length;
+    const many = count > 1;
     const menu = document.createElement('div');
     menu.className = 'node-context-menu';
     menu.setAttribute('role', 'menu');
     menu.innerHTML = `
-      <p class="node-context-title">${this.escapeHtml(this.nodeLabel(node))}</p>
-      <button type="button" role="menuitem" data-node-act="duplicate">Duplicate node</button>
-      <button type="button" role="menuitem" data-node-act="delete" class="is-danger">Delete node</button>
+      <p class="node-context-title">${
+        many ? this.escapeHtml(`${count} nodes selected`) : this.escapeHtml(this.nodeLabel(node))
+      }</p>
+      <button type="button" role="menuitem" data-node-act="duplicate">Duplicate ${
+        many ? `${count} nodes` : 'node'
+      }</button>
+      <button type="button" role="menuitem" data-node-act="delete" class="is-danger">Delete ${
+        many ? `${count} nodes` : 'node'
+      }</button>
     `;
     // Keep the press inside the popover from reaching the dismiss listener.
     menu.addEventListener('pointerdown', (e) => e.stopPropagation());
@@ -1724,12 +1621,58 @@ export class StudioApp {
       const act = btn.dataset.nodeAct;
       this.closeNodeMenu();
       if (act === 'duplicate') {
-        const dup = this.duplicateNode(node.id, { recordUndo: true, select: true });
-        if (dup) this.setStatus(`Duplicated · ${this.nodeLabel(dup)}`);
+        this.duplicateNodeGroup(this.selectedNodeIds, { offsetX: 32, offsetY: 32 });
       } else if (act === 'delete') {
-        this.deleteNode(node.id);
+        this.deleteSelectedNodes();
       }
     });
+    this.mountBoardPopover(menu, clientX, clientY);
+  }
+
+  /** The Add menu: a right-click on empty canvas drops a node where you clicked. */
+  private showBoardMenu(clientX: number, clientY: number): void {
+    this.closeNodeMenu();
+    const menu = document.createElement('div');
+    menu.className = 'node-context-menu board-context-menu';
+    menu.setAttribute('role', 'menu');
+    menu.innerHTML = `
+      <p class="node-context-title">Add to canvas</p>
+      <button type="button" role="menuitem" data-board-act="pattern">New pattern <span class="board-menu-kind">2D</span></button>
+      <button type="button" role="menuitem" data-board-act="sim">New drape <span class="board-menu-kind">3D</span></button>
+      <button type="button" role="menuitem" data-board-act="text">Note</button>
+      <button type="button" role="menuitem" data-board-act="image">Image reference…</button>
+    `;
+    menu.addEventListener('pointerdown', (e) => e.stopPropagation());
+    menu.addEventListener('contextmenu', (e) => e.preventDefault());
+    menu.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest(
+        'button[data-board-act]'
+      ) as HTMLButtonElement | null;
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const act = btn.dataset.boardAct;
+      const at = { clientX, clientY };
+      this.closeNodeMenu();
+      if (act === 'pattern') {
+        this.pushUndo();
+        this.addPatternFrame(at);
+      } else if (act === 'sim') {
+        this.pushUndo();
+        this.addSimViewport(at);
+      } else if (act === 'text') {
+        this.pushUndo();
+        this.addTextNote(at);
+      } else if (act === 'image') {
+        // The picker writes into the same input paste and drop use.
+        this.imageFileInput.click();
+      }
+    });
+    this.mountBoardPopover(menu, clientX, clientY);
+  }
+
+  /** Foot a board popover at the pointer, nudged to stay inside the window. */
+  private mountBoardPopover(menu: HTMLElement, clientX: number, clientY: number): void {
     menu.style.left = `${clientX}px`;
     menu.style.top = `${clientY}px`;
     document.body.appendChild(menu);
@@ -1758,13 +1701,26 @@ export class StudioApp {
         this.panLast = { x: e.clientX, y: e.clientY };
         wrap.setPointerCapture(e.pointerId);
         e.preventDefault();
+        return;
       }
+      if (e.button !== 0) return;
+      // ⌘/Ctrl on empty board: rectangle-select nodes (as on the 2D canvas,
+      // where ⌘/Ctrl is the panel-marquee modifier too).
+      if (e.metaKey || e.ctrlKey) {
+        this.beginNodeMarquee(e);
+        return;
+      }
+      if (this.selectedNodeIds.length > 0) this.clearNodeSelection();
     });
     // Suppress browser middle-click autoscroll affordance on the board.
     wrap.addEventListener('auxclick', (e) => {
       if (e.button === 1) e.preventDefault();
     });
     wrap.addEventListener('pointermove', (e) => {
+      if (this.nodeMarquee) {
+        this.updateNodeMarquee(e);
+        return;
+      }
       if (this.wireDrag) {
         const rect = wrap.getBoundingClientRect();
         this.wireDrag.x = e.clientX - rect.left;
@@ -1788,18 +1744,27 @@ export class StudioApp {
         this.applyNodeResize(e.clientX, e.clientY);
         return;
       }
-      if (this.draggingNode) {
+      if (this.draggingNodes) {
         const zoom = this.project.canvas.zoom;
-        const node = this.project.canvas.nodes.find((n) => n.id === this.draggingNode!.id);
-        if (node) {
-          node.x = (e.clientX - this.project.canvas.panX) / zoom - this.draggingNode.ox;
-          node.y = (e.clientY - this.project.canvas.panY) / zoom - this.draggingNode.oy;
-          this.layoutNodes();
-          this.drawWires();
+        for (const drag of this.draggingNodes) {
+          const node = this.project.canvas.nodes.find((n) => n.id === drag.id);
+          if (!node) continue;
+          node.x = (e.clientX - this.project.canvas.panX) / zoom - drag.ox;
+          node.y = (e.clientY - this.project.canvas.panY) / zoom - drag.oy;
         }
+        this.layoutNodes();
+        this.drawWires();
       }
     });
     wrap.addEventListener('pointerup', (e) => {
+      if (this.nodeMarquee) {
+        this.finishNodeMarquee();
+        try {
+          wrap.releasePointerCapture(e.pointerId);
+        } catch {
+          /* capture may already be released */
+        }
+      }
       if (this.wireDrag) {
         this.finishWireDrag(e.clientX, e.clientY);
         try {
@@ -1808,14 +1773,18 @@ export class StudioApp {
           /* capture may already be released */
         }
       }
+      // A move or a resize is a document edit: without this it would only reach
+      // the file on the next autosave.
+      if (this.draggingNodes || this.resizingNode) this.markDirty();
       this.panning = false;
-      this.draggingNode = null;
+      this.draggingNodes = null;
       this.resizingNode = null;
     });
     wrap.addEventListener('pointercancel', () => {
       this.cancelWireDrag();
+      this.cancelNodeMarquee();
       this.panning = false;
-      this.draggingNode = null;
+      this.draggingNodes = null;
       this.resizingNode = null;
     });
     wrap.addEventListener(
@@ -1891,7 +1860,7 @@ export class StudioApp {
       el.style.top = `${node.y}px`;
       el.style.width = `${node.width}px`;
       el.style.height = `${node.height}px`;
-      el.classList.toggle('selected', node.id === this.selectedNodeId);
+      el.classList.toggle('selected', this.isNodeSelected(node.id));
       el.classList.toggle(
         'sim-active',
         node.type === 'simViewport' && (node as SimViewportNode).simId === this.project.activeSimId
@@ -1951,7 +1920,7 @@ export class StudioApp {
     this.expandedNodeId = nodeId;
     this.expandPlaceholder = placeholder;
     this.expandOverlay = overlay;
-    this.selectedNodeId = nodeId;
+    this.selectNodes([nodeId]);
     this.dockInspectorToFullscreen();
     this.syncFullscreenTabs(el, nodeId);
     this.layoutNodes();
@@ -2110,7 +2079,7 @@ export class StudioApp {
     this.setExpandButtonMode(nextEl, true);
     this.expandOverlay.appendChild(nextEl);
     this.expandedNodeId = nextId;
-    this.selectedNodeId = nextId;
+    this.selectNodes([nextId]);
     this.dockInspectorToFullscreen();
     this.syncFullscreenTabs(nextEl, nextId);
     this.layoutNodes();
@@ -2269,24 +2238,13 @@ export class StudioApp {
     mesh?: MeshDocument;
     transform?: Transform3dInstance;
   } {
-    const tLink = this.project.transformSimAssignments.find((a) => a.simId === simId);
-    const transform = tLink
-      ? this.project.transforms.find((t) => t.id === tLink.transformId)
+    const { meshId, transformId } = simChainIds(this.project, simId);
+    const transform = transformId
+      ? this.project.transforms.find((t) => t.id === transformId)
       : undefined;
-    let mesh = transform
-      ? (this.project.meshes.find((m) => m.id === transform.meshId) ??
-        this.project.meshes.find((m) =>
-          this.project.meshTransformAssignments.some(
-            (a) => a.transformId === transform.id && a.meshId === m.id
-          )
-        ))
-      : undefined;
-    if (!mesh) {
-      const link = this.project.assignments.find((a) => a.simId === simId);
-      mesh = link ? this.project.meshes.find((m) => m.id === link.meshId) : undefined;
-    }
+    const mesh = meshId ? this.project.meshes.find((m) => m.id === meshId) : undefined;
     const pattern = mesh
-      ? this.project.patterns.find((p) => p.id === mesh!.patternId)
+      ? this.project.patterns.find((p) => p.id === mesh.patternId)
       : undefined;
     return { pattern, mesh, transform };
   }
@@ -2297,13 +2255,7 @@ export class StudioApp {
    * stale the way a persisted flag would.
    */
   private isEmbeddedNode(node: CanvasNode): boolean {
-    if (node.type !== 'meshFrame' && node.type !== 'transform3d') return false;
-    for (const sim of this.project.sims) {
-      const chain = this.simChain(sim.id);
-      if (node.type === 'meshFrame' && chain.mesh?.id === node.meshId) return true;
-      if (node.type === 'transform3d' && chain.transform?.id === node.transformId) return true;
-    }
-    return false;
+    return isEmbeddedStage(this.project, node);
   }
 
   /** Keep the `is-embedded` class in step with the current wiring. */
@@ -2940,33 +2892,183 @@ export class StudioApp {
     }
   }
 
+  private isNodeSelected(nodeId: string): boolean {
+    return this.selectedNodeIds.includes(nodeId);
+  }
+
+  /**
+   * Replace the node selection. `primary` is the node whose inspector is shown —
+   * the one just clicked — and defaults to the last of `ids`.
+   */
+  private selectNodes(ids: readonly string[], primary?: string | null): void {
+    this.applyNodeSelection(ids, primary);
+    this.layoutNodes();
+    this.renderInspector();
+  }
+
+  /** The selection without the inspector pass: for live marquee updates. */
+  private applyNodeSelection(ids: readonly string[], primary?: string | null): void {
+    this.selectedNodeIds = [...new Set(ids)].filter((id) =>
+      this.project.canvas.nodes.some((n) => n.id === id)
+    );
+    this.selectedNodeId =
+      primary && this.selectedNodeIds.includes(primary)
+        ? primary
+        : (this.selectedNodeIds[this.selectedNodeIds.length - 1] ?? null);
+  }
+
+  private clearNodeSelection(): void {
+    if (this.selectedNodeIds.length === 0 && !this.selectedNodeId) return;
+    this.applyNodeSelection([]);
+    this.layoutNodes();
+    this.renderInspector();
+    // "3 nodes selected" must not outlive the selection it was about.
+    this.setStatus('');
+  }
+
+  /** Add the node to the selection, or take it out when it is already picked. */
+  private toggleNodeSelection(nodeId: string): void {
+    const ids = this.selectedNodeIds.filter((id) => id !== nodeId);
+    if (ids.length === this.selectedNodeIds.length) ids.push(nodeId);
+    this.selectNodes(ids, nodeId);
+    this.setStatus(
+      this.selectedNodeIds.length > 1 ? `${this.selectedNodeIds.length} nodes selected` : ''
+    );
+  }
+
+  /** Board coordinates from a point measured from the board wrap's top-left. */
+  private boardFromWrap(x: number, y: number): { x: number; y: number } {
+    const { panX, panY, zoom } = this.project.canvas;
+    return { x: (x - panX) / zoom, y: (y - panY) / zoom };
+  }
+
+  /** ⌘/Ctrl-drag on empty board: rectangle-select whole nodes. */
+  private beginNodeMarquee(e: PointerEvent): void {
+    const wrap = document.getElementById('boardWrap')!;
+    const rect = wrap.getBoundingClientRect();
+    const el = document.createElement('div');
+    el.className = 'board-marquee';
+    wrap.appendChild(el);
+    const additive = e.shiftKey;
+    this.nodeMarquee = {
+      el,
+      startX: e.clientX - rect.left,
+      startY: e.clientY - rect.top,
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+      base: additive ? [...this.selectedNodeIds] : [],
+      moved: false,
+    };
+    this.placeNodeMarquee();
+    wrap.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }
+
+  private updateNodeMarquee(e: PointerEvent): void {
+    const marquee = this.nodeMarquee;
+    if (!marquee) return;
+    const rect = document.getElementById('boardWrap')!.getBoundingClientRect();
+    marquee.x = e.clientX - rect.left;
+    marquee.y = e.clientY - rect.top;
+    if (Math.hypot(marquee.x - marquee.startX, marquee.y - marquee.startY) > 2) {
+      marquee.moved = true;
+    }
+    this.placeNodeMarquee();
+    // The rectangle is drawn in wrap-relative screen space; the nodes are hit in
+    // board space.
+    const a = this.boardFromWrap(marquee.startX, marquee.startY);
+    const b = this.boardFromWrap(marquee.x, marquee.y);
+    const hits = nodesInBoardRect(
+      this.project.canvas.nodes,
+      {
+        x: Math.min(a.x, b.x),
+        y: Math.min(a.y, b.y),
+        width: Math.abs(b.x - a.x),
+        height: Math.abs(b.y - a.y),
+      },
+      (node) => this.isEmbeddedNode(node)
+    ).map((node) => node.id);
+    this.applyNodeSelection([...marquee.base, ...hits]);
+    this.layoutNodes();
+  }
+
+  private placeNodeMarquee(): void {
+    const marquee = this.nodeMarquee;
+    if (!marquee) return;
+    marquee.el.style.left = `${Math.min(marquee.startX, marquee.x)}px`;
+    marquee.el.style.top = `${Math.min(marquee.startY, marquee.y)}px`;
+    marquee.el.style.width = `${Math.abs(marquee.x - marquee.startX)}px`;
+    marquee.el.style.height = `${Math.abs(marquee.y - marquee.startY)}px`;
+  }
+
+  private finishNodeMarquee(): void {
+    const marquee = this.nodeMarquee;
+    if (!marquee) return;
+    this.nodeMarquee = null;
+    marquee.el.remove();
+    // A click rather than a drag: ⌘/Ctrl-click on empty board clears the way a
+    // plain click does, so the modifier is not a trap.
+    if (!marquee.moved && marquee.base.length === 0) {
+      this.clearNodeSelection();
+      return;
+    }
+    this.renderInspector();
+    this.setStatus(
+      this.selectedNodeIds.length > 1 ? `${this.selectedNodeIds.length} nodes selected` : ''
+    );
+  }
+
+  private cancelNodeMarquee(): void {
+    const marquee = this.nodeMarquee;
+    if (!marquee) return;
+    this.nodeMarquee = null;
+    marquee.el.remove();
+    this.selectNodes(marquee.base);
+  }
+
   private beginNodeDrag(node: CanvasNode, e: PointerEvent): void {
     // Secondary buttons belong to the context menu, not to dragging.
     if (e.button !== 0) return;
     if (this.expandedNodeId === node.id) return;
+    // Shift or ⌘/Ctrl adds the node to the selection (or drops it), so a drag
+    // moves a group. Without a modifier the click picks just this node.
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+    if (additive && !e.altKey) {
+      this.toggleNodeSelection(node.id);
+      if (!this.isNodeSelected(node.id)) return;
+    } else if (!this.isNodeSelected(node.id)) {
+      this.selectNodes([node.id]);
+    } else {
+      // Already part of the selection: keep the group, make this the primary.
+      this.selectNodes(this.selectedNodeIds, node.id);
+    }
     this.pushUndo();
 
-    let dragTarget = node;
-    // Option/Alt-drag: leave the original in place and drag a duplicate
+    let targets = this.selectedNodeIds.slice();
+    // Option/Alt-drag: leave the originals in place and drag duplicates.
     if (e.altKey) {
-      const dup = this.duplicateNode(node.id, {
+      const copies = this.duplicateNodeGroup(targets, {
         offsetX: 0,
         offsetY: 0,
         recordUndo: false,
-        select: true,
+        select: false,
+        announce: false,
       });
-      if (dup) dragTarget = dup;
-    } else {
-      this.selectedNodeId = node.id;
-      this.renderInspector();
+      if (copies.length > 0) {
+        targets = copies.map((copy) => copy.id);
+        this.selectNodes(targets, targets[targets.length - 1]);
+      }
     }
 
     const zoom = this.project.canvas.zoom;
-    this.draggingNode = {
-      id: dragTarget.id,
-      ox: (e.clientX - this.project.canvas.panX) / zoom - dragTarget.x,
-      oy: (e.clientY - this.project.canvas.panY) / zoom - dragTarget.y,
-    };
+    this.draggingNodes = targets
+      .map((id) => this.project.canvas.nodes.find((n) => n.id === id))
+      .filter((n): n is CanvasNode => !!n)
+      .map((n) => ({
+        id: n.id,
+        ox: (e.clientX - this.project.canvas.panX) / zoom - n.x,
+        oy: (e.clientY - this.project.canvas.panY) / zoom - n.y,
+      }));
     this.layoutNodes();
     e.preventDefault();
   }
@@ -3068,9 +3170,10 @@ export class StudioApp {
       handle.addEventListener('pointerdown', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        this.selectedNodeId = node.id;
+        if (!this.isNodeSelected(node.id)) this.selectNodes([node.id]);
+        else this.selectNodes(this.selectedNodeIds, node.id);
         this.pushUndo();
-        this.draggingNode = null;
+        this.draggingNodes = null;
         const zoom = this.project.canvas.zoom;
         this.resizingNode = {
           id: node.id,
@@ -4318,10 +4421,45 @@ export class StudioApp {
     this.hideInspectorTip();
     const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
     if (!node) {
-      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · Shift-click pieces to multi-select (drag or rotate the group around their shared pivot) · empty drag to orbit · Shift-drag empty space to raise/lower orbit · Move/Rotate toggle · R = 90° local X · Snap to quadrant reveals the two 2 × 8 grids: click a piece, then click a cell to centre it there · wheel zoom.<br/>Sim: drag fabric to move · Shift-click to multi-select · Play to simulate drape · Draw pattern points shows the pattern's anchor points on the fabric — click one to edit it in a small overlay (Cancel/Apply above it; Apply remeshes and rebuilds the drape).</p>`;
+      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom. Shift- or ⌘/Ctrl-click a node, or ⌘/Ctrl-drag the board, to select several at once, then ⌘/Ctrl+D to duplicate the whole set — links between the copies stay between the copies. ⌫ / Delete removes the selection.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · Shift-click pieces to multi-select (drag or rotate the group around their shared pivot) · empty drag to orbit · Shift-drag empty space to raise/lower orbit · Move/Rotate toggle · R = 90° local X · Snap to quadrant reveals the two 2 × 8 grids: click a piece, then click a cell to centre it there · wheel zoom.<br/>Sim: drag fabric to move · Shift-click to multi-select · Play to simulate drape · Draw pattern points shows the pattern's anchor points on the fabric — click one to edit it in a small overlay (Cancel/Apply above it; Apply remeshes and rebuilds the drape).</p>`;
       return;
     }
+    this.renderNodeInspector(node);
+    this.prependSelectionNotice();
+  }
 
+  /** A group selection: name the set and offer the two group actions. */
+  private prependSelectionNotice(): void {
+    const ids = this.selectedNodeIds;
+    if (ids.length < 2) return;
+    const notice = document.createElement('div');
+    notice.className = 'node-selection-notice';
+    const names = ids
+      .map((id) => {
+        const selected = this.project.canvas.nodes.find((n) => n.id === id);
+        return selected ? `<li>${this.escapeHtml(this.nodeLabel(selected))}</li>` : '';
+      })
+      .join('');
+    notice.innerHTML = `
+      <p class="muted">${ids.length} nodes selected · ⌘/Ctrl+D duplicates the set · ⌫ deletes it · Esc clears it</p>
+      <ul>${names}</ul>
+      <div class="node-selection-actions">
+        <button type="button" data-selection-act="duplicate">Duplicate ${ids.length} nodes</button>
+        <button type="button" data-selection-act="delete" class="danger">Delete ${ids.length} nodes</button>
+      </div>
+    `;
+    notice.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest(
+        'button[data-selection-act]'
+      ) as HTMLButtonElement | null;
+      if (!btn) return;
+      if (btn.dataset.selectionAct === 'duplicate') this.duplicateSelectedNode();
+      else this.deleteSelectedNodes();
+    });
+    this.inspector.prepend(notice);
+  }
+
+  private renderNodeInspector(node: CanvasNode): void {
     if (node.type === 'transform3d') {
       const transform = this.project.transforms.find((t) => t.id === node.transformId)!;
       const rt = this.transformRuntimes.get(transform.id);
@@ -4828,7 +4966,9 @@ export class StudioApp {
 
   private bindDeleteButton(nodeId: string): void {
     this.inspector.querySelector('#deleteNode')?.addEventListener('click', () => {
-      this.deleteNode(nodeId);
+      // The inspector belongs to the whole selection, so this drops all of it.
+      if (this.isNodeSelected(nodeId)) this.deleteSelectedNodes();
+      else this.deleteNode(nodeId);
     });
   }
 
@@ -4872,81 +5012,99 @@ export class StudioApp {
     this.project.assignments = this.project.assignments.filter((a) => a.meshId !== meshId);
   }
 
-  private deleteNode(nodeId: string): void {
-    const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
-    if (!node) return;
-    if (!confirm('Delete this node?')) return;
+  /**
+   * Remove nodes from the board. Undo covers this, so there is no confirmation —
+   * the document behind a node is only dropped once the last node using it goes.
+   */
+  private deleteNodes(nodeIds: readonly string[]): void {
+    const nodes = nodeIds
+      .map((id) => this.project.canvas.nodes.find((n) => n.id === id))
+      .filter((n): n is CanvasNode => !!n);
+    if (nodes.length === 0) return;
     this.pushUndo();
 
-    this.project.canvas.nodes = this.project.canvas.nodes.filter((n) => n.id !== nodeId);
+    const gone = new Set(nodes.map((n) => n.id));
+    this.project.canvas.nodes = this.project.canvas.nodes.filter((n) => !gone.has(n.id));
 
-    if (node.type === 'simViewport') {
-      const simId = node.simId;
-      // Capture the internal chain before the wiring is torn down.
-      const chain = this.simChain(simId);
-      const stillUsed = this.project.canvas.nodes.some(
-        (n) => n.type === 'simViewport' && n.simId === simId
-      );
-      if (!stillUsed) {
-        const rt = this.simRuntimes.get(simId);
-        rt?.cloth?.destroy();
-        this.simRuntimes.delete(simId);
-        this.project.sims = this.project.sims.filter((s) => s.id !== simId);
-        this.project.assignments = this.project.assignments.filter((a) => a.simId !== simId);
-        this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
-          (a) => a.simId !== simId
+    for (const node of nodes) {
+      if (node.type === 'simViewport') {
+        const simId = node.simId;
+        // Capture the internal chain before the wiring is torn down.
+        const chain = this.simChain(simId);
+        const stillUsed = this.project.canvas.nodes.some(
+          (n) => n.type === 'simViewport' && n.simId === simId
         );
-        this.dropEmbeddedChain(chain);
-        if (this.project.activeSimId === simId) this.project.activeSimId = null;
-      }
-    } else if (node.type === 'meshFrame') {
-      const meshId = node.meshId;
-      const stillUsed = this.project.canvas.nodes.some(
-        (n) => n.type === 'meshFrame' && n.meshId === meshId
-      );
-      if (!stillUsed) {
-        this.project.meshes = this.project.meshes.filter((m) => m.id !== meshId);
-        this.project.assignments = this.project.assignments.filter((a) => a.meshId !== meshId);
-        this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
-          (a) => a.meshId !== meshId
+        if (!stillUsed) {
+          const rt = this.simRuntimes.get(simId);
+          rt?.cloth?.destroy();
+          this.simRuntimes.delete(simId);
+          this.project.sims = this.project.sims.filter((s) => s.id !== simId);
+          this.project.assignments = this.project.assignments.filter((a) => a.simId !== simId);
+          this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
+            (a) => a.simId !== simId
+          );
+          this.dropEmbeddedChain(chain);
+          if (this.project.activeSimId === simId) this.project.activeSimId = null;
+        }
+      } else if (node.type === 'meshFrame') {
+        const meshId = node.meshId;
+        const stillUsed = this.project.canvas.nodes.some(
+          (n) => n.type === 'meshFrame' && n.meshId === meshId
         );
-      }
-    } else if (node.type === 'transform3d') {
-      const transformId = node.transformId;
-      const stillUsed = this.project.canvas.nodes.some(
-        (n) => n.type === 'transform3d' && n.transformId === transformId
-      );
-      if (!stillUsed) {
-        const rt = this.transformRuntimes.get(transformId);
-        rt?.cloth?.destroy();
-        this.transformRuntimes.delete(transformId);
-        this.project.transforms = this.project.transforms.filter((t) => t.id !== transformId);
-        this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
-          (a) => a.transformId !== transformId
+        if (!stillUsed) {
+          this.project.meshes = this.project.meshes.filter((m) => m.id !== meshId);
+          this.project.assignments = this.project.assignments.filter((a) => a.meshId !== meshId);
+          this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
+            (a) => a.meshId !== meshId
+          );
+        }
+      } else if (node.type === 'transform3d') {
+        const transformId = node.transformId;
+        const stillUsed = this.project.canvas.nodes.some(
+          (n) => n.type === 'transform3d' && n.transformId === transformId
         );
-        this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
-          (a) => a.transformId !== transformId
+        if (!stillUsed) {
+          const rt = this.transformRuntimes.get(transformId);
+          rt?.cloth?.destroy();
+          this.transformRuntimes.delete(transformId);
+          this.project.transforms = this.project.transforms.filter((t) => t.id !== transformId);
+          this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
+            (a) => a.transformId !== transformId
+          );
+          this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
+            (a) => a.transformId !== transformId
+          );
+        }
+      } else if (node.type === 'patternFrame') {
+        const patternId = node.patternId;
+        const stillUsed = this.project.canvas.nodes.some(
+          (n) => n.type === 'patternFrame' && n.patternId === patternId
         );
-      }
-    } else if (node.type === 'patternFrame') {
-      const patternId = node.patternId;
-      const stillUsed = this.project.canvas.nodes.some(
-        (n) => n.type === 'patternFrame' && n.patternId === patternId
-      );
-      if (!stillUsed) {
-        this.project.patterns = this.project.patterns.filter((p) => p.id !== patternId);
-        // Orphan meshes that pointed at this pattern keep the id until user reassigns;
-        // clear geometry so remesh fails loudly until a new pattern is chosen.
-        for (const mesh of this.project.meshes) {
-          if (mesh.patternId === patternId) mesh.geometry = null;
+        if (!stillUsed) {
+          this.project.patterns = this.project.patterns.filter((p) => p.id !== patternId);
+          // Orphan meshes that pointed at this pattern keep the id until user reassigns;
+          // clear geometry so remesh fails loudly until a new pattern is chosen.
+          for (const mesh of this.project.meshes) {
+            if (mesh.patternId === patternId) mesh.geometry = null;
+          }
         }
       }
     }
 
+    this.selectedNodeIds = [];
     this.selectedNodeId = null;
     this.renderAll();
-    void this.initGpuAndSims();
-    this.setStatus('Node deleted');
+    this.markDirty();
+    const message = nodes.length === 1 ? 'Node deleted' : `${nodes.length} nodes deleted`;
+    void this.initGpuAndSims().then(() => this.setStatus(message));
+  }
+
+  private deleteNode(nodeId: string): void {
+    this.deleteNodes([nodeId]);
+  }
+
+  private deleteSelectedNodes(): void {
+    this.deleteNodes(this.selectedNodeIds);
   }
 
   private applyNodeResize(clientX: number, clientY: number): void {
@@ -5014,18 +5172,67 @@ export class StudioApp {
   }
 
   private duplicateSelectedNode(): void {
-    if (!this.selectedNodeId) {
+    if (this.selectedNodeIds.length === 0) {
       this.setStatus('Select a node to duplicate');
       return;
     }
     if (this.isStudioModalOpen()) return;
-    const dup = this.duplicateNode(this.selectedNodeId, {
-      offsetX: 32,
-      offsetY: 32,
-      recordUndo: true,
-      select: true,
-    });
-    if (dup) this.setStatus(`Duplicated · ${this.nodeLabel(dup)}`);
+    this.duplicateNodeGroup(this.selectedNodeIds, { offsetX: 32, offsetY: 32 });
+  }
+
+  /**
+   * Duplicate a whole selection in one gesture. Links between two copies stay
+   * between the copies — pattern → mesh → transform 3D → drape — instead of
+   * pointing back at the originals, so a duplicated chain is a chain of its own.
+   */
+  private duplicateNodeGroup(
+    nodeIds: readonly string[],
+    opts: {
+      offsetX?: number;
+      offsetY?: number;
+      recordUndo?: boolean;
+      select?: boolean;
+      /** Say what was copied once the board has settled. Off while dragging. */
+      announce?: boolean;
+    } = {}
+  ): CanvasNode[] {
+    const plan = planNodeDuplicates(this.project, nodeIds, uid);
+    if (plan.sources.length === 0) return [];
+    if (opts.recordUndo !== false) this.pushUndo();
+    const copies: CanvasNode[] = [];
+    for (const source of plan.sources) {
+      const copy = this.duplicateNode(source.id, {
+        offsetX: opts.offsetX ?? 32,
+        offsetY: opts.offsetY ?? 32,
+        recordUndo: false,
+        select: false,
+        links: plan.links,
+      });
+      if (copy) copies.push(copy);
+    }
+    if (copies.length === 0) return [];
+    // The copies become the selection, the way a single duplicate does.
+    if (opts.select !== false) {
+      this.selectNodes(copies.map((copy) => copy.id), copies[copies.length - 1].id);
+    }
+    this.layoutNodes();
+    // A copy's hidden chain is only wired once every copy exists, so the classes
+    // that hide it are settled here rather than as each node mounts.
+    this.syncEmbeddedNodes();
+    this.drawWires();
+    this.markDirty();
+    // Every copy is on the board: one init covers the lot. The rebuild writes
+    // its own status, so the line about what was copied waits for it.
+    const done = this.initGpuAndSims();
+    if (opts.announce === false) void done;
+    else {
+      const message =
+        copies.length === 1
+          ? `Duplicated · ${this.nodeLabel(copies[0])}`
+          : `Duplicated ${copies.length} nodes`;
+      void done.then(() => this.setStatus(message));
+    }
+    return copies;
   }
 
   private isStudioModalOpen(): boolean {
@@ -5060,6 +5267,11 @@ export class StudioApp {
   /**
    * Clone a canvas node and its backing document (pattern/mesh/transform/sim),
    * preserving settings, geometry, pose, camera, and graph connections where applicable.
+   *
+   * `links` carries the ids a *group* duplicate has already reserved: a copy whose
+   * pattern/mesh/... is being copied too points at that copy rather than at the
+   * original. Left out for a single node, which then copies whatever it points at
+   * by reference (a duplicated transform still reads the original mesh).
    */
   private duplicateNode(
     nodeId: string,
@@ -5068,6 +5280,7 @@ export class StudioApp {
       offsetY?: number;
       recordUndo?: boolean;
       select?: boolean;
+      links?: DuplicateLinks;
     } = {}
   ): CanvasNode | null {
     const src = this.project.canvas.nodes.find((n) => n.id === nodeId);
@@ -5078,6 +5291,8 @@ export class StudioApp {
     const ox = opts.offsetX ?? 32;
     const oy = opts.offsetY ?? 32;
     const zIndex = this.project.canvas.nodes.length + 1;
+    const linked = (kind: 'pattern' | 'mesh' | 'transform' | 'sim', id: string) =>
+      opts.links?.[kind].get(id) ?? id;
     let needsGpu = false;
     let node: CanvasNode;
 
@@ -5085,7 +5300,10 @@ export class StudioApp {
       case 'patternFrame': {
         const pattern = this.project.patterns.find((p) => p.id === src.patternId);
         if (!pattern) return null;
-        const cloned = this.clonePatternDocument(pattern);
+        const cloned = this.clonePatternDocument(
+          pattern,
+          linked('pattern', pattern.id)
+        );
         this.project.patterns.push(cloned);
         node = {
           type: 'patternFrame',
@@ -5103,9 +5321,9 @@ export class StudioApp {
         const mesh = this.project.meshes.find((m) => m.id === src.meshId);
         if (!mesh) return null;
         const cloned: MeshDocument = {
-          id: uid('mesh'),
+          id: linked('mesh', mesh.id),
           name: `${mesh.name} copy`,
-          patternId: mesh.patternId,
+          patternId: linked('pattern', mesh.patternId),
           settings: { ...mesh.settings },
           geometry: mesh.geometry ? structuredClone(mesh.geometry) : null,
         };
@@ -5126,9 +5344,9 @@ export class StudioApp {
         const transform = this.project.transforms.find((t) => t.id === src.transformId);
         if (!transform) return null;
         const cloned = {
-          id: uid('transform'),
+          id: linked('transform', transform.id),
           name: `${transform.name} copy`,
-          meshId: transform.meshId,
+          meshId: linked('mesh', transform.meshId),
           camera: structuredClone(transform.camera),
           pose: transform.pose ? structuredClone(transform.pose) : null,
           pieceTransforms: structuredClone(transform.pieceTransforms),
@@ -5159,7 +5377,7 @@ export class StudioApp {
         this.persistSimStates();
         const live = this.project.sims.find((s) => s.id === src.simId)!;
         const cloned: SimInstance = {
-          id: uid('sim'),
+          id: linked('sim', live.id),
           name: `${live.name} copy`,
           params: {
             ...live.params,
@@ -5173,7 +5391,7 @@ export class StudioApp {
         for (const a of this.project.assignments.filter((x) => x.simId === src.simId)) {
           this.project.assignments.push({
             id: uid('assign'),
-            meshId: a.meshId,
+            meshId: linked('mesh', a.meshId),
             simId: cloned.id,
           });
         }
@@ -5182,7 +5400,7 @@ export class StudioApp {
         )) {
           this.project.transformSimAssignments.push({
             id: uid('assign'),
-            transformId: a.transformId,
+            transformId: linked('transform', a.transformId),
             simId: cloned.id,
           });
         }
@@ -5233,16 +5451,16 @@ export class StudioApp {
     this.project.canvas.nodes.push(node);
     this.mountNode(node);
     if (opts.select !== false) {
-      this.selectedNodeId = node.id;
-      this.renderInspector();
+      this.selectNodes([node.id]);
     }
     this.layoutNodes();
     this.drawWires();
-    if (needsGpu) void this.initGpuAndSims();
+    // A group duplicate does the GPU pass once, after every copy is in place.
+    if (needsGpu && !opts.links) void this.initGpuAndSims();
     return node;
   }
 
-  private clonePatternDocument(src: PatternDocument): PatternDocument {
+  private clonePatternDocument(src: PatternDocument, id = uid('pattern')): PatternDocument {
     const pieceIdMap = new Map<string, string>();
     const pointIdMap = new Map<string, string>();
 
@@ -5284,6 +5502,7 @@ export class StudioApp {
           const to = entry.piece.points[index];
           if (to) pointIdMap.set(point.id, to.id);
         }
+        entry.piece.seamAllowance = remapSeamAllowance(from.seamAllowance, pointIdMap);
       }
 
       copy.pieces = generated.map((entry) => ({ role: entry.role, pieceId: entry.piece.id }));
@@ -5318,6 +5537,7 @@ export class StudioApp {
               to: { ...piece.grainline.to },
             }
           : undefined,
+        seamAllowance: remapSeamAllowance(piece.seamAllowance, pointIdMap),
       };
     });
     const remapEdge = (edge: PatternDocument['seams'][number]['a']) => ({
@@ -5328,7 +5548,7 @@ export class StudioApp {
       t1: edge.t1,
     });
     return {
-      id: uid('pattern'),
+      id,
       name: `${src.name} copy`,
       pieces: [...pieces, ...generatedPieces],
       seams: src.seams.map((seam) => ({
@@ -5343,7 +5563,8 @@ export class StudioApp {
     };
   }
 
-  private addPatternFrame(): void {
+  /** Drop a 2D pattern on the board, centred on the point it was asked for. */
+  private addPatternFrame(at?: { clientX: number; clientY: number }): void {
     const patternId = uid('pattern');
     this.project.patterns.push({
       id: patternId,
@@ -5351,22 +5572,27 @@ export class StudioApp {
       pieces: [rectPiece('Panel', 40, 50, { x: 5, y: 5 })],
       seams: [],
     });
+    const width = 400;
+    const height = 440;
+    const anchor = this.boardPointFromClient(at?.clientX, at?.clientY);
     const node = {
       type: 'patternFrame' as const,
       id: uid('node'),
       patternId,
-      x: 60,
-      y: 100 + this.project.patterns.length * 30,
-      width: 400,
-      height: 440,
+      x: Math.round(anchor.x - width / 2),
+      y: Math.round(anchor.y - height / 2),
+      width,
+      height,
       zIndex: this.project.canvas.nodes.length + 1,
     };
     this.project.canvas.nodes.push(node);
     this.mountNode(node);
+    this.selectNodes([node.id]);
     this.drawWires();
   }
 
-  private addSimViewport(): void {
+  /** Drop a 3D drape viewport on the board, centred on the point it was asked for. */
+  private addSimViewport(at?: { clientX: number; clientY: number }): void {
     const simId = uid('sim');
     const sim: SimInstance = {
       id: simId,
@@ -5377,18 +5603,22 @@ export class StudioApp {
       dropped: false,
     };
     this.project.sims.push(sim);
+    const width = 420;
+    const height = 320;
+    const anchor = this.boardPointFromClient(at?.clientX, at?.clientY);
     const node: SimViewportNode = {
       type: 'simViewport',
       id: uid('node'),
       simId,
-      x: 560,
-      y: 80 + this.project.sims.length * 40,
-      width: 420,
-      height: 320,
+      x: Math.round(anchor.x - width / 2),
+      y: Math.round(anchor.y - height / 2),
+      width,
+      height,
       zIndex: this.project.canvas.nodes.length + 1,
     };
     this.project.canvas.nodes.push(node);
     this.mountNode(node);
+    this.selectNodes([node.id]);
     // A drape carries its own remesh + transform stages; wire in the first
     // pattern so the fullscreen tab strip is complete straight away.
     const pattern = this.project.patterns[0];
@@ -5401,19 +5631,23 @@ export class StudioApp {
     this.drawWires();
   }
 
-  private addTextNote(): void {
+  private addTextNote(at?: { clientX: number; clientY: number }): void {
+    const width = 280;
+    const height = 80;
+    const anchor = this.boardPointFromClient(at?.clientX, at?.clientY);
     const node: TextAnnotationNode = {
       type: 'text',
       id: uid('node'),
-      x: 40,
-      y: 580,
-      width: 280,
-      height: 80,
+      x: Math.round(anchor.x - width / 2),
+      y: Math.round(anchor.y - height / 2),
+      width,
+      height,
       zIndex: this.project.canvas.nodes.length + 1,
       text: 'New note',
       fontSize: 14,
     };
     this.project.canvas.nodes.push(node);
     this.mountNode(node);
+    this.selectNodes([node.id]);
   }
 }

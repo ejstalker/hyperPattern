@@ -167,8 +167,14 @@ export function spliceBlockPieces(
   const next = pieces.filter((piece) => !previous.has(piece.id) || live.has(piece.id));
   for (const { piece } of generated) {
     const at = next.findIndex((existing) => existing.id === piece.id);
-    if (at >= 0) next[at] = piece;
-    else next.push(piece);
+    if (at >= 0) {
+      // Regeneration rebuilds a block's geometry, and the seam allowance is not
+      // geometry: it is a setting on the piece, keyed by point ids that come back
+      // the same every time. Carry it across rather than losing it to a draft
+      // variable moving.
+      if (next[at].seamAllowance) piece.seamAllowance = next[at].seamAllowance;
+      next[at] = piece;
+    } else next.push(piece);
   }
 
   return {

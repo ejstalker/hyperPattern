@@ -4,7 +4,10 @@ import type {
   BlockInstance,
   BlockVariableBinding,
   BlockVariableDecl,
+  MeasureAnchor,
+  MeasureItem,
   PatternDocument,
+  PatternMeasure,
   PatternPiece,
   PatternRuler,
   SeamBinding,
@@ -33,6 +36,16 @@ import {
   type RulerHit,
 } from './rulers';
 import {
+  measureAnchorPoints,
+  measureItemSpan,
+  measureLabelText,
+  measureLineSpans,
+  measureReading,
+  measureReferences,
+  normalizeMeasures,
+  resolveMeasureAnchor,
+} from './measures';
+import {
   buildSeamConnectorPointPairs,
   drawMeshSeamConnectors,
   drawSeamConnectorPairs,
@@ -45,6 +58,7 @@ import {
   dist,
   edgeHandles,
   edgeIndexForPointIds,
+  edgeIsStraight,
   findNearestEdge,
   insertDartOnPiece,
   isSeamEdgeValid,
@@ -62,6 +76,17 @@ import {
   sampleEdgeSpanByPointIds,
   segmentLengths,
 } from './geometry';
+import {
+  allowanceForEdge,
+  allowanceRingPath,
+  allowanceSpanForEdge,
+  seamAllowanceOutline,
+  setEdgeAllowance,
+  setEveryEdgeAllowance,
+  setPieceAllowance,
+  defaultSeamAllowanceCm,
+  edgeHasOwnAllowance,
+} from './seamAllowance';
 import {
   findSeamNearPoint,
   reverseSeamsAcrossEdge,
@@ -126,8 +151,8 @@ export type PatternEditorCallbacks = {
   /** Fired once before a gesture/mutation so the host can snapshot undo history. */
   onBeforeChange?: () => void;
   /**
-   * Ruler edits are drafting references only — they never change geometry, so
-   * they must not invalidate the mesh the way `onChange` does.
+   * Drafting references — rulers, seam allowance — never change geometry, so they
+   * must not invalidate the mesh the way `onChange` does.
    */
   onRulerChange?: () => void;
   /** Body-measurement library (people + values) used to size and label rulers. */
@@ -151,7 +176,8 @@ export type PatternTool =
   | 'sew'
   | 'join'
   | 'bridge'
-  | 'ruler';
+  | 'ruler'
+  | 'measure';
 
 /** The rail's menus: what each one offers, and what its rows stand for. */
 export type AddKind = 'pen' | 'rect' | 'circle' | 'block' | 'import';
@@ -238,6 +264,21 @@ const KNIFE_TIPS: Record<KnifeMode, string> = {
   'loop-straight': 'Knife · Loop cut, straight across (hover an edge)',
 };
 
+/** The viewBox width the wheel and the zoom control may not pass, in pattern units. */
+const MIN_VIEW_WIDTH = 8;
+const MAX_VIEW_WIDTH = 400;
+
+/**
+ * The viewBox width the zoom control reads as 100%.
+ *
+ * The editor's own default framing — not "fit to the pattern", which would move
+ * under the readout every time a piece did — so the number only changes when the
+ * view does. `Fit to pattern` is the button for framing the work.
+ */
+const ZOOM_BASE_WIDTH = 80;
+const MIN_ZOOM_PERCENT = Math.round((ZOOM_BASE_WIDTH / MAX_VIEW_WIDTH) * 100);
+const MAX_ZOOM_PERCENT = Math.round((ZOOM_BASE_WIDTH / MIN_VIEW_WIDTH) * 100);
+
 
 export type KnifeMode = 'linear' | 'circle' | 'curve' | 'loop' | 'loop-straight';
 export type SewMode = 'segment' | 'many';
@@ -321,6 +362,10 @@ type DragKind =
   | { type: 'rulerCreate'; start: Vec2; current: Vec2; snap: boolean }
   | { type: 'rulerMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'rulerTurn'; id: string; which: 'a' | 'b' }
+  /** A measure line being drawn across the pattern. */
+  | { type: 'measureLine'; start: Vec2; current: Vec2 }
+  /** A measurement's readout being carried somewhere else. */
+  | { type: 'measureMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'blockMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'knifeLine'; start: Vec2; current: Vec2; shift: boolean }
   | { type: 'knifeCircle'; center: Vec2; radius: number; shift: boolean }
@@ -444,7 +489,18 @@ function normalizePattern(
   setFor: (personId: string | null) => MeasurementSet | null | undefined
 ): void {
   if (pattern.rulers) pattern.rulers = normalizeRulers(pattern.rulers);
+  if (pattern.measures) pattern.measures = normalizeMeasures(pattern.measures);
   normalizeBlocks(pattern, getBlockDefinition, setFor);
+}
+
+/** Do two anchors name the same point on the same piece? */
+function samePoint(a: MeasureAnchor, b: MeasureAnchor): boolean {
+  if (a.kind !== b.kind || a.pieceId !== b.pieceId) return false;
+  if (a.kind === 'point' && b.kind === 'point') return a.pointId === b.pointId;
+  if (a.kind === 'edge' && b.kind === 'edge') {
+    return a.fromPointId === b.fromPointId && a.toPointId === b.toPointId && a.t === b.t;
+  }
+  return false;
 }
 
 /**
@@ -581,10 +637,42 @@ export class PatternEditor {
   private xrayOn = false;
   /** Show dashed links between paired seam edges. */
   private seamConnectorsOn = false;
+  /** Show each piece's seam allowance, and pick edges to set their own. */
+  private allowanceOn = false;
+  /** Edge under the pointer while the allowance is shown. */
+  private allowanceHover: { pieceId: string; edgeIndex: number } | null = null;
+  /** Edge whose allowance the ribbon is showing. */
+  private allowanceEdge: { pieceId: string; edgeIndex: number } | null = null;
   /** Pattern fill opacity while x-ray is on (0–1). */
   private xrayOpacity = 0.35;
+  /**
+   * The zoom is frozen: the wheel and the zoom control leave it where it is.
+   * Panning is untouched — the lock is about the level, not the position.
+   */
+  private zoomLocked = false;
+  /**
+   * Hicon projection: the sheet as a line drawing — no fills, white outlines and
+   * measurements, the seam allowance shown, and a grid strong enough to read
+   * them against. Purely presentational; nothing about it touches the document.
+   */
+  private hiconOn = false;
+  private zoomBtn!: HTMLButtonElement;
+  private zoomMenu!: HTMLElement;
+  private zoomInput!: HTMLInputElement;
+  private zoomHint!: HTMLElement;
+  private zoomLockBtn!: HTMLButtonElement;
+  private hiconBtn!: HTMLButtonElement;
+  /** The readout last written, so redraw does not rewrite the same numbers. */
+  private lastZoomSig = '';
+  private zoomMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
   private xrayBtn: HTMLButtonElement;
   private seamLinksBtn: HTMLButtonElement;
+  private allowanceBtn: HTMLButtonElement;
+  private allowanceBar: HTMLElement;
+  private allowancePieceInput!: HTMLInputElement;
+  private allowanceEdgeInput!: HTMLInputElement;
+  private allowanceEdgeLabel!: HTMLElement;
+  private allowanceUnitLabel!: HTMLElement;
   private xrayBar: HTMLElement;
   private xrayOpacityInput: HTMLInputElement;
   private contextMenu: HTMLElement;
@@ -616,8 +704,6 @@ export class PatternEditor {
   private rulerMenu!: HTMLElement;
   private rulerSearchInput!: HTMLInputElement;
   private rulerTree!: HTMLElement;
-  private rulerMenuHoldTimer: ReturnType<typeof setTimeout> | null = null;
-  private rulerMenuHoldOpened = false;
   private rulerMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
   /**
    * A measurement chosen from the hold-open menu, waiting for the next drag.
@@ -630,6 +716,26 @@ export class PatternEditor {
     lengthCm: number;
   } | null = null;
   private rulerBar!: HTMLElement;
+  // ── Measurements ─────────────────────────────────────────────────────────
+  //
+  // A measurement reads the pattern itself (unlike a ruler, which reads a
+  // person). They are document data on `pattern.measures`, and they never touch
+  // geometry, so editing one leaves the mesh alone.
+  /** The measurement the measure tool is still adding to, if any. */
+  private measureDraftId: string | null = null;
+  /**
+   * The point the measure tool is waiting to pair with the next one. Session
+   * state, not document data: a measurement never holds half a span.
+   */
+  private measureChainTail: MeasureAnchor | null = null;
+  /** The measurement whose value the pointer is over, so its work lights up. */
+  private measureHoverId: string | null = null;
+  /**
+   * Measurements gathered with Shift-click, waiting to be totalled. Session
+   * state: what makes the Sum button meaningful.
+   */
+  private measureSelection = new Set<string>();
+  private measureBar!: HTMLElement;
   /** Block tool state — instances are document data on `pattern.blocks`. */
   private selectedBlockId: string | null = null;
   /**
@@ -718,7 +824,7 @@ export class PatternEditor {
           <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="sew"></div>
         </div>
         <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="ruler">
-          <button type="button" data-tool="ruler" data-tip="Ruler · hold for measurements" aria-label="Ruler" aria-haspopup="true" aria-expanded="false">
+          <button type="button" data-tool="ruler" data-tip="Ruler &amp; measure · click for either" aria-label="Ruler and measure" aria-haspopup="true" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
               <g transform="rotate(-45 8 8)">
                 <rect x="1.2" y="5.4" width="13.6" height="5.2" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.3"/>
@@ -727,6 +833,17 @@ export class PatternEditor {
             </svg>
           </button>
           <div class="pattern-tool-flyout-menu pattern-ruler-menu" hidden role="menu">
+            <div class="pattern-ruler-menu-tools" role="group" aria-label="Ruler or measure">
+              <button type="button" class="pattern-ruler-item is-tool" data-ruler-tool="ruler" role="menuitem">
+                <span class="pattern-ruler-item-label">Ruler</span>
+                <span class="pattern-ruler-item-value">a real rule over the work</span>
+              </button>
+              <button type="button" class="pattern-ruler-item is-tool" data-ruler-tool="measure" role="menuitem">
+                <span class="pattern-ruler-item-label">Measure line</span>
+                <span class="pattern-ruler-item-value">read the pattern</span>
+              </button>
+            </div>
+            <div class="pattern-ruler-menu-divider"></div>
             <div class="pattern-ruler-menu-search">
               <input type="search" data-ruler-search autocomplete="off" spellcheck="false"
                 placeholder="Search people or measurements…" aria-label="Search people and measurements" />
@@ -736,6 +853,48 @@ export class PatternEditor {
         </div>
       </div>
       <div class="pattern-toolbar-spacer" aria-hidden="true"></div>
+      <div class="pattern-tool-flyout pattern-zoom-flyout">
+        <button type="button" data-opt="zoom" class="pattern-zoom-btn" data-tip="Zoom · set the viewport zoom" aria-label="Viewport zoom" aria-haspopup="true" aria-expanded="false">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="6.9" cy="6.9" r="4.3" fill="none" stroke="currentColor" stroke-width="1.3"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M10.2 10.2 L14 14"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" d="M4.7 6.9 H9.1 M6.9 4.7 V9.1"/>
+          </svg>
+        </button>
+        <div class="pattern-tool-flyout-menu pattern-zoom-menu" hidden role="dialog" aria-label="Viewport zoom">
+          <span class="pattern-zoom-title">Viewport zoom</span>
+          <div class="pattern-zoom-row">
+            <button type="button" data-zoom-act="out" title="Zoom out 1%" aria-label="Zoom out 1%">−</button>
+            <label class="pattern-zoom-field">
+              <input type="number" data-zoom-input min="20" max="1000" step="1" value="100" aria-label="Zoom percent" />
+              <span class="pattern-zoom-unit">%</span>
+            </label>
+            <button type="button" data-zoom-act="in" title="Zoom in 1%" aria-label="Zoom in 1%">+</button>
+          </div>
+          <button type="button" class="pattern-zoom-fit" data-zoom-act="fit">Fit to pattern</button>
+          <button type="button" class="pattern-zoom-lock" data-zoom-act="lock" title="Hold the zoom level where it is — the wheel and the zoom controls stop moving it" aria-label="Lock zoom" aria-pressed="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="3.4" y="7" width="9.2" height="6.4" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.3"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.6 7 V5.2 a2.4 2.4 0 0 1 4.8 0 V7"/>
+              <circle cx="8" cy="10.3" r="0.95" fill="currentColor"/>
+            </svg>
+            <span>Lock zoom</span>
+          </button>
+          <span class="pattern-zoom-hint" data-zoom-hint></span>
+        </div>
+      </div>
+      <button type="button" data-opt="hicon" class="pattern-hicon-btn" data-tip="Hicon projection · white outlines, seam allowance and a stronger grid" aria-label="Hicon projection" aria-pressed="false">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+          <path fill="none" stroke="currentColor" stroke-width="1" opacity="0.5" d="M2.4 8.6 H13.6 M2.4 11 H13.6 M6.2 2.9 V12.6 M10.2 3.9 V12.6"/>
+          <path fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" d="M4.4 12.4 V6.6 L7.6 3.4 L13.2 5.2 V12.4 Z"/>
+        </svg>
+      </button>
+      <button type="button" data-opt="allowance" class="pattern-allowance-btn" data-tip="Seam allowance · show it, and click an edge to set its own" aria-label="Seam allowance" aria-pressed="false">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+          <path fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" d="M4.6 1.9 H 11.4 L 14.1 8 L 11.4 14.1 H 4.6 L 1.9 8 Z"/>
+          <path fill="none" stroke="currentColor" stroke-width="1.05" stroke-dasharray="1.7 1.5" stroke-linejoin="round" d="M6.3 4.2 H 9.8 L 11.7 8 L 9.8 11.8 H 6.3 L 4.3 8 Z"/>
+        </svg>
+      </button>
       <button type="button" data-opt="seam-links" class="pattern-seam-links-btn" data-tip="Seam links" aria-label="Seam links" aria-pressed="false">
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
           <circle cx="4.5" cy="5" r="1.4" fill="currentColor"/>
@@ -777,6 +936,20 @@ export class PatternEditor {
     this.bindToolbarTips();
     this.snapBtn = this.toolbar.querySelector('button[data-opt="snap"]') as HTMLButtonElement;
     this.seamLinksBtn = this.toolbar.querySelector('button[data-opt="seam-links"]') as HTMLButtonElement;
+    this.allowanceBtn = this.toolbar.querySelector(
+      'button[data-opt="allowance"]'
+    ) as HTMLButtonElement;
+    this.zoomBtn = this.toolbar.querySelector('button[data-opt="zoom"]') as HTMLButtonElement;
+    this.zoomMenu = this.toolbar.querySelector('.pattern-zoom-menu') as HTMLElement;
+    this.zoomInput = this.toolbar.querySelector('input[data-zoom-input]') as HTMLInputElement;
+    this.zoomHint = this.toolbar.querySelector('[data-zoom-hint]') as HTMLElement;
+    this.zoomLockBtn = this.toolbar.querySelector(
+      '.pattern-zoom-lock'
+    ) as HTMLButtonElement;
+    this.hiconBtn = this.toolbar.querySelector('button[data-opt="hicon"]') as HTMLButtonElement;
+    this.zoomInput.min = String(MIN_ZOOM_PERCENT);
+    this.zoomInput.max = String(MAX_ZOOM_PERCENT);
+    this.bindZoomMenu();
     this.xrayBtn = this.toolbar.querySelector('button[data-opt="xray"]') as HTMLButtonElement;
     this.avatarToggleBtn = this.toolbar.querySelector('button[data-opt="avatar"]') as HTMLButtonElement;
     this.rulerBtn = this.toolbar.querySelector('button[data-tool="ruler"]') as HTMLButtonElement;
@@ -799,6 +972,20 @@ export class PatternEditor {
       this.chooseRulerMeasurement(item.dataset.personId ?? '', item.dataset.measureId ?? '');
     });
     this.toolbar.addEventListener('click', (e) => {
+      const hiconBtn = (e.target as HTMLElement).closest(
+        'button[data-opt="hicon"]'
+      ) as HTMLButtonElement | null;
+      if (hiconBtn) {
+        this.setHiconEnabled(!this.hiconOn);
+        return;
+      }
+      const allowanceBtn = (e.target as HTMLElement).closest(
+        'button[data-opt="allowance"]'
+      ) as HTMLButtonElement | null;
+      if (allowanceBtn) {
+        this.setSeamAllowanceEnabled(!this.allowanceOn);
+        return;
+      }
       const seamLinksBtn = (e.target as HTMLElement).closest(
         'button[data-opt="seam-links"]'
       ) as HTMLButtonElement | null;
@@ -883,6 +1070,77 @@ export class PatternEditor {
       </label>
     `;
     this.viewport.appendChild(this.toolSettings);
+
+    // Seam allowance: the same top-left slot, showing the piece's allowance and
+    // the picked edge's own. The two fields are in the canvas' display unit, so
+    // half an inch reads as 0.5 in or 1.27 cm depending on the unit in use.
+    this.allowanceBar = document.createElement('div');
+    this.allowanceBar.className = 'pattern-allowance-bar';
+    this.allowanceBar.hidden = true;
+    this.allowanceBar.innerHTML = `
+      <span class="pattern-settings-title">Seam allowance</span>
+      <span class="pattern-allowance-edge" data-allowance-edge-label></span>
+      <label class="pattern-settings-field" title="Every edge of this piece without a setting of its own">
+        <span>Piece</span>
+        <input type="number" data-allowance-piece min="0" max="10" step="0.05" inputmode="decimal"
+          aria-label="Piece seam allowance" />
+      </label>
+      <label class="pattern-settings-field" title="Just the picked edge">
+        <span>Edge</span>
+        <input type="number" data-allowance-edge min="0" max="10" step="0.05" inputmode="decimal"
+          aria-label="Edge seam allowance" />
+      </label>
+      <span class="pattern-allowance-unit" data-allowance-unit></span>
+      <button type="button" data-allowance-act="all" title="Use this edge's allowance on every edge of the piece">All edges</button>
+      <button type="button" data-allowance-act="reset" title="Drop this edge's own allowance and follow the piece">Use piece</button>
+    `;
+    this.viewport.appendChild(this.allowanceBar);
+    this.allowanceEdgeLabel = this.allowanceBar.querySelector(
+      '[data-allowance-edge-label]'
+    ) as HTMLElement;
+    this.allowanceUnitLabel = this.allowanceBar.querySelector(
+      '[data-allowance-unit]'
+    ) as HTMLElement;
+    this.allowancePieceInput = this.allowanceBar.querySelector(
+      'input[data-allowance-piece]'
+    ) as HTMLInputElement;
+    this.allowanceEdgeInput = this.allowanceBar.querySelector(
+      'input[data-allowance-edge]'
+    ) as HTMLInputElement;
+    this.sealOverlay(this.allowanceBar);
+    this.allowancePieceInput.addEventListener('input', () => {
+      this.applyAllowanceInput(this.allowancePieceInput, (piece, cm) =>
+        setPieceAllowance(piece, cm)
+      );
+    });
+    this.allowanceEdgeInput.addEventListener('input', () => {
+      this.applyAllowanceInput(this.allowanceEdgeInput, (piece, cm) => {
+        const sel = this.allowanceEdge;
+        if (sel) setEdgeAllowance(piece, sel.edgeIndex, cm);
+      });
+    });
+    this.allowanceBar.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest(
+        'button[data-allowance-act]'
+      ) as HTMLButtonElement | null;
+      const sel = this.allowanceEdge;
+      if (!btn || !sel) return;
+      const piece = this.pattern.pieces.find((entry) => entry.id === sel.pieceId);
+      if (!piece) return;
+      e.preventDefault();
+      if (btn.dataset.allowanceAct === 'all') {
+        const cm = this.allowanceValueOf(this.allowanceEdgeInput.value);
+        this.markBeforeChange();
+        if (cm == null) setEveryEdgeAllowance(piece, allowanceForEdge(piece, sel.edgeIndex));
+        else setEveryEdgeAllowance(piece, cm);
+      } else {
+        this.markBeforeChange();
+        setEdgeAllowance(piece, sel.edgeIndex, null);
+      }
+      this.endHistoryGesture();
+      this.notifyReferenceChange();
+      this.redraw();
+    });
     this.sealOverlay(this.toolSettings);
     this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
@@ -1201,6 +1459,33 @@ export class PatternEditor {
       this.cancelSimplify();
     });
 
+    // Measure bar: the running value, and the two ways out of the session.
+    this.measureBar = document.createElement('div');
+    this.measureBar.className = 'pattern-measure-bar';
+    this.measureBar.hidden = true;
+    this.measureBar.innerHTML = `
+      <span class="pattern-measure-title">Measure</span>
+      <span class="pattern-measure-readout" data-measure-readout></span>
+      <button type="button" data-measure-sum hidden>Sum</button>
+      <button type="button" data-measure-clear class="danger" hidden>Delete</button>
+      <button type="button" data-measure-done hidden>Done</button>
+    `;
+    this.viewport.appendChild(this.measureBar);
+    this.sealOverlay(this.measureBar);
+    this.measureBar.querySelector('[data-measure-sum]')?.addEventListener('click', () => {
+      this.sumSelectedMeasures();
+    });
+    this.measureBar.querySelector('[data-measure-clear]')?.addEventListener('click', () => {
+      this.clearMeasureDraft();
+    });
+    this.measureBar.querySelector('[data-measure-done]')?.addEventListener('click', () => {
+      // The same button steps out of whichever session is running: the gathering
+      // for a total, or the measurement being built.
+      if (this.measureSelection.size > 0) this.clearMeasureSelection();
+      else this.finishMeasureDraft();
+      this.redraw();
+    });
+
     // Curve knife bar: the chain's options, where the eye already is while
     // clicking points down the piece.
     this.knifeBar = document.createElement('div');
@@ -1434,6 +1719,14 @@ export class PatternEditor {
         e.preventDefault();
         return;
       }
+      if (!this.zoomMenu.hidden) {
+        // Swallow the key: the popover is what Escape is dismissing, not the
+        // full-screen view it happens to be sitting in.
+        this.hideZoomMenu();
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       if (this.pendingSeam) {
         this.pendingSeam = null;
         this.hoverEdge = null;
@@ -1461,6 +1754,21 @@ export class PatternEditor {
         this.cancelSimplify();
         e.preventDefault();
         return;
+      }
+      if (this.allowanceEdge) {
+        this.allowanceEdge = null;
+        this.allowanceHover = null;
+        this.redraw();
+      }
+      // Escape steps out of the measurement being built; what it made stays put.
+      if (this.measureSelection.size > 0) {
+        this.clearMeasureSelection();
+        e.preventDefault();
+        return;
+      }
+      if (this.measureDraftId || this.measureChainTail) {
+        this.finishMeasureDraft();
+        this.redraw();
       }
       this.setRulerSelection(null);
       this.setSelectedBlock(null);
@@ -1609,15 +1917,27 @@ export class PatternEditor {
     // Changing tools is walking away from anything in hand: a simplify preview
     // belongs to the tool it was started from.
     if (this.simplify) this.cancelSimplify();
-    if (tool !== 'ruler') {
+    if (tool !== 'ruler' && tool !== 'measure') {
       this.hideRulerMenu();
+    }
+    if (tool !== 'ruler') {
       // A measurement armed for the ruler tool is meaningless elsewhere.
       this.rulerArmed = null;
-      this.syncRulerToolbar();
     }
-    // Rulers are only interactive under the ruler and move tools; drop the
-    // inspector rather than leaving an invisible selection behind.
-    if (tool !== 'ruler' && tool !== 'move') {
+    if (tool !== 'measure') {
+      // The measurement itself is document data and stays; this only drops the
+      // session that was still adding to it.
+      this.measureDraftId = null;
+      this.measureChainTail = null;
+      this.measureHoverId = null;
+      this.measureSelection.clear();
+    }
+    if (!this.measureInteractive()) this.measureHoverId = null;
+    this.syncRulerToolbar();
+    this.syncMeasureBar();
+    // Rulers and measurements are only interactive under the tools that work on
+    // them; drop the inspector rather than leaving an invisible selection behind.
+    if (tool !== 'ruler' && tool !== 'move' && tool !== 'measure') {
       this.selectedRulerId = null;
       this.hoverRulerId = null;
       this.syncRulerBar();
@@ -1629,6 +1949,8 @@ export class PatternEditor {
     for (const btn of Array.from(this.toolbar.querySelectorAll('button[data-tool]'))) {
       btn.classList.toggle('active', (btn as HTMLElement).dataset.tool === tool);
     }
+    // The ruler button fronts two tools, so it stays lit for both.
+    this.rulerBtn.classList.toggle('active', tool === 'ruler' || tool === 'measure');
     this.syncRailMenus();
     this.applyCursor(null);
     this.redraw();
@@ -1646,7 +1968,8 @@ export class PatternEditor {
       tool === 'rect' ||
       tool === 'circle' ||
       tool === 'knife' ||
-      tool === 'ruler'
+      tool === 'ruler' ||
+      tool === 'measure'
     ) {
       return 'crosshair';
     }
@@ -1992,14 +2315,155 @@ export class PatternEditor {
   }
 
   private zoomAt(clientX: number, clientY: number, factor: number): void {
+    // The lock is the last word on zoom: every path that moves the level comes
+    // through here, so it only has to be checked once.
+    if (this.zoomLocked) return;
     const before = this.svgPointFromClient(clientX, clientY);
-    this.viewBox.w = Math.min(400, Math.max(8, this.viewBox.w * factor));
-    this.viewBox.h = Math.min(400, Math.max(8, this.viewBox.h * factor));
+    this.viewBox.w = Math.min(MAX_VIEW_WIDTH, Math.max(MIN_VIEW_WIDTH, this.viewBox.w * factor));
+    this.viewBox.h = Math.min(MAX_VIEW_WIDTH, Math.max(MIN_VIEW_WIDTH, this.viewBox.h * factor));
     this.redraw();
     const after = this.svgPointFromClient(clientX, clientY);
     this.viewBox.x += before.x - after.x;
     this.viewBox.y += before.y - after.y;
     this.redraw();
+  }
+
+  /** The zoom the current view stands for, as a percent of the default framing. */
+  private zoomPercent(): number {
+    return Math.round((ZOOM_BASE_WIDTH / this.viewBox.w) * 100);
+  }
+
+  /** Zoom about the middle of the viewport, the way a typed value should feel. */
+  private zoomByFactor(factor: number): void {
+    if (Math.abs(factor - 1) < 1e-6) return;
+    const rect = this.svg.getBoundingClientRect();
+    this.zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  }
+
+  /** Set the zoom to a percent of the default framing, keeping the view centred. */
+  private setZoomPercent(percent: number): void {
+    if (!Number.isFinite(percent)) return;
+    const width = ZOOM_BASE_WIDTH * (100 / percent);
+    const clamped = Math.min(MAX_VIEW_WIDTH, Math.max(MIN_VIEW_WIDTH, width));
+    this.zoomByFactor(clamped / this.viewBox.w);
+  }
+
+  private setZoomLocked(on: boolean): void {
+    this.zoomLocked = on;
+    this.zoomLockBtn.classList.toggle('active', on);
+    this.zoomLockBtn.setAttribute('aria-pressed', String(on));
+    this.zoomMenu.classList.toggle('is-locked', on);
+    // The marker on the rail button: the lock lives in the popover, so the
+    // button has to say the level is held even while the popover is shut.
+    this.zoomBtn.classList.toggle('is-locked', on);
+    this.zoomInput.disabled = on;
+    // The lock row itself stays live — it is the way back out.
+    this.zoomMenu.querySelectorAll('button[data-zoom-act]').forEach((btn) => {
+      const el = btn as HTMLButtonElement;
+      if (el.dataset.zoomAct === 'lock') return;
+      el.disabled = on;
+    });
+    this.hideToolbarTip();
+    this.syncZoomControl();
+  }
+
+  private setHiconEnabled(on: boolean): void {
+    this.hiconOn = on;
+    this.hiconBtn.classList.toggle('active', on);
+    this.hiconBtn.setAttribute('aria-pressed', String(on));
+    this.root.classList.toggle('is-hicon', on);
+    this.redraw();
+  }
+
+  private bindZoomMenu(): void {
+    this.zoomBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.hideToolbarTip();
+      this.toggleZoomMenu(this.zoomMenu.hidden);
+    });
+    this.zoomMenu.addEventListener('click', (e) => {
+      const act = (e.target as HTMLElement).closest('button[data-zoom-act]')?.getAttribute(
+        'data-zoom-act'
+      );
+      if (!act) return;
+      e.preventDefault();
+      this.onZoomAction(act);
+    });
+    this.zoomInput.addEventListener('change', () => {
+      const value = Number.parseFloat(this.zoomInput.value);
+      this.setZoomPercent(value);
+      this.syncZoomControl();
+    });
+    this.zoomInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        this.zoomInput.blur();
+      }
+    });
+  }
+
+  private toggleZoomMenu(show: boolean): void {
+    this.zoomMenu.hidden = !show;
+    this.zoomBtn.setAttribute('aria-expanded', String(show));
+    if (!show) {
+      this.hideZoomMenu();
+      return;
+    }
+    this.syncZoomControl();
+    this.zoomInput.focus();
+    this.zoomInput.select();
+    if (!this.zoomMenuDocPointerDown) {
+      // Any press outside the button and its popover puts the popover away.
+      this.zoomMenuDocPointerDown = (e: PointerEvent) => {
+        const target = e.target as Node;
+        if (this.zoomMenu.contains(target) || this.zoomBtn.contains(target)) return;
+        this.hideZoomMenu();
+      };
+      document.addEventListener('pointerdown', this.zoomMenuDocPointerDown, true);
+    }
+  }
+
+  private hideZoomMenu(): void {
+    this.zoomMenu.hidden = true;
+    this.zoomBtn.setAttribute('aria-expanded', 'false');
+    if (this.zoomMenuDocPointerDown) {
+      document.removeEventListener('pointerdown', this.zoomMenuDocPointerDown, true);
+      this.zoomMenuDocPointerDown = null;
+    }
+  }
+
+  private onZoomAction(act: string): void {
+    if (act === 'lock') {
+      this.setZoomLocked(!this.zoomLocked);
+      return;
+    }
+    if (this.zoomLocked) return;
+    if (act === 'in') this.setZoomPercent(this.zoomPercent() + 1);
+    else if (act === 'out') this.setZoomPercent(this.zoomPercent() - 1);
+    else if (act === 'fit') {
+      this.fitView();
+      this.redraw();
+    }
+    this.syncZoomControl();
+  }
+
+  /**
+   * The zoom control's readout. `redraw` calls it, so panning, framing and a
+   * resized viewport all keep it honest without threading a call through each.
+   */
+  private syncZoomControl(): void {
+    const pct = this.zoomPercent();
+    const sig = `${pct}|${this.zoomLocked}`;
+    if (sig === this.lastZoomSig) return;
+    this.lastZoomSig = sig;
+    this.zoomInput.value = String(pct);
+    this.zoomBtn.dataset.tip = this.zoomLocked
+      ? `Zoom · locked at ${pct}%`
+      : `Zoom · ${pct}% — type a value, or use ⌘/Ctrl-wheel`;
+    this.zoomHint.textContent = this.zoomLocked
+      ? 'Locked — the wheel will not zoom'
+      : 'Percent of the default framing';
   }
 
   private setXrayEnabled(on: boolean): void {
@@ -2011,6 +2475,64 @@ export class PatternEditor {
       this.xrayOpacityInput.value = String(Math.round(this.xrayOpacity * 100));
     }
     this.applyXrayStyles();
+  }
+
+  /**
+   * Seam allowance on screen: every piece draws the line its allowance makes,
+   * and the move tool picks edges so each one can be given its own value. Off is
+   * exactly the old behaviour — no line, no picking.
+   */
+  private setSeamAllowanceEnabled(on: boolean): void {
+    this.allowanceOn = on;
+    this.allowanceBtn.classList.toggle('active', on);
+    this.allowanceBtn.setAttribute('aria-pressed', String(on));
+    this.root.classList.toggle('is-allowance', on);
+    if (!on) {
+      this.allowanceHover = null;
+      this.allowanceEdge = null;
+    }
+    this.redraw();
+  }
+
+  /** The edge the allowance ribbon is showing, or null to put the ribbon away. */
+  private setAllowanceEdge(next: { pieceId: string; edgeIndex: number } | null): void {
+    if (
+      this.allowanceEdge?.pieceId === next?.pieceId &&
+      this.allowanceEdge?.edgeIndex === next?.edgeIndex
+    ) {
+      return;
+    }
+    this.allowanceEdge = next;
+    this.redraw();
+  }
+
+  private allowancePiece(): PatternPiece | null {
+    const sel = this.allowanceEdge;
+    if (!sel) return null;
+    return this.pattern.pieces.find((piece) => piece.id === sel.pieceId) ?? null;
+  }
+
+  /** A field value in the canvas' unit, as cm. Null when it is not a number. */
+  private allowanceValueOf(raw: string): number | null {
+    const value = parseFloat(raw);
+    if (!Number.isFinite(value)) return null;
+    return displayToCm(value, this.unit);
+  }
+
+  private applyAllowanceInput(
+    input: HTMLInputElement,
+    apply: (piece: PatternPiece, cm: number) => void
+  ): void {
+    const piece = this.allowancePiece();
+    const cm = this.allowanceValueOf(input.value);
+    if (!piece || cm == null) return;
+    this.markBeforeChange();
+    apply(piece, cm);
+    this.endHistoryGesture();
+    // Not `onChange`: the allowance is a drafting reference like a ruler, and
+    // must not invalidate the mesh the drape was built from.
+    this.notifyReferenceChange();
+    this.redraw();
   }
 
   private setSeamConnectorsEnabled(on: boolean): void {
@@ -2138,6 +2660,8 @@ export class PatternEditor {
       this.drawPiece(piece);
     }
 
+    this.drawSeamAllowances();
+
     // Above the pieces, below the seams and everything you can grab: the
     // highlight is an answer to "what does this number move?", not a handle.
     this.drawBlockHighlight();
@@ -2153,6 +2677,10 @@ export class PatternEditor {
     // readings come back separately so a later ruler's graduations can never
     // cover an earlier ruler's numbers.
     for (const reading of this.drawRulers()) this.svg.appendChild(reading);
+
+    // Measurements ride over the rulers: both are references, and the readout is
+    // the smaller thing you need to be able to grab.
+    this.drawMeasures();
 
     if (this.tool === 'move') {
       this.drawSelectionChrome();
@@ -2187,10 +2715,13 @@ export class PatternEditor {
     }
 
     this.updatePointBar();
+    this.updateAllowanceBar();
     this.updateRulerReadout();
     this.updateBlockReadouts();
     this.syncKnifeBar();
     this.syncJoinBar();
+    this.syncZoomControl();
+    this.syncMeasureBar();
   }
 
   private selectedPoint(): BezierPoint | null {
@@ -2210,9 +2741,54 @@ export class PatternEditor {
     return inZero && outZero;
   }
 
+  /**
+   * The seam allowance ribbon: what the picked edge and the piece are set to,
+   * in the canvas' unit. It shares the top-left slot with the point settings, and
+   * a picked edge wins — you are setting an edge, not dragging a point.
+   */
+  private updateAllowanceBar(): void {
+    const sel = this.allowanceEdge;
+    const piece = this.allowancePiece();
+    // The piece can go out from under the pick (deleted, or replaced by history).
+    if (sel && !piece) this.allowanceEdge = null;
+    const showing = this.allowanceOn && !!sel && !!piece;
+    this.allowanceBar.hidden = !showing;
+    if (!showing || !sel || !piece) return;
+    this.pointBar.hidden = true;
+    this.toolSettings.hidden = true;
+
+    this.allowanceEdgeLabel.textContent = `${piece.name} · edge ${sel.edgeIndex + 1} of ${
+      piece.points.length
+    }`;
+    this.allowanceUnitLabel.textContent = this.unit;
+    // Never overwrite the field being typed in: the caret would jump.
+    if (document.activeElement !== this.allowancePieceInput) {
+      this.allowancePieceInput.value = this.allowanceText(defaultSeamAllowanceCm(piece));
+    }
+    const own = edgeHasOwnAllowance(piece, sel.edgeIndex);
+    if (document.activeElement !== this.allowanceEdgeInput) {
+      this.allowanceEdgeInput.value = this.allowanceText(allowanceForEdge(piece, sel.edgeIndex));
+    }
+    this.allowanceEdgeInput.classList.toggle('is-inherited', !own);
+    const reset = this.allowanceBar.querySelector(
+      'button[data-allowance-act="reset"]'
+    ) as HTMLButtonElement | null;
+    if (reset) reset.disabled = !own;
+    const all = this.allowanceBar.querySelector(
+      'button[data-allowance-act="all"]'
+    ) as HTMLButtonElement | null;
+    if (all) all.disabled = !own;
+  }
+
+  /** A value ready for a number field: display units, no trailing zeroes. */
+  private allowanceText(cm: number): string {
+    const value = cmToDisplay(cm, this.unit);
+    return String(Math.round(value * 1000) / 1000);
+  }
+
   private updatePointBar(): void {
     const pt = this.selectedPoint();
-    if (!pt || this.hasToolSettings()) {
+    if (!pt || this.hasToolSettings() || (this.allowanceOn && !!this.allowanceEdge)) {
       this.pointBar.hidden = true;
       return;
     }
@@ -3364,10 +3940,7 @@ export class PatternEditor {
       const a = pts[i];
       const b = pts[(i + 1) % n];
       const { c0, c1 } = edgeHandles(a, b);
-      const linear =
-        (!a.handleOut || (a.handleOut.x === a.anchor.x && a.handleOut.y === a.anchor.y)) &&
-        (!b.handleIn || (b.handleIn.x === b.anchor.x && b.handleIn.y === b.anchor.y));
-      if (linear) d += ` L ${b.anchor.x} ${b.anchor.y}`;
+      if (edgeIsStraight(a, b)) d += ` L ${b.anchor.x} ${b.anchor.y}`;
       else d += ` C ${c0.x} ${c0.y}, ${c1.x} ${c1.y}, ${b.anchor.x} ${b.anchor.y}`;
     }
     if (piece.closed) d += ' Z';
@@ -3732,6 +4305,19 @@ export class PatternEditor {
     }
 
     const p = this.svgPointFromClient(e.clientX, e.clientY);
+
+    // Right-clicking a measurement's value throws the measurement away — the
+    // readout is the handle, so the gesture lands on the thing it deletes. Undo
+    // brings it back.
+    const measureHit = this.findMeasureHit(p);
+    if (measureHit) {
+      e.stopPropagation();
+      e.preventDefault();
+      this.deleteMeasure(measureHit.id);
+      this.redraw();
+      return;
+    }
+
     const rulerHit = this.findRulerHit(p);
     if (rulerHit) {
       e.stopPropagation();
@@ -4067,44 +4653,42 @@ export class PatternEditor {
     return ruler.half ? full / 2 : full;
   }
 
-  private notifyRulerChange(): void {
+  /** Document data that is not geometry: saved, but no remesh behind it. */
+  private notifyReferenceChange(): void {
     if (this.cbs.onRulerChange) this.cbs.onRulerChange();
     else this.cbs.onChange();
   }
 
-  // ── Hold-to-open measurement picker ──────────────────────────────────────
+  // ── Ruler / measure picker ───────────────────────────────────────────────
   //
-  // Holding the ruler button drops a tree of everybody in the measurement
-  // library and their measurements, with a search box that matches a person and
-  // a measurement together ("alex waist"). Picking one either rebinds the
-  // selected ruler or arms the tool for the next one you drag out.
+  // The rail button leads with the two things it can put in hand — a real rule
+  // laid over the work, or a measurement read off the pattern — and, under
+  // those, a tree of everybody in the measurement library with a search box that
+  // matches a person and a measurement together ("alex waist"). Picking a body
+  // measurement either rebinds the selected ruler or arms the tool for the next
+  // one you drag out.
 
   private bindRulerMenu(): void {
-    const HOLD_MS = 380;
     this.rulerBtn.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
       this.hideToolbarTip();
-      this.rulerMenuHoldOpened = false;
-      this.rulerMenuHoldTimer = setTimeout(() => {
-        this.rulerMenuHoldTimer = null;
-        this.rulerMenuHoldOpened = true;
-        this.showRulerMenu();
-      }, HOLD_MS);
-      const onUp = (ev: PointerEvent) => {
-        window.removeEventListener('pointerup', onUp, true);
-        window.removeEventListener('pointercancel', onUp, true);
-        if (this.rulerMenuHoldTimer) {
-          clearTimeout(this.rulerMenuHoldTimer);
-          this.rulerMenuHoldTimer = null;
-        }
-        if (this.rulerMenuHoldOpened) return;
-        // Quick click → plain ruler tool.
-        if (ev.target && this.rulerBtn.contains(ev.target as Node)) this.setTool('ruler');
-      };
-      window.addEventListener('pointerup', onUp, true);
-      window.addEventListener('pointercancel', onUp, true);
+      // One press, one menu: the two tools are rows in it, so a click no longer
+      // has to guess whether you wanted the rule or the picker.
+      if (this.rulerMenu.hidden) this.showRulerMenu();
+      else this.hideRulerMenu();
+    });
+    // The rows that put a tool in hand.
+    this.rulerMenu.addEventListener('click', (e) => {
+      const row = (e.target as HTMLElement).closest(
+        'button[data-ruler-tool]'
+      ) as HTMLButtonElement | null;
+      if (!row) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.hideRulerMenu();
+      this.setTool(row.dataset.rulerTool === 'measure' ? 'measure' : 'ruler');
     });
   }
 
@@ -4269,7 +4853,7 @@ export class PatternEditor {
         ruler.measurementId = null;
         ruler.personId = null;
         ruler.personName = '';
-        this.notifyRulerChange();
+        this.notifyReferenceChange();
         this.endHistoryGesture();
         this.syncRulerBar();
       } else {
@@ -4289,7 +4873,7 @@ export class PatternEditor {
       ruler.personName = set.name;
       ruler.measurementId = fieldId;
       ruler.lengthCm = value;
-      this.notifyRulerChange();
+      this.notifyReferenceChange();
       this.endHistoryGesture();
       this.syncRulerBar();
     } else {
@@ -4304,13 +4888,16 @@ export class PatternEditor {
     this.redraw();
   }
 
-  /** Tooltip + armed marker on the ruler button. */
+  /** Tooltip + armed marker on the ruler button — it fronts both its tools. */
   private syncRulerToolbar(): void {
     const armed = this.rulerArmed;
     const field = armed ? measurementField(armed.fieldId) : null;
-    const tip = armed
-      ? `Ruler · ${armed.personName} ${field?.label ?? armed.fieldId} — drag to place`
-      : 'Ruler · hold for measurements';
+    const tip =
+      this.tool === 'measure'
+        ? 'Measure · click points and edges to add them, or drag a line across'
+        : armed
+          ? `Ruler · ${armed.personName} ${field?.label ?? armed.fieldId} — drag to place`
+          : 'Ruler & measure · click for either';
     this.rulerBtn.dataset.tip = tip;
     this.rulerBtn.setAttribute('aria-label', tip);
     this.rulerBtn.classList.toggle('is-armed', !!armed);
@@ -4320,6 +4907,376 @@ export class PatternEditor {
     if (this.selectedRulerId === id) return;
     this.selectedRulerId = id;
     this.syncRulerBar();
+  }
+
+  // ── Measurements ─────────────────────────────────────────────────────────
+  //
+  // A measurement reads the *pattern*: the length of an edge, the gap between
+  // two points, or a measure line's span between the places it crossed an
+  // outline — summed into one value. It is drawn like a dimension on a technical
+  // drawing, and its readout can be parked where you want it.
+  //
+  // Nothing here is a control point: a measure point is stored as a fraction
+  // along an edge, so it rides the outline and the piece is untouched. That is
+  // also why a measurement is a *reference* — it never leaves a mesh stale.
+
+  private measures(): PatternMeasure[] {
+    return this.pattern.measures ?? [];
+  }
+
+  private ensureMeasures(): PatternMeasure[] {
+    if (!this.pattern.measures) this.pattern.measures = [];
+    return this.pattern.measures;
+  }
+
+  private findMeasure(id: string | null): PatternMeasure | null {
+    if (!id) return null;
+    return this.measures().find((measure) => measure.id === id) ?? null;
+  }
+
+  /** Both the measure tool and Move can carry, hover and delete a readout. */
+  private measureInteractive(): boolean {
+    return this.tool === 'measure' || this.tool === 'move';
+  }
+
+  /**
+   * Where a fresh readout goes: above the middle of what it measures, which is
+   * where a dimension line's number belongs. Nudged clear of the readouts
+   * already up, since measuring several things on one panel otherwise stacks
+   * their values on the same spot. Dragged from there.
+   */
+  private defaultMeasureLabel(items: readonly MeasureItem[]): Vec2 {
+    const points: Vec2[] = [];
+    for (const item of items) {
+      const span = measureItemSpan(this.pattern.pieces, item);
+      if (span) points.push(span.mid);
+    }
+    if (points.length === 0) {
+      return { x: this.viewBox.x + this.viewBox.w / 2, y: this.viewBox.y + this.viewBox.h / 2 };
+    }
+    const cx = points.reduce((sum, p) => sum + p.x, 0) / points.length;
+    const cy = points.reduce((sum, p) => sum + p.y, 0) / points.length;
+    const at = { x: cx, y: cy - this.px(34) };
+    const clear = this.px(26);
+    const others = this.measures()
+      .filter((measure) => measure.id !== this.measureDraftId)
+      .map((measure) => measure.label);
+    for (let tries = 0; tries < 8; tries++) {
+      if (!others.some((other) => dist(other, at) < clear)) break;
+      at.y -= this.px(24);
+    }
+    return at;
+  }
+
+  /**
+   * The measurement in hand, made if this is the first pick. Picks land in the
+   * document straight away so the readout is live, draggable and undoable; the
+   * draft id is only the session that keeps adding to it.
+   */
+  private beginMeasure(items: MeasureItem[]): PatternMeasure {
+    const draft = this.findMeasure(this.measureDraftId);
+    if (draft) return draft;
+    const measure: PatternMeasure = {
+      id: uid('measure'),
+      label: this.defaultMeasureLabel(items),
+      items: [...items],
+    };
+    this.markBeforeChange();
+    this.ensureMeasures().push(measure);
+    this.endHistoryGesture();
+    this.measureDraftId = measure.id;
+    this.notifyReferenceChange();
+    return measure;
+  }
+
+  private appendMeasure(items: MeasureItem[]): void {
+    const draft = this.findMeasure(this.measureDraftId);
+    if (!draft) {
+      this.beginMeasure(items);
+      this.redraw();
+      return;
+    }
+    this.markBeforeChange();
+    draft.items.push(...items);
+    // A readout parked over the old geometry follows the new pick until it is
+    // moved by hand — otherwise the number ends up nowhere near what it reads.
+    draft.label = this.defaultMeasureLabel(draft.items);
+    this.endHistoryGesture();
+    this.notifyReferenceChange();
+    this.redraw();
+  }
+
+  /** Drop the session that was still adding to a measurement; what it made stays. */
+  private finishMeasureDraft(): void {
+    this.measureDraftId = null;
+    this.measureChainTail = null;
+    this.syncMeasureBar();
+  }
+
+  /** Throw the measurement being built away, whole. Undo brings it back. */
+  private clearMeasureDraft(): void {
+    const draft = this.findMeasure(this.measureDraftId);
+    if (draft) this.deleteMeasure(draft.id);
+    else this.finishMeasureDraft();
+    this.measureChainTail = null;
+    this.redraw();
+  }
+
+  private deleteMeasure(id: string): void {
+    const list = this.measures();
+    const index = list.findIndex((measure) => measure.id === id);
+    if (index < 0) return;
+    this.markBeforeChange();
+    list.splice(index, 1);
+    this.endHistoryGesture();
+    if (this.measureDraftId === id) this.measureDraftId = null;
+    if (this.measureHoverId === id) this.measureHoverId = null;
+    this.measureChainTail = null;
+    this.notifyReferenceChange();
+    this.syncMeasureBar();
+  }
+
+  /**
+   * What is under the pointer: a readout's value, or one of the dimension lines
+   * it draws. Reverse order so the topmost measurement wins.
+   */
+  private findMeasureHit(p: Vec2): { id: string; part: 'label' | 'item' } | null {
+    if (!this.measureInteractive()) return null;
+    const list = this.measures();
+    for (let i = list.length - 1; i >= 0; i--) {
+      const measure = list[i]!;
+      if (dist(p, measure.label) <= this.px(16)) {
+        return { id: measure.id, part: 'label' };
+      }
+      for (const item of measure.items) {
+        const span = measureItemSpan(this.pattern.pieces, item);
+        if (span && distanceToSegment(p, span.a, span.b) <= this.px(5)) {
+          return { id: measure.id, part: 'item' };
+        }
+      }
+    }
+    return null;
+  }
+
+  private onMeasureDown(e: PointerEvent, p: Vec2): void {
+    // The readout is the handle: it is what you carry, and what right-click
+    // deletes. Everything else the tool does builds the measurement.
+    const hit = this.findMeasureHit(p);
+    if (hit) {
+      // Shift gathers readouts up for a total instead of taking hold of one, so
+      // several measurements can be summed without disturbing them. Only the
+      // measure tool gathers: the bar that totals them belongs to it.
+      if (e.shiftKey && this.tool === 'measure') {
+        this.toggleMeasureSelected(hit.id);
+        e.preventDefault();
+        return;
+      }
+      const measure = this.findMeasure(hit.id);
+      if (measure) {
+        this.measureDraftId = measure.id;
+        this.markBeforeChange();
+        this.drag = {
+          type: 'measureMove',
+          id: measure.id,
+          start: p,
+          origin: { ...measure.label },
+        };
+        this.svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        this.syncMeasureBar();
+        this.redraw();
+        return;
+      }
+    }
+    // Any other gesture on the canvas is done with the gathering.
+    this.measureSelection.clear();
+
+    const target = e.target as SVGElement;
+    const kind = target.dataset?.kind;
+    const pieceId = target.dataset?.pieceId;
+    const pointId = target.dataset?.pointId;
+
+    // A control point: the measurement reads that point itself, so it follows the
+    // piece exactly and stays right when the point is dragged.
+    if (kind === 'anchor' && pointId && pieceId) {
+      const piece = this.pattern.pieces.find((entry) => entry.id === pieceId);
+      if (piece && piece.points.some((pt) => pt.id === pointId)) {
+        this.addMeasurePick({ kind: 'point', pieceId, pointId });
+        e.preventDefault();
+        return;
+      }
+    }
+
+    // An edge: the whole edge is read, along its curve, so a run of edges sums
+    // to the length you would measure with a tape laid on the seam line.
+    const edge = this.findNearestEdgeAcrossPieces(p);
+    if (edge) {
+      this.addMeasurePick({
+        kind: 'edge',
+        pieceId: edge.piece.id,
+        fromPointId: edge.fromPointId,
+        toPointId: edge.toPointId,
+      });
+      e.preventDefault();
+      return;
+    }
+
+    // Empty canvas: draw a measure line across the work.
+    this.drag = { type: 'measureLine', start: p, current: p };
+    this.svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    this.redraw();
+  }
+
+  /**
+   * Add one pick.
+   *
+   * Points chain in the order they are picked — two points give the distance
+   * between them, a third continues the walk — and an edge adds its own arc
+   * length, so a run of edges sums to the length a tape would show. The pick
+   * waiting for a partner is session state, not document data: a measurement
+   * never holds half a span.
+   */
+  private addMeasurePick(item: MeasureAnchor | Extract<MeasureItem, { kind: 'edge' }>): void {
+    if (item.kind === 'edge') {
+      this.appendMeasure([item]);
+      return;
+    }
+    const tail = this.measureChainTail;
+    if (!tail) {
+      this.measureChainTail = item;
+      this.syncMeasureBar();
+      this.redraw();
+      return;
+    }
+    if (samePoint(tail, item)) return;
+    this.appendMeasure([{ kind: 'span', a: tail, b: item }]);
+    this.measureChainTail = item;
+    this.syncMeasureBar();
+  }
+
+  /** Turn a finished measure-line drag into the spans it measures. */
+  private commitMeasureLine(drag: Extract<DragKind, { type: 'measureLine' }>): void {
+    const items = measureLineSpans(this.pattern.pieces, drag.start, drag.current);
+    if (items.length === 0) {
+      // Nothing to read: a line that misses the work, or grazes one edge only.
+      this.redraw();
+      return;
+    }
+    // A measure line is a measurement of its own, so it does not extend whatever
+    // the picks were building, and the pick waiting for a partner is dropped.
+    this.finishMeasureDraft();
+    this.beginMeasure(items);
+    this.finishMeasureDraft();
+    this.syncMeasureBar();
+    this.notifyReferenceChange();
+    this.redraw();
+  }
+
+  /** Hovering a readout lights up everything it reads. */
+  private setMeasureHover(id: string | null): void {
+    if (this.measureHoverId === id) return;
+    this.measureHoverId = id;
+    this.applyCursor(null);
+    this.redraw();
+  }
+
+  /** Shift-clicking a readout gathers it up, or lets it go again. */
+  private toggleMeasureSelected(id: string): void {
+    if (this.measureSelection.has(id)) this.measureSelection.delete(id);
+    else this.measureSelection.add(id);
+    this.syncMeasureBar();
+    this.redraw();
+  }
+
+  private clearMeasureSelection(): void {
+    if (this.measureSelection.size === 0) return;
+    this.measureSelection.clear();
+    this.syncMeasureBar();
+    this.redraw();
+  }
+
+  /**
+   * Total the gathered measurements into one of their own.
+   *
+   * The new measurement copies their items rather than pointing at them: the
+   * items name pieces and edges, not coordinates, so it still reads the pattern
+   * live — and it can be moved and deleted without touching the measurements it
+   * was made from, which are left exactly as they were.
+   */
+  private sumSelectedMeasures(): void {
+    const sources = this.measures().filter((measure) => this.measureSelection.has(measure.id));
+    const items = sources.flatMap((measure) => measure.items);
+    if (sources.length < 2 || items.length === 0) {
+      this.clearMeasureSelection();
+      return;
+    }
+    // Its readout goes where any fresh one does — above the middle of what it
+    // reads, nudged clear of the part readouts already up.
+    const measure: PatternMeasure = {
+      id: uid('measure'),
+      label: this.defaultMeasureLabel(items),
+      items,
+      sumOf: sources.length,
+    };
+    this.markBeforeChange();
+    this.ensureMeasures().push(measure);
+    this.endHistoryGesture();
+    this.measureSelection.clear();
+    this.finishMeasureDraft();
+    this.notifyReferenceChange();
+    this.syncMeasureBar();
+    this.redraw();
+  }
+
+  /** The measurement the measure bar is talking about, if the tool is in hand. */
+  private syncMeasureBar(): void {
+    if (!this.measureBar) return;
+    const active = this.tool === 'measure';
+    this.measureBar.hidden = !active;
+    if (!active) return;
+    const readout = this.measureBar.querySelector('[data-measure-readout]') as HTMLElement;
+    const sum = this.measureBar.querySelector('[data-measure-sum]') as HTMLButtonElement;
+    const clear = this.measureBar.querySelector('[data-measure-clear]') as HTMLButtonElement;
+    const done = this.measureBar.querySelector('[data-measure-done]') as HTMLButtonElement;
+
+    // A gathering for a total takes the bar over: it is what Shift is for.
+    const gathered = [...this.measureSelection];
+    if (gathered.length > 0) {
+      const total = this.measures()
+        .filter((measure) => this.measureSelection.has(measure.id))
+        .reduce((sum, measure) => sum + measureReading(this.pattern.pieces, measure).totalCm, 0);
+      readout.textContent = `${gathered.length} gathered · ${formatLength(total, this.unit, 1)} — ${
+        gathered.length > 1 ? 'Sum them' : 'gather another'
+      }`;
+      sum.hidden = false;
+      sum.disabled = gathered.length < 2;
+      sum.textContent = `Sum ${gathered.length}`;
+      clear.hidden = true;
+      done.hidden = false;
+      done.textContent = 'Clear picks';
+      return;
+    }
+    done.textContent = 'Done';
+
+    const draft = this.findMeasure(this.measureDraftId);
+    if (!draft) {
+      readout.textContent = this.measureChainTail
+        ? 'First point picked — pick another to measure between them'
+        : 'Click points and edges, or drag a line across the work';
+      sum.hidden = true;
+      clear.hidden = !this.measureChainTail;
+      done.hidden = !this.measureChainTail;
+      return;
+    }
+    const reading = measureReading(this.pattern.pieces, draft);
+    const label = measureLabelText(reading, this.unit, draft);
+    sum.hidden = true;
+    readout.textContent = this.measureChainTail
+      ? `${label.secondary} · ${label.primary} · chain open`
+      : `${label.secondary} · ${label.primary}`;
+    clear.hidden = false;
+    done.hidden = false;
   }
 
   private findRulerHit(p: Vec2): RulerHit | null {
@@ -4398,7 +5355,7 @@ export class PatternEditor {
     this.ensureRulers().push(ruler);
     this.selectedRulerId = ruler.id;
     this.syncRulerBar();
-    this.notifyRulerChange();
+    this.notifyReferenceChange();
     this.endHistoryGesture();
   }
 
@@ -4407,7 +5364,7 @@ export class PatternEditor {
     if (!ruler || ruler.half === half) return;
     this.markBeforeChange();
     ruler.half = half;
-    this.notifyRulerChange();
+    this.notifyReferenceChange();
     this.endHistoryGesture();
     this.syncRulerBar();
     this.redraw();
@@ -4423,7 +5380,7 @@ export class PatternEditor {
     // Keep the stored fallback truthful for the new person.
     const live = measurementValueCm(set, ruler.measurementId);
     if (live != null) ruler.lengthCm = live;
-    this.notifyRulerChange();
+    this.notifyReferenceChange();
     this.endHistoryGesture();
     this.syncRulerBar();
     this.redraw();
@@ -4444,7 +5401,7 @@ export class PatternEditor {
         ruler.personName = set.name;
       }
     }
-    this.notifyRulerChange();
+    this.notifyReferenceChange();
     this.endHistoryGesture();
     this.syncRulerBar();
     this.redraw();
@@ -4457,7 +5414,7 @@ export class PatternEditor {
     this.pattern.rulers = this.rulers().filter((r) => r.id !== ruler.id);
     this.selectedRulerId = null;
     this.hoverRulerId = null;
-    this.notifyRulerChange();
+    this.notifyReferenceChange();
     this.endHistoryGesture();
     this.syncRulerBar();
     this.redraw();
@@ -5757,6 +6714,319 @@ export class PatternEditor {
    * appends *after* the pattern so the readings stay legible on top of a piece
    * while the scale itself stays behind it.
    */
+  /**
+   * The measurements, drawn like the dimensions on a technical drawing: a line
+   * with a tick at each end for a span, the edge itself lit up when the item is
+   * an edge, and a value that can be parked anywhere.
+   *
+   * Hovering a readout lights everything that measurement reads, which is the
+   * whole point of summing several edges into one number: the value says how
+   * much, the highlight says *of what*.
+   */
+  private drawMeasures(): void {
+    const list = this.measures();
+    const draft = this.drag?.type === 'measureLine' ? this.drag : null;
+    for (const measure of list) {
+      const hot = this.measureHoverId === measure.id || this.measureDraftId === measure.id;
+      const gathered = this.measureSelection.has(measure.id);
+      const reading = measureReading(this.pattern.pieces, measure);
+      const group = svgEl('g');
+      group.setAttribute(
+        'class',
+        `pattern-measure${hot ? ' is-hot' : ''}${reading.stale > 0 ? ' is-stale' : ''}${
+          gathered ? ' is-gathered' : ''
+        }${measure.sumOf && measure.sumOf > 1 ? ' is-sum' : ''}`
+      );
+      group.setAttribute('pointer-events', 'none');
+
+      const refs = measureReferences(measure);
+      // What it reads, lit up under the dimension lines. The whole edge is
+      // shown rather than just the stretch between the stops, so hovering a
+      // value answers "of what?" at a glance.
+      for (const edge of refs.edges) {
+        this.drawMeasureEdge(edge, hot);
+      }
+
+      for (const item of measure.items) {
+        const span = measureItemSpan(this.pattern.pieces, item);
+        if (!span) continue;
+        group.appendChild(this.drawMeasureItem(item, span, hot));
+      }
+
+      const label = measureLabelText(reading, this.unit, measure);
+      const anchor = measureAnchorPoints(this.pattern.pieces, measure);
+      // The readout goes into the group last so it draws over its own dimension
+      // lines, and travels with them in the DOM.
+      group.appendChild(
+        this.drawMeasureLabel(measure, label, hot, anchor, gathered || !!measure.sumOf)
+      );
+      this.svg.appendChild(group);
+    }
+    if (draft) this.drawMeasureLineDraft(draft);
+    // The pick waiting for a partner, so the first click of a measurement is not
+    // silent.
+    const tail = this.tool === 'measure' ? this.measureChainTail : null;
+    if (tail) {
+      const at = resolveMeasureAnchor(this.pattern.pieces, tail);
+      if (at) {
+        const dot = svgEl('circle');
+        dot.setAttribute('cx', String(at.x));
+        dot.setAttribute('cy', String(at.y));
+        dot.setAttribute('r', String(this.px(4.5)));
+        dot.setAttribute('class', 'pattern-measure-ref-point is-hot');
+        dot.setAttribute('pointer-events', 'none');
+        dot.setAttribute('stroke-width', String(this.px(1.4)));
+        this.svg.appendChild(dot);
+      }
+    }
+  }
+
+  /** One dimension line: span, or the edge's own curve with its length on it. */
+  private drawMeasureItem(
+    item: MeasureItem,
+    span: { a: Vec2; b: Vec2; mid: Vec2; lengthCm: number },
+    hot: boolean
+  ): SVGGElement {
+    const group = svgEl('g');
+    if (item.kind === 'edge') {
+      const piece = this.pattern.pieces.find((entry) => entry.id === item.pieceId);
+      const samples = piece
+        ? sampleEdgeByPointIds(piece, item.fromPointId, item.toPointId, 20)
+        : null;
+      if (samples && samples.length > 1) {
+        let d = `M ${samples[0]!.x} ${samples[0]!.y}`;
+        for (let i = 1; i < samples.length; i++) d += ` L ${samples[i]!.x} ${samples[i]!.y}`;
+        const path = svgEl('path');
+        path.setAttribute('d', d);
+        path.setAttribute('class', 'pattern-measure-dim');
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke-width', String(this.px(hot ? 3 : 2)));
+        group.appendChild(path);
+      }
+      group.appendChild(
+        this.measureText(
+          formatLength(span.lengthCm, this.unit, 1),
+          span.mid.x,
+          span.mid.y - this.px(9),
+          'pattern-measure-value'
+        )
+      );
+      // An edge item is measured between the piece's own points, so its stops
+      // are control points, not measure points.
+      this.drawMeasureStops(
+        group,
+        [
+          { at: span.a, measurePoint: false },
+          { at: span.b, measurePoint: false },
+        ],
+        hot
+      );
+      return group;
+    }
+
+    const line = svgLine(span.a.x, span.a.y, span.b.x, span.b.y, 'pattern-measure-span', this.px(1.3));
+    group.appendChild(line);
+    const tick = this.px(7);
+    for (const end of [span.a, span.b]) {
+      group.appendChild(
+        this.drawMeasureTick(end, span.b.x - span.a.x, span.b.y - span.a.y, tick, hot)
+      );
+    }
+    // The number sits off the line, on the side the drawing reads from.
+    const nx = -(span.b.y - span.a.y);
+    const ny = span.b.x - span.a.x;
+    const len = Math.hypot(nx, ny) || 1;
+    const off = this.px(11);
+    group.appendChild(
+      this.measureText(
+        formatLength(span.lengthCm, this.unit, 1),
+        span.mid.x + (nx / len) * off,
+        span.mid.y + (ny / len) * off,
+        'pattern-measure-value'
+      )
+    );
+    this.drawMeasureStops(
+      group,
+      [
+        { at: span.a, measurePoint: item.a.kind === 'edge' },
+        { at: span.b, measurePoint: item.b.kind === 'edge' },
+      ],
+      hot
+    );
+    return group;
+  }
+
+  /**
+   * A mark at each end of what is measured. A control point gets a filled dot; a
+   * measure point — one the software placed on an edge, which is not a control
+   * point of the piece — is ringed, so it is never mistaken for something you
+   * can drag as geometry.
+   */
+  private drawMeasureStops(
+    group: SVGGElement,
+    stops: ReadonlyArray<{ at: Vec2; measurePoint: boolean }>,
+    hot: boolean
+  ): void {
+    for (const stop of stops) {
+      if (stop.measurePoint) {
+        const ring = svgEl('circle');
+        ring.setAttribute('cx', String(stop.at.x));
+        ring.setAttribute('cy', String(stop.at.y));
+        ring.setAttribute('r', String(this.px(hot ? 6 : 5)));
+        ring.setAttribute('class', `pattern-measure-stop-ring${hot ? ' is-hot' : ''}`);
+        ring.setAttribute('fill', 'none');
+        ring.setAttribute('stroke-width', String(this.px(1.2)));
+        group.appendChild(ring);
+      }
+      const dot = svgEl('circle');
+      dot.setAttribute('cx', String(stop.at.x));
+      dot.setAttribute('cy', String(stop.at.y));
+      dot.setAttribute('r', String(this.px(hot ? 3.2 : 2.6)));
+      dot.setAttribute('class', `pattern-measure-stop${hot ? ' is-hot' : ''}`);
+      dot.setAttribute('stroke-width', String(this.px(1)));
+      group.appendChild(dot);
+    }
+  }
+
+  /** The end tick of a dimension line, square to the span. */
+  private drawMeasureTick(end: Vec2, dx: number, dy: number, half: number, hot: boolean): SVGLineElement {
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    const line = svgLine(
+      end.x - nx * half,
+      end.y - ny * half,
+      end.x + nx * half,
+      end.y + ny * half,
+      'pattern-measure-tick',
+      this.px(hot ? 1.8 : 1.3)
+    );
+    return line;
+  }
+
+  /** The whole edge a measurement reads, lit under the dimension line. */
+  private drawMeasureEdge(
+    edge: { pieceId: string; fromPointId: string; toPointId: string },
+    hot: boolean
+  ): void {
+    const piece = this.pattern.pieces.find((entry) => entry.id === edge.pieceId);
+    if (!piece) return;
+    const samples = sampleEdgeByPointIds(piece, edge.fromPointId, edge.toPointId, 20);
+    if (!samples || samples.length < 2) return;
+    let d = `M ${samples[0]!.x} ${samples[0]!.y}`;
+    for (let i = 1; i < samples.length; i++) d += ` L ${samples[i]!.x} ${samples[i]!.y}`;
+    const path = svgEl('path');
+    path.setAttribute('d', d);
+    path.setAttribute('class', `pattern-measure-ref${hot ? ' is-hot' : ''}`);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('pointer-events', 'none');
+    path.setAttribute('stroke-width', String(this.px(hot ? 4.5 : 3)));
+    this.svg.appendChild(path);
+  }
+
+  /**
+   * The value itself: the one thing on a measurement you can take hold of. It is
+   * drawn last so it sits over whatever it reads, and carries the frame when the
+   * measurement is in hand or under the pointer.
+   */
+  private drawMeasureLabel(
+    measure: PatternMeasure,
+    label: { primary: string; secondary: string },
+    hot: boolean,
+    anchors: readonly Vec2[],
+    emphasis: boolean
+  ): SVGGElement {
+    const group = svgEl('g');
+    const at = measure.label;
+    group.setAttribute('class', `pattern-measure-label${hot ? ' is-hot' : ''}`);
+    group.setAttribute('pointer-events', 'none');
+
+    // A leader back to what it reads, so a parked value still says what it is
+    // about. Faint, and only when the readout has been moved off its geometry.
+    if (anchors.length > 0) {
+      const cx = anchors.reduce((sum, p) => sum + p.x, 0) / anchors.length;
+      const cy = anchors.reduce((sum, p) => sum + p.y, 0) / anchors.length;
+      if (Math.hypot(cx - at.x, cy - at.y) > this.px(26)) {
+        const leader = svgLine(at.x, at.y, cx, cy, 'pattern-measure-leader', this.px(1));
+        leader.setAttribute('stroke-dasharray', `${this.px(3)} ${this.px(3)}`);
+        group.appendChild(leader);
+      }
+    }
+
+    const chip = svgEl('rect');
+    // Sized to the wider of the two lines: the secondary line names what the
+    // value is made of and is usually the longer one.
+    const fontPx = 11;
+    const textPx = (text: string): number => text.length * fontPx * 0.62;
+    const width = this.px(Math.max(56, Math.max(textPx(label.primary), textPx(label.secondary)) + 18));
+    const height = this.px(32);
+    chip.setAttribute('x', String(at.x - width / 2));
+    chip.setAttribute('y', String(at.y - height / 2));
+    chip.setAttribute('width', String(width));
+    chip.setAttribute('height', String(height));
+    chip.setAttribute('rx', String(this.px(5)));
+    chip.setAttribute('class', 'pattern-measure-chip');
+    // Emphasis is a width, so it goes through `px()`: a bare number in CSS would
+    // be user units and come out several times too thick.
+    chip.setAttribute('stroke-width', String(this.px(emphasis ? 2 : 1)));
+    group.appendChild(chip);
+
+    group.appendChild(
+      this.measureText(label.primary, at.x, at.y - this.px(1), 'pattern-measure-total')
+    );
+    group.appendChild(
+      this.measureText(label.secondary, at.x, at.y + this.px(12), 'pattern-measure-parts')
+    );
+    return group;
+  }
+  private measureText(text: string, x: number, y: number, cls: string): SVGTextElement {
+    const el = svgEl('text');
+    el.setAttribute('x', String(x));
+    el.setAttribute('y', String(y));
+    el.setAttribute('class', cls);
+    el.setAttribute('text-anchor', 'middle');
+    el.setAttribute('font-size', String(this.px(11)));
+    el.setAttribute('pointer-events', 'none');
+    el.style.userSelect = 'none';
+    el.textContent = text;
+    return el;
+  }
+
+  /** The line being drawn, and where it would put its measure points. */
+  private drawMeasureLineDraft(drag: Extract<DragKind, { type: 'measureLine' }>): void {
+    const line = svgLine(
+      drag.start.x,
+      drag.start.y,
+      drag.current.x,
+      drag.current.y,
+      'pattern-measure-line-draft',
+      this.px(1.4)
+    );
+    line.setAttribute('stroke-dasharray', `${this.px(5)} ${this.px(4)}`);
+    line.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(line);
+
+    if (dist(drag.start, drag.current) < this.px(6)) return;
+    // The stops the drag would place: only the crossings that end up measured,
+    // so the preview says exactly which stretches of the work will be read.
+    const spans = measureLineSpans(this.pattern.pieces, drag.start, drag.current);
+    for (const span of spans) {
+      if (span.kind !== 'span') continue;
+      for (const anchor of [span.a, span.b]) {
+        const p = resolveMeasureAnchor(this.pattern.pieces, anchor);
+        if (!p) continue;
+        const dot = svgEl('circle');
+        dot.setAttribute('cx', String(p.x));
+        dot.setAttribute('cy', String(p.y));
+        dot.setAttribute('r', String(this.px(4)));
+        dot.setAttribute('class', 'pattern-measure-ref-point is-hot');
+        dot.setAttribute('pointer-events', 'none');
+        dot.setAttribute('stroke-width', String(this.px(1.4)));
+        this.svg.appendChild(dot);
+      }
+    }
+  }
+
   private drawRulers(): SVGGElement[] {
     const list = this.rulers();
     const draft = this.drag?.type === 'rulerCreate' ? this.drag : null;
@@ -6062,9 +7332,22 @@ export class PatternEditor {
       return;
     }
 
-    // The move tool can pick a ruler up off the canvas too — but only when the
-    // click is not landing on a pattern point or handle, which take precedence.
+    // Measure builds a measurement out of what you pick, or draws one across the
+    // work; its readout is the handle for moving it.
+    if (this.tool === 'measure') {
+      this.onMeasureDown(e, p);
+      return;
+    }
+
+    // The move tool can pick a ruler or a readout up off the canvas too — but
+    // only when the click is not landing on a pattern point or handle, which
+    // take precedence.
     if (this.tool === 'move' && !kind) {
+      const measureHit = this.findMeasureHit(p);
+      if (measureHit?.part === 'label') {
+        this.onMeasureDown(e, p);
+        return;
+      }
       const rulerHit = this.findRulerHit(p);
       if (rulerHit) {
         this.onRulerDown(e, p, rulerHit);
@@ -6091,6 +7374,33 @@ export class PatternEditor {
         this.redraw();
         return;
       }
+    }
+
+    // Seam allowance, with the allowance shown: a plain click picks the edge
+    // under the pointer so the ribbon can set it. ⌘/Ctrl-click is left alone, so
+    // the point insert above still works and the modifier keeps its own meaning.
+    if (
+      this.tool === 'move' &&
+      this.allowanceOn &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.shiftKey &&
+      !e.altKey &&
+      kind !== 'anchor' &&
+      kind !== 'handleIn' &&
+      kind !== 'handleOut'
+    ) {
+      const hit = this.edgesNear(p)[0] ?? null;
+      if (hit) {
+        this.setRulerSelection(null);
+        const same =
+          this.allowanceEdge?.pieceId === hit.piece.id &&
+          this.allowanceEdge?.edgeIndex === hit.edgeIndex;
+        this.setAllowanceEdge(same ? null : { pieceId: hit.piece.id, edgeIndex: hit.edgeIndex });
+        e.preventDefault();
+        return;
+      }
+      this.setAllowanceEdge(null);
     }
 
     // Cmd/Ctrl is the panel modifier: the press takes the panel under the pointer
@@ -6961,7 +8271,8 @@ export class PatternEditor {
    */
   private syncToolSettings(): void {
     if (!this.toolSettings) return;
-    const showing = this.hasToolSettings();
+    // The allowance ribbon is showing an edge: the slot is taken.
+    const showing = this.hasToolSettings() && !(this.allowanceOn && !!this.allowanceEdge);
     this.toolSettings.hidden = !showing;
     if (!showing) return;
     this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
@@ -7635,6 +8946,67 @@ export class PatternEditor {
     this.svg.appendChild(path);
   }
 
+  /**
+   * Every piece's allowance line, then the edge in hand lit up against it. The
+   * line is dashed the way a cutter reads one: the seam line is the piece, this
+   * is what is left outside it.
+   */
+  private drawSeamAllowances(): void {
+    // Hicon shows the allowance whether or not the allowance tool is in hand:
+    // it is one of the three things that mode draws. The picking that the tool
+    // adds stays behind `allowanceOn` — a projection is not a drafting session.
+    if (!this.allowanceOn && !this.hiconOn) return;
+    for (const piece of this.pattern.pieces) {
+      const d = allowanceRingPath(seamAllowanceOutline(piece));
+      if (!d) continue;
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', d);
+      path.setAttribute(
+        'class',
+        `pattern-allowance${this.blockOwnership.has(piece.id) ? ' is-block' : ''}`
+      );
+      path.setAttribute('fill', 'none');
+      path.setAttribute('pointer-events', 'none');
+      path.setAttribute('stroke-width', String(this.px(1.4)));
+      path.setAttribute('stroke-dasharray', `${this.px(6)} ${this.px(4)}`);
+      path.dataset.pieceId = piece.id;
+      this.svg.appendChild(path);
+    }
+
+    this.drawAllowanceEdgeMark(this.allowanceHover, 'is-hover');
+    this.drawAllowanceEdgeMark(this.allowanceEdge, 'is-picked');
+  }
+
+  /** One edge, and the allowance line that belongs to it. */
+  private drawAllowanceEdgeMark(
+    sel: { pieceId: string; edgeIndex: number } | null,
+    state: 'is-hover' | 'is-picked'
+  ): void {
+    if (!sel) return;
+    const piece = this.pattern.pieces.find((entry) => entry.id === sel.pieceId);
+    if (!piece) return;
+    const n = piece.points.length;
+    const from = piece.points[sel.edgeIndex];
+    const to = piece.points[(sel.edgeIndex + 1) % n];
+    if (!from || !to) return;
+    this.drawSeamEdgeStroke(
+      { pieceId: piece.id, fromPointId: from.id, toPointId: to.id, t0: 0, t1: 1 },
+      `pattern-allowance-edge ${state}`,
+      false
+    );
+    const span = allowanceSpanForEdge(piece, sel.edgeIndex);
+    if (span.length < 2) return;
+    let d = `M ${span[0].x} ${span[0].y}`;
+    for (let i = 1; i < span.length; i++) d += ` L ${span[i].x} ${span[i].y}`;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('class', `pattern-allowance-span ${state}`);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('pointer-events', 'none');
+    path.setAttribute('stroke-width', String(this.px(state === 'is-picked' ? 3 : 2.25)));
+    this.svg.appendChild(path);
+  }
+
   private drawSeams(): void {
     if (this.seamConnectorsOn) {
       drawMeshSeamConnectors(this.svg, this.pattern, {
@@ -8041,6 +9413,13 @@ export class PatternEditor {
   }
 
   private onPointerMove(e: PointerEvent): void {
+    // Hovering a readout lights everything it reads, under either of the tools
+    // that can take hold of one.
+    if (!this.drag && this.measureInteractive()) {
+      const hit = this.findMeasureHit(this.svgPoint(e));
+      this.setMeasureHover(hit ? hit.id : null);
+    }
+
     // Sew tool: hover highlight edges even when not dragging
     if ((this.tool === 'sew' || this.tool === 'join' || this.tool === 'bridge') && !this.drag) {
       const p = this.svgPoint(e);
@@ -8119,6 +9498,23 @@ export class PatternEditor {
       return;
     }
 
+    // Seam allowance: while it is shown, the move tool lights the edge a click
+    // would give its own allowance to.
+    if (this.tool === 'move' && this.allowanceOn && !this.drag) {
+      const hit = this.edgesNear(this.svgPoint(e))[0] ?? null;
+      const next = hit ? { pieceId: hit.piece.id, edgeIndex: hit.edgeIndex } : null;
+      const changed =
+        !!next !== !!this.allowanceHover ||
+        (!!next &&
+          !!this.allowanceHover &&
+          (next.pieceId !== this.allowanceHover.pieceId ||
+            next.edgeIndex !== this.allowanceHover.edgeIndex));
+      if (changed) {
+        this.allowanceHover = next;
+        this.redraw();
+      }
+    }
+
     // Hover feedback for rulers, and for the rotate zones beside a selection's
     // corner grips (ruler + move tools only).
     if (!this.drag && (this.tool === 'ruler' || this.tool === 'move')) {
@@ -8188,6 +9584,25 @@ export class PatternEditor {
       return;
     }
 
+    if (this.drag.type === 'measureLine') {
+      this.drag.current = p;
+      this.redraw();
+      return;
+    }
+
+    if (this.drag.type === 'measureMove') {
+      const d = this.drag;
+      const measure = this.findMeasure(d.id);
+      if (!measure) return;
+      measure.label = {
+        x: d.origin.x + (p.x - d.start.x),
+        y: d.origin.y + (p.y - d.start.y),
+      };
+      this.redraw();
+      this.notifyReferenceChange();
+      return;
+    }
+
     if (this.drag.type === 'rulerCreate') {
       this.drag.current = p;
       this.drag.snap = e.shiftKey;
@@ -8201,7 +9616,7 @@ export class PatternEditor {
       if (!ruler) return;
       ruler.center = { x: d.origin.x + (p.x - d.start.x), y: d.origin.y + (p.y - d.start.y) };
       this.redraw();
-      this.notifyRulerChange();
+      this.notifyReferenceChange();
       return;
     }
 
@@ -8221,7 +9636,7 @@ export class PatternEditor {
         setRulerDrawnLength(ruler, Math.max(1, Math.hypot(dx, dy) * 2));
       }
       this.redraw();
-      this.notifyRulerChange();
+      this.notifyReferenceChange();
       return;
     }
 
@@ -8436,6 +9851,13 @@ export class PatternEditor {
 
     if (finished.type === 'rulerCreate') {
       this.commitRulerCreate(finished);
+      this.endHistoryGesture();
+      this.redraw();
+      return;
+    }
+
+    if (finished.type === 'measureLine') {
+      this.commitMeasureLine(finished);
       this.endHistoryGesture();
       this.redraw();
       return;

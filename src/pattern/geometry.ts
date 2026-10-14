@@ -408,6 +408,12 @@ export function edgeHandles(
   return { c0, c1 };
 }
 
+/** Is the edge between two points a straight segment (both handles zeroed)? */
+export function edgeIsStraight(a: BezierPoint, b: BezierPoint): boolean {
+  const { c0, c1 } = edgeHandles(a, b);
+  return c0.x === a.anchor.x && c0.y === a.anchor.y && c1.x === b.anchor.x && c1.y === b.anchor.y;
+}
+
 /** Flatten closed piece to polyline (cm). */
 export function pieceToPolyline(points: BezierPoint[], closed: boolean, stepsPerEdge = 12): Vec2[] {
   if (points.length === 0) return [];
@@ -533,28 +539,53 @@ function offsetVec2(v: Vec2, dx: number, dy: number): Vec2 {
 }
 
 /** Deep-clone a pattern piece with new ids and optional translation. */
+/**
+ * Carry seam allowance overrides onto a copy: they are keyed by the id of the
+ * point an edge starts at, so a clone that renames its points renames the keys.
+ */
+export function remapSeamAllowance(
+  allowance: PatternPiece['seamAllowance'],
+  pointIdMap: Map<string, string>
+): PatternPiece['seamAllowance'] {
+  if (!allowance) return undefined;
+  const edges: Record<string, number> = {};
+  for (const [key, value] of Object.entries(allowance.edges ?? {})) {
+    edges[pointIdMap.get(key) ?? key] = value;
+  }
+  return Object.keys(edges).length > 0
+    ? { defaultCm: allowance.defaultCm, edges }
+    : { defaultCm: allowance.defaultCm };
+}
+
 export function clonePatternPiece(
   piece: PatternPiece,
   makeId: () => string,
   offset: Vec2 = { x: 0, y: 0 }
 ): PatternPiece {
-  return {
-    id: makeId(),
-    name: piece.name.endsWith(' copy') ? piece.name : `${piece.name} copy`,
-    closed: piece.closed,
-    points: piece.points.map((pt) => ({
-      id: makeId(),
+  const pointIdMap = new Map<string, string>();
+  const points = piece.points.map((pt) => {
+    const id = makeId();
+    pointIdMap.set(pt.id, id);
+    return {
+      id,
       anchor: offsetVec2(pt.anchor, offset.x, offset.y),
       handleIn: pt.handleIn ? offsetVec2(pt.handleIn, offset.x, offset.y) : null,
       handleOut: pt.handleOut ? offsetVec2(pt.handleOut, offset.x, offset.y) : null,
       handlesParallel: pt.handlesParallel,
-    })),
+    };
+  });
+  return {
+    id: makeId(),
+    name: piece.name.endsWith(' copy') ? piece.name : `${piece.name} copy`,
+    closed: piece.closed,
+    points,
     grainline: piece.grainline
       ? {
           from: offsetVec2(piece.grainline.from, offset.x, offset.y),
           to: offsetVec2(piece.grainline.to, offset.x, offset.y),
         }
       : undefined,
+    seamAllowance: remapSeamAllowance(piece.seamAllowance, pointIdMap),
   };
 }
 
@@ -572,13 +603,18 @@ export function mirrorClonePatternPiece(
   const cx = (box.minX + box.maxX) / 2;
   const cy = (box.minY + box.maxY) / 2;
 
-  const mirroredPts: BezierPoint[] = piece.points.map((pt) => ({
-    id: makeId(),
-    anchor: mirrorVec2(pt.anchor, cx, cy, axis),
-    handleIn: pt.handleIn ? mirrorVec2(pt.handleIn, cx, cy, axis) : null,
-    handleOut: pt.handleOut ? mirrorVec2(pt.handleOut, cx, cy, axis) : null,
-    handlesParallel: pt.handlesParallel,
-  }));
+  const pointIdMap = new Map<string, string>();
+  const mirroredPts: BezierPoint[] = piece.points.map((pt) => {
+    const id = makeId();
+    pointIdMap.set(pt.id, id);
+    return {
+      id,
+      anchor: mirrorVec2(pt.anchor, cx, cy, axis),
+      handleIn: pt.handleIn ? mirrorVec2(pt.handleIn, cx, cy, axis) : null,
+      handleOut: pt.handleOut ? mirrorVec2(pt.handleOut, cx, cy, axis) : null,
+      handlesParallel: pt.handlesParallel,
+    };
+  });
 
   // Reverse winding + swap handles so edge directions stay consistent
   mirroredPts.reverse();
@@ -618,6 +654,9 @@ export function mirrorClonePatternPiece(
     closed: piece.closed,
     points: mirroredPts,
     grainline,
+    // Mirroring reverses the winding, so the allowance travels with the points
+    // it was set on rather than with the edge numbers.
+    seamAllowance: remapSeamAllowance(piece.seamAllowance, pointIdMap),
   };
 }
 

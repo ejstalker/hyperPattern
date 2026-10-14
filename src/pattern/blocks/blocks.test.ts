@@ -889,6 +889,31 @@ describe('splicing generated pieces into a pattern', () => {
     expect(second.pieces[0]).toBe(other);
   });
 
+  it('keeps the seam allowance an edited piece was given', () => {
+    const block = instance();
+    const first = spliceBlockPieces([other], block, generateBlockPieces(SKIRT_BLOCK, block, null));
+    const owned: BlockInstance = { ...block, pieces: first.ownership };
+    const edited = first.pieces.map((piece, index) =>
+      index === 1
+        ? {
+            ...piece,
+            seamAllowance: { defaultCm: 2, edges: { [piece.points[0].id]: 1 } },
+          }
+        : piece
+    );
+    const second = spliceBlockPieces(
+      edited,
+      owned,
+      generateBlockPieces(SKIRT_BLOCK, owned, null)
+    );
+    // Regeneration rebuilds the outline, but the allowance is not the outline.
+    expect(second.pieces[1].seamAllowance).toEqual({
+      defaultCm: 2,
+      edges: { [second.pieces[1].points[0].id]: 1 },
+    });
+    expect(second.pieces[2].seamAllowance).toBeUndefined();
+  });
+
   it('drops pieces the block no longer produces', () => {
     const block: BlockInstance = {
       ...instance(),

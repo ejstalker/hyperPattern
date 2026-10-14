@@ -1391,7 +1391,7 @@ export class SimViewportRuntime {
       ctx.fillStyle = '#1a1815';
       ctx.fillRect(0, 0, c.width, c.height);
       ctx.fillStyle = '#f2ebe3';
-      ctx.font = '20px sans-serif';
+      ctx.font = `20px ${getComputedStyle(document.body).fontFamily}`;
       ctx.fillText('Sim snapshot (GPU readback pending)', 24, 48);
       return c.toDataURL('image/png');
     }
