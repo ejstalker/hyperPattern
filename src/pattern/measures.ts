@@ -17,6 +17,7 @@ import {
   pointInPolygon,
   pointOnEdgeAtT,
   sampleCubic,
+  piecePointById,
 } from './geometry';
 
 /**
@@ -51,7 +52,9 @@ export function resolveMeasureAnchor(
   const piece = pieceById(pieces, anchor.pieceId);
   if (!piece) return null;
   if (anchor.kind === 'point') {
-    const pt = piece.points.find((candidate) => candidate.id === anchor.pointId);
+    // Hole points are points of the piece like any other: an anchor on one is as
+    // good as an anchor on the outline.
+    const pt = piecePointById(piece, anchor.pointId);
     return pt ? { ...pt.anchor } : null;
   }
   // The fraction is clamped, so an anchor always lands on the edge even if the

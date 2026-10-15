@@ -139,3 +139,78 @@ describe('thin-strip meshing', () => {
     expectNoDegenerateTriangles(mesh);
   });
 });
+
+/**
+ * A panel with a hole cut out of it.
+ *
+ * The hole is real cloth geometry, not a drawing: the mesh has to leave it empty,
+ * and its rim is a boundary of the cloth with vertices on it — which is what lets
+ * a piece be sewn into the opening, and what stops the drape hanging a curtain
+ * across it.
+ */
+describe('meshing a panel with a hole', () => {
+  const frame = (holes?: BezierPoint[][]): PatternPiece => ({
+    id: 'frame',
+    name: 'Frame',
+    closed: true,
+    points: rectPoints('outer', 0, 0, 40, 40),
+    holes,
+  });
+
+  const pattern = (piece: PatternPiece): PatternDocument => ({
+    id: 'pat',
+    name: 'Pat',
+    pieces: [piece],
+    seams: [],
+  });
+
+  const triangleCentroids = (mesh: MeshGeometry): Vec2[] => {
+    const out: Vec2[] = [];
+    for (let t = 0; t + 2 < mesh.triangles.length; t += 3) {
+      const [a, b, c] = [mesh.triangles[t], mesh.triangles[t + 1], mesh.triangles[t + 2]].map(
+        (i) => mesh.vertices[i]!
+      );
+      out.push({ x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3 });
+    }
+    return out;
+  };
+
+  it('leaves the hole empty and keeps the cloth around it', () => {
+    const hole = rectRing(15, 15, 10, 10);
+    const mesh = triangulatePattern(pattern(frame([rectPoints('hole', 15, 15, 10, 10)])), DEFAULT_MESH_SETTINGS);
+    expect(mesh.triangles.length).toBeGreaterThan(0);
+    // Nothing spans the hole: no triangle has its middle inside it.
+    for (const c of triangleCentroids(mesh)) {
+      expect(pointInPolygon(c, hole)).toBe(false);
+    }
+    // But the cloth is still there around it, on all four sides.
+    const centroids = triangleCentroids(mesh);
+    expect(centroids.some((c) => c.x < 15 && c.y < 15)).toBe(true);
+    expect(centroids.some((c) => c.x > 25 && c.y > 25)).toBe(true);
+    expect(centroids.some((c) => c.y > 25)).toBe(true);
+    expect(centroids.some((c) => c.y < 15)).toBe(true);
+    expectNoDegenerateTriangles(mesh);
+  });
+
+  it('puts mesh verts on the hole rim, tagged to its edges', () => {
+    const piece = frame([rectPoints('hole', 15, 15, 10, 10)]);
+    const mesh = triangulatePattern(pattern(piece), DEFAULT_MESH_SETTINGS);
+    const rim = piece.holes![0]!;
+    const onRim = (mesh.boundary ?? []).filter((tag) => tag?.pieceId === 'frame' && tag.fromPointId.startsWith('hole'));
+    expect(onRim.length).toBeGreaterThan(4);
+    for (const tag of onRim) {
+      // Every one of those tags names a real edge of the hole ring.
+      expect(rim.some((pt) => pt.id === tag!.fromPointId)).toBe(true);
+    }
+  });
+
+  it('meshes the same panel solid when nothing is cut out of it', () => {
+    // The contrast that says the hole is doing the work: the same panel with no
+    // hole has cloth — and so mesh — right across where the hole would be.
+    const hole = rectRing(15, 15, 10, 10);
+    const solid = triangulatePattern(pattern(frame()), DEFAULT_MESH_SETTINGS);
+    const holed = triangulatePattern(pattern(frame([rectPoints('hole', 15, 15, 10, 10)])), DEFAULT_MESH_SETTINGS);
+    expect(triangleCentroids(solid).some((c) => pointInPolygon(c, hole))).toBe(true);
+    expect(triangleCentroids(holed).some((c) => pointInPolygon(c, hole))).toBe(false);
+  });
+});

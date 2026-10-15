@@ -9,6 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  cutterCrossings,
   cutterPathThrough,
   findBoundaryHits,
   pieceUnderChain,
@@ -49,6 +50,33 @@ const rectangle = () =>
     { x: 100, y: 200 },
     { x: 0, y: 200 },
   ]);
+
+/** Both crossings have to be there on both halves — that is where the cut is. */
+function expectCutAtCrossings(result: ReturnType<typeof slicePiece>, hits: ReturnType<typeof findBoundaryHits>) {
+  expect(result.ok).toBe(true);
+  if (!result.ok) return;
+  for (const child of result.pieces) {
+    for (const hit of hits) {
+      expect(child.points.some((pt) => dist(pt.anchor, hit.point) < 1e-6)).toBe(true);
+    }
+  }
+}
+
+/** The area a piece encloses, sampled along its edges, curves included. */
+function sampledArea(p: PatternPiece): number {
+  const poly: Vec2[] = [];
+  for (let i = 0; i < p.points.length; i++) {
+    const a = p.points[i]!;
+    const b = p.points[(i + 1) % p.points.length]!;
+    const samples = sampleEdgeByPointIds(p, a.id, b.id, 16) ?? [];
+    for (let k = 0; k < samples.length - 1; k++) poly.push(samples[k]!);
+  }
+  let sum = 0;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    sum += poly[j]!.x * poly[i]!.y - poly[i]!.x * poly[j]!.y;
+  }
+  return Math.abs(sum / 2);
+}
 
 /** A chain that runs straight down the middle of the rectangle. */
 const straightChain: CutterPath = {
@@ -178,6 +206,164 @@ describe('the loop knife feeds the slicer', () => {
     if (!result.ok) return;
     expect(area(result.pieces[0])).toBeCloseTo(30 * 200, 4);
     expect(area(result.pieces[1])).toBeCloseTo(70 * 200, 4);
+  });
+});
+
+describe('the circle cutter', () => {
+  /** Every anchor the children carry that sits on the cutter's rim. */
+  const onRim = (child: PatternPiece, c: Extract<CutterPath, { kind: 'circle' }>) =>
+    child.points.filter(
+      (pt) => Math.abs(Math.hypot(pt.anchor.x - c.center.x, pt.anchor.y - c.center.y) - c.radius) < 0.05
+    );
+
+  it('trims an arc out of an edge with its centre off the panel', () => {
+    const panel = rectangle();
+    const cutter: CutterPath = { kind: 'circle', center: { x: 130, y: 100 }, radius: 50 };
+    const hits = findBoundaryHits(panel, cutter);
+    expect(hits.length).toBe(2);
+    // Both crossings are on the right-hand edge, 40 either side of the centre.
+    for (const hit of hits) {
+      expect(hit.point.x).toBeCloseTo(100, 4);
+      expect(Math.abs(hit.point.y - 100)).toBeCloseTo(40, 4);
+    }
+    expect(cutterCrossings(panel, cutter, hits)).not.toBeNull();
+
+    const result = slicePiece(panel, cutter, id);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const [a, b] = result.pieces;
+    expect(area(a) + area(b)).toBeCloseTo(area(panel), 4);
+    expectCutAtCrossings(result, hits);
+    // The cut runs round the rim — out to x = 80 at its deepest — rather than
+    // straight across as the chord would.
+    const cut = [...onRim(a, cutter), ...onRim(b, cutter)];
+    expect(cut.some((pt) => Math.abs(pt.anchor.x - 80) < 0.05 && Math.abs(pt.anchor.y - 100) < 0.05)).toBe(true);
+  });
+
+  it('takes a bite out of an edge the long way round the circle', () => {
+    const panel = rectangle();
+    const cutter: CutterPath = { kind: 'circle', center: { x: 50, y: 10 }, radius: 20 };
+    // The circle crosses the top edge at 50 ± 17.3 with its centre 10 cm below
+    // that edge, so the rim inside the panel is the long way round, beneath.
+    const hits = findBoundaryHits(panel, cutter);
+    expect(hits.length).toBe(2);
+    expect(hits.every((h) => Math.abs(h.point.y) < 1e-6)).toBe(true);
+    expect(cutterCrossings(panel, cutter, hits)).not.toBeNull();
+
+    const result = slicePiece(panel, cutter, id);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const [a, b] = result.pieces;
+    expect(area(a) + area(b)).toBeCloseTo(area(panel), 4);
+    expectCutAtCrossings(result, hits);
+    // The cut runs down to the far side of the rim and never over its top, which
+    // is the side that lies outside the panel.
+    const cut = [...onRim(a, cutter), ...onRim(b, cutter)].map((pt) => pt.anchor);
+    expect(Math.max(...cut.map((p) => p.y))).toBeGreaterThan(20);
+    expect(Math.min(...cut.map((p) => p.y))).toBeGreaterThan(-1e-6);
+  });
+
+  it('trims a shallow arc, where there is nothing between the crossings', () => {
+    const panel = rectangle();
+    // A circle leaning gently into the right-hand edge: the rim inside the panel
+    // is a short arc, so the piece it leaves has one anchor on the edge and the
+    // arc to close it.
+    const cutter: CutterPath = { kind: 'circle', center: { x: 150, y: 100 }, radius: 60 };
+    const hits = findBoundaryHits(panel, cutter);
+    expect(hits.length).toBe(2);
+    const result = slicePiece(panel, cutter, id);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const [a, b] = result.pieces;
+    expectCutAtCrossings(result, hits);
+    // Sampled, because the trimmed piece's own anchors all sit on the edge it was
+    // cut out of: the area is between the edge and the arc.
+    expect(sampledArea(a) + sampledArea(b)).toBeCloseTo(200 * 100, 2);
+    const trim = sampledArea(a) < sampledArea(b) ? a : b;
+    expect(sampledArea(trim)).toBeGreaterThan(10);
+    expect(sampledArea(trim)).toBeLessThan(200 * 100 / 10);
+  });
+
+  it('cuts a corner off', () => {
+    const panel = rectangle();
+    const cutter: CutterPath = { kind: 'circle', center: { x: 0, y: 0 }, radius: 20 };
+    const result = slicePiece(panel, cutter, id);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const [a, b] = result.pieces;
+    expect(area(a) + area(b)).toBeCloseTo(area(panel), 4);
+    // The corner itself is gone, and what is left still fills the rest.
+    const small = area(a) < area(b) ? a : b;
+    expect(area(small)).toBeGreaterThan(1);
+    expect(area(small)).toBeLessThan(area(panel) / 10);
+  });
+
+  it('refuses a circle that never leans into the panel', () => {
+    const panel = rectangle();
+    // Enclosing the panel: its rim runs outside the outline all the way round.
+    expect(slicePiece(panel, { kind: 'circle', center: { x: 50, y: 100 }, radius: 300 }, id)).toEqual({
+      ok: false,
+      reason: 'Cut must cross the outline twice',
+    });
+    // And one sitting inside it touches nothing at all.
+    expect(findBoundaryHits(panel, { kind: 'circle', center: { x: 50, y: 100 }, radius: 30 })).toEqual([]);
+    expect(slicePiece(panel, { kind: 'circle', center: { x: 50, y: 100 }, radius: 30 }, id).ok).toBe(false);
+  });
+
+  it('still splits a panel it crosses four times, over the rim and not the chord', () => {
+    const panel = rectangle();
+    const cutter: CutterPath = { kind: 'circle', center: { x: 50, y: 100 }, radius: 60 };
+    const hits = findBoundaryHits(panel, cutter);
+    expect(hits.length).toBe(4);
+    expect(cutterCrossings(panel, cutter, hits)).not.toBeNull();
+    const result = slicePiece(panel, cutter, id);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const [a, b] = result.pieces;
+    expect(area(a) + area(b)).toBeCloseTo(area(panel), 4);
+    // Neither child may run outside the panel: the cut is a piece of rim that
+    // leans in, never a chord straight across between crossings.
+    for (const child of [a, b]) {
+      for (const pt of child.points) {
+        expect(pt.anchor.x).toBeGreaterThan(-0.05);
+        expect(pt.anchor.x).toBeLessThan(100.05);
+      }
+    }
+  });});
+
+describe('two crossings on one edge', () => {
+  /**
+   * A panel whose one edge bows out and back, closed by two straight edges down
+   * the left: a vertical line crosses that single edge twice.
+   */
+  const bulge = (): PatternPiece => ({
+    id: 'bulge',
+    name: 'Bulge',
+    closed: true,
+    points: [
+      { id: 'a', anchor: { x: 0, y: 0 }, handleIn: null, handleOut: { x: 300, y: 0 }, handlesParallel: false },
+      { id: 'b', anchor: { x: 0, y: 200 }, handleIn: { x: 300, y: 200 }, handleOut: null, handlesParallel: false },
+      { id: 'c', anchor: { x: -60, y: 100 }, handleIn: null, handleOut: null, handlesParallel: false },
+    ],
+  });
+  const straightDown: CutterPath = { kind: 'line', a: { x: 50, y: -50 }, b: { x: 50, y: 250 } };
+
+  it('puts both cut points on the line, not one of them up the edge', () => {
+    const panel = bulge();
+    const hits = findBoundaryHits(panel, straightDown);
+    expect(hits.length).toBe(2);
+    // Both crossings really are on the one bowed edge.
+    expect(hits.every((h) => h.edgeIndex === 0)).toBe(true);
+
+    expectCutAtCrossings(slicePiece(panel, straightDown, id), hits);
+  });
+
+  it('cuts a circle out of a straight edge at the crossings the preview promised', () => {
+    const panel = rectangle();
+    const cutter: CutterPath = { kind: 'circle', center: { x: 130, y: 100 }, radius: 50 };
+    const hits = findBoundaryHits(panel, cutter);
+    expect(hits.every((h) => h.edgeIndex === 1)).toBe(true);
+    expectCutAtCrossings(slicePiece(panel, cutter, id), hits);
   });
 });
 

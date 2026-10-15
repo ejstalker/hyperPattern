@@ -665,6 +665,79 @@ export function findBoundaryHits(piece: PatternPiece, cutter: CutterPath): Bound
 }
 
 /**
+ * The two crossings that actually separate a closed piece — the pair whose cut
+ * runs through the piece rather than clipping round the outside of it. `null`
+ * when this cutter crosses the outline without ever passing inside, which is
+ * what the knife refuses on.
+ *
+ * What "through the piece" means per cutter: a line's chord has to pass inside,
+ * and a circle's rim likewise, measured along the rim — so a circle taking a
+ * bite out of one edge is cut around its long way and a circle dropped over the
+ * panel around its short way. A chain is excused the test: its own two ends are
+ * the crossings, and what it does in between belongs to the cut that was drawn.
+ */
+export function cutterCrossings(
+  piece: PatternPiece,
+  cutter: CutterPath,
+  hits: BoundaryHit[] = findBoundaryHits(piece, cutter)
+): [BoundaryHit, BoundaryHit] | null {
+  if (hits.length < 2) return null;
+  const poly = pieceToPolyline(piece.points, true);
+  let best: { i: number; j: number; span: number } | null = null;
+  for (let i = 0; i < hits.length; i++) {
+    for (let j = i + 1; j < hits.length; j++) {
+      const a = hits[i]!;
+      const b = hits[j]!;
+      let span: number;
+      if (cutter.kind === 'circle') {
+        const arc = circleArcDelta(cutter.center, cutter.radius, a.point, b.point, poly);
+        if (!arc.inside) continue;
+        span = Math.abs(arc.delta);
+      } else {
+        if (cutter.kind !== 'path' && !pointInPolygon(lerp(a.point, b.point, 0.5), poly)) continue;
+        span = Math.abs(b.along - a.along);
+      }
+      if (!best || span < best.span) best = { i, j, span };
+    }
+  }
+  return best ? [hits[best.i]!, hits[best.j]!] : null;
+}
+
+/**
+ * Which way round a circle's rim runs from one of its crossings to another, and
+ * whether that arc lies in the piece at all.
+ *
+ * A circle cuts along the part of its rim that is inside the panel, so the way
+ * round is chosen by where each arc's midpoint falls: a circle dropped over an
+ * edge is cut along the short hop through the panel, while one taking a bite out
+ * of an edge is cut the long way round its own centre. Both arcs inside means a
+ * piece that folds around the circle; the short way is the tidier cut there.
+ */
+function circleArcDelta(
+  center: Vec2,
+  radius: number,
+  from: Vec2,
+  to: Vec2,
+  poly: Vec2[]
+): { delta: number; inside: boolean } {
+  const a0 = Math.atan2(from.y - center.y, from.x - center.x);
+  const a1 = Math.atan2(to.y - center.y, to.x - center.x);
+  let short = angleDelta(a0, a1);
+  if (Math.abs(short) < 1e-6) short = Math.PI * 2;
+  const long = short > 0 ? short - Math.PI * 2 : short + Math.PI * 2;
+  const mid = (delta: number): Vec2 => ({
+    x: center.x + Math.cos(a0 + delta / 2) * radius,
+    y: center.y + Math.sin(a0 + delta / 2) * radius,
+  });
+  const shortInside = pointInPolygon(mid(short), poly);
+  const longInside = pointInPolygon(mid(long), poly);
+  return {
+    delta: longInside && !shortInside ? long : short,
+    inside: shortInside || longInside,
+  };
+}
+
+/**
  * A cutter that follows the points a knife click left behind.
  *
  * `smooth` bends through the clicks — each point carries one tangent, read from
@@ -797,6 +870,22 @@ function polyArea(poly: Vec2[]): number {
   return a / 2;
 }
 
+/**
+ * The area a closed ring encloses, sampled along its edges.
+ *
+ * Its anchors alone will not do it: a cut can leave a ring whose anchors are all
+ * on one line — a circle's arc against the straight edge it trimmed — and the
+ * cloth between the curves is a real piece with a real area.
+ */
+function ringArea(points: BezierPoint[]): number {
+  const poly: Vec2[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const samples = sampleEdgePoints(points[i]!, points[(i + 1) % points.length]!, 16);
+    for (let k = 0; k < samples.length - 1; k++) poly.push(samples[k]!.p);
+  }
+  return Math.abs(polyArea(poly));
+}
+
 function buildCutBridge(
   cutter: CutterPath,
   from: Vec2,
@@ -815,21 +904,9 @@ function buildCutBridge(
 
   if (cutter.kind === 'circle') {
     const a0 = Math.atan2(from.y - cutter.center.y, from.x - cutter.center.x);
-    const a1 = Math.atan2(to.y - cutter.center.y, to.x - cutter.center.x);
-    let dShort = angleDelta(a0, a1);
-    if (Math.abs(dShort) < 1e-6) dShort = Math.PI * 2;
-    const dLong = dShort > 0 ? dShort - 2 * Math.PI : dShort + 2 * Math.PI;
-    const midShort = {
-      x: cutter.center.x + Math.cos(a0 + dShort / 2) * cutter.radius,
-      y: cutter.center.y + Math.sin(a0 + dShort / 2) * cutter.radius,
-    };
-    const midLong = {
-      x: cutter.center.x + Math.cos(a0 + dLong / 2) * cutter.radius,
-      y: cutter.center.y + Math.sin(a0 + dLong / 2) * cutter.radius,
-    };
-    const shortInside = pointInPolygon(midShort, piecePoly);
-    const longInside = pointInPolygon(midLong, piecePoly);
-    const delta = longInside && !shortInside ? dLong : dShort;
+    // The same way round the rim the crossings were picked by, so the cut drawn
+    // here is the one that was measured as inside the piece.
+    const { delta } = circleArcDelta(cutter.center, cutter.radius, from, to, piecePoly);
     const cubics = circularArcCubics(cutter.center, cutter.radius, a0, delta);
     const pts: BezierPoint[] = [];
     for (let i = 0; i < cubics.length; i++) {
@@ -973,50 +1050,30 @@ export function slicePiece(
     return { ok: false, reason: 'Cut must cross the outline twice' };
   }
 
-  hits.sort((a, b) => a.along - b.along);
-  let h0 = hits[0]!;
-  let h1 = hits[1]!;
-
-  // Prefer a consecutive pair along the knife whose chord midpoint is inside the piece.
-  // This picks opposite-side crossings on simple polygons (not just adjacent edges).
-  const poly = pieceToPolyline(working, true);
-  if (hits.length >= 2) {
-    let best: { i: number; j: number; span: number } | null = null;
-    for (let i = 0; i < hits.length; i++) {
-      for (let j = i + 1; j < hits.length; j++) {
-        const mid = lerp(hits[i]!.point, hits[j]!.point, 0.5);
-        if (cutter.kind === 'line' && !pointInPolygon(mid, poly)) continue;
-        const span = Math.abs(hits[j]!.along - hits[i]!.along);
-        if (!best || span < best.span) best = { i, j, span };
-      }
-    }
-    // Fallback: for lines, also try consecutive hits along the sorted line
-    if (!best && cutter.kind === 'line') {
-      for (let i = 0; i < hits.length - 1; i++) {
-        const mid = lerp(hits[i]!.point, hits[i + 1]!.point, 0.5);
-        if (pointInPolygon(mid, poly)) {
-          best = { i, j: i + 1, span: Math.abs(hits[i + 1]!.along - hits[i]!.along) };
-          break;
-        }
-      }
-    }
-    if (best) {
-      h0 = hits[best.i]!;
-      h1 = hits[best.j]!;
-    } else if (cutter.kind === 'line') {
-      return { ok: false, reason: 'Cut line must pass through the piece' };
-    }
+  const crossings = cutterCrossings(piece, cutter, hits);
+  if (!crossings) {
+    // Crosses the outline, but never runs inside the piece — a line clipping a
+    // spike, a circle sitting in a notch. There is nothing to separate.
+    return {
+      ok: false,
+      reason:
+        cutter.kind === 'line'
+          ? 'Cut line must pass through the piece'
+          : 'Cut must cross the outline twice',
+    };
   }
+  const [h0, h1] = crossings;
 
-  if (cutter.kind === 'line') {
-    const mid = lerp(h0.point, h1.point, 0.5);
-    if (!pointInPolygon(mid, poly)) {
-      return { ok: false, reason: 'Cut line must pass through the piece' };
-    }
-  }
-
+  // Insert the crossings in decreasing edge index, so the one inserted first
+  // cannot shift the edge the other one names. Two crossings on the *same* edge
+  // — a circle taking an arc out of a straight edge, a chain crossing one bowed
+  // edge twice — need the extra step: inserting the later one splits that edge in
+  // two, and the earlier crossing then sits in the first half of it, at a t
+  // rescaled into that half.
   const ordered = [h0, h1].sort((a, b) => b.edgeIndex - a.edgeIndex || b.t - a.t);
   const inserted: BezierPoint[] = [];
+  let splitEdge = -1;
+  let splitT = 1;
   for (const h of ordered) {
     if (h.pointId) {
       const existing = working.find((point) => point.id === h.pointId);
@@ -1024,14 +1081,32 @@ export function slicePiece(
       inserted.push(existing);
       continue;
     }
-    const pt = insertPointOnEdgePreserving(working, true, h.edgeIndex, h.t, makeId);
+    const t = h.edgeIndex === splitEdge ? h.t / splitT : h.t;
+    const pt = insertPointOnEdgePreserving(working, true, h.edgeIndex, t, makeId);
     if (!pt) return { ok: false, reason: 'Failed to insert cut point' };
+    splitEdge = h.edgeIndex;
+    splitT = h.t;
     inserted.push(pt);
   }
 
-  const idxA = working.findIndex((p) => p.id === inserted[0]!.id);
-  const idxB = working.findIndex((p) => p.id === inserted[1]!.id);
+  let idxA = working.findIndex((p) => p.id === inserted[0]!.id);
+  let idxB = working.findIndex((p) => p.id === inserted[1]!.id);
   if (idxA < 0 || idxB < 0) return { ok: false, reason: 'Cut points lost' };
+
+  // Two crossings on one edge leave the arc between them as that single edge, and
+  // a ring of two points is no shape at all — a circle trimming an arc out of an
+  // edge arrives exactly here. Splitting that edge at its middle gives the ring a
+  // body without moving it: the midpoint of a straight edge is on the edge, and
+  // of a curve is on the curve.
+  if ((idxA + 1) % working.length === idxB || (idxB + 1) % working.length === idxA) {
+    const edge = (idxA + 1) % working.length === idxB ? idxA : idxB;
+    if (!insertPointOnEdgePreserving(working, true, edge, 0.5, makeId)) {
+      return { ok: false, reason: 'Degenerate split' };
+    }
+    idxA = working.findIndex((p) => p.id === inserted[0]!.id);
+    idxB = working.findIndex((p) => p.id === inserted[1]!.id);
+    if (idxA < 0 || idxB < 0) return { ok: false, reason: 'Cut points lost' };
+  }
 
   let iA = idxA;
   let iB = idxB;
@@ -1069,10 +1144,7 @@ export function slicePiece(
   if (ring1.length < 3 || ring2.length < 3) {
     return { ok: false, reason: 'Degenerate split' };
   }
-  if (
-    Math.abs(polyArea(ring1.map((p) => p.anchor))) < 0.05 ||
-    Math.abs(polyArea(ring2.map((p) => p.anchor))) < 0.05
-  ) {
+  if (ringArea(ring1) < 0.05 || ringArea(ring2) < 0.05) {
     return { ok: false, reason: 'Cut creates a vanishing piece' };
   }
 

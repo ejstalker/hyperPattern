@@ -947,6 +947,19 @@ optgroup {
   color: var(--muted);
 }
 
+/* One set of settings per tool: the ribbon shows the one belonging to the tool in
+   hand. It is a row of its own, so its items keep the ribbon's own spacing. */
+.pattern-settings-set {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.pattern-settings-set[hidden] {
+  display: none !important;
+}
+
 /* Seam allowance: the piece's allowance and the picked edge's own, plus the two
    ways to spread a value around. */
 .pattern-allowance-bar {
@@ -3101,8 +3114,10 @@ optgroup {
   font-size: 11px;
 }
 
-/* Curve knife bar: same slot as the simplify bar — bottom middle, where the
-   piece being clicked is — with the cut's status between the two controls. */
+/* The cut bar: same slot as the simplify bar — bottom middle, where the piece
+   being cut is — for every knife that cuts with a drag or a click. The chain's
+   own controls come and go with the mode; the two toggles that say what becomes
+   of the piece a cut separates stay put. */
 .pattern-knife-bar {
   position: absolute;
   bottom: 12px;
@@ -3170,6 +3185,25 @@ optgroup {
 .pattern-knife-bar [data-knife-done]:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+/* The inset's distance, and any field that belongs to one mode only. */
+.pattern-knife-bar [hidden] {
+  display: none !important;
+}
+
+.pattern-knife-readout {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.pattern-knife-inset {
+  fill-rule: evenodd;
+}
+
+.pattern-knife-inset + circle,
+.pattern-knife-inset {
+  pointer-events: none;
 }
 
 .pattern-seam-connector {

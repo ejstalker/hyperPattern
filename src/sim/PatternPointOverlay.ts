@@ -1,5 +1,5 @@
 import type { BezierPoint, PatternDocument, PatternPiece, Vec2 } from '../project/types';
-import { pieceToPolyline } from '../pattern/geometry';
+import { piecePointById, pieceToPolyline } from '../pattern/geometry';
 
 export type PatternPointOverlayCallbacks = {
   /** Fired whenever the working copy transitions between clean and dirty. */
@@ -187,7 +187,7 @@ export class PatternPointOverlay {
   ): { piece: PatternPiece; point: BezierPoint } | null {
     if (!pointId || !this.working) return null;
     for (const piece of this.working.pieces) {
-      const hit = piece.points.find((p) => p.id === pointId);
+      const hit = piecePointById(piece, pointId);
       if (hit) return { piece, point: hit };
     }
     return null;
@@ -231,7 +231,7 @@ export class PatternPointOverlay {
     const pieceId = target?.getAttribute?.('data-piece-id') ?? null;
     if (!pointId || !pieceId) return;
     const piece = this.working.pieces.find((p) => p.id === pieceId);
-    const point = piece?.points.find((p) => p.id === pointId);
+    const point = piece ? piecePointById(piece, pointId) : null;
     if (!piece || !point) return;
     e.preventDefault();
     this.drag = {

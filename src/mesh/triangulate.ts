@@ -2,6 +2,7 @@ import Delaunator from 'delaunator';
 import {
   boundsOf,
   dist,
+  findNearestPieceEdge,
   edgeArcLengthBetweenParams,
   edgeLengthByPointIds,
   findNearestEdge,
@@ -10,7 +11,10 @@ import {
   pointInPolygon,
   pointOnEdgeAtArcFractionInSpan,
   pointOnEdgeAtT,
+  pieceRings,
   pieceToPolyline,
+  pointInCloth,
+  ringToPolyline,
 } from '../pattern/geometry';
 import type {
   PatternDocument,
@@ -38,6 +42,22 @@ const FALLBACK_POLYGON: Vec2[] = [
 /** Flatten a single pattern piece to a polygon outline. */
 export function pieceToPolygon(piece: { points: PatternDocument['pieces'][number]['points']; closed: boolean }): Vec2[] {
   return pieceToPolyline(piece.points, piece.closed, 20);
+}
+
+/**
+ * The contours cut out of a piece, flattened. A panel with a hole in it is its
+ * outline *and* that hole: the mesh has to leave the hole empty, and the hole's
+ * edge is a boundary of the cloth that a seam can be sewn to.
+ */
+export function pieceHolePolygons(piece: PatternPiece): Vec2[][] {
+  return (piece.closed ? piece.holes ?? [] : []).map((ring) => ringToPolyline(ring));
+}
+
+/** The rings of a piece, outline first — every contour the mesh has to follow. */
+export function pieceBoundaryRings(piece: PatternPiece): Vec2[][] {
+  return pieceRings(piece).map((ring, index) =>
+    index === 0 ? pieceToPolyline(ring, piece.closed, 20) : ringToPolyline(ring, 20)
+  );
 }
 
 /** Every closed piece with an outline, as separate polygons (one per garment panel). */
@@ -90,7 +110,12 @@ function sampleBoundary(poly: Vec2[], spacingCm: number): Vec2[] {
  * samples own the edge) but callers pass a smaller inset for narrow pieces so
  * at least one interior row survives across the width.
  */
-function sampleInteriorGrid(poly: Vec2[], spacingCm: number, insetCm?: number): Vec2[] {
+function sampleInteriorGrid(
+  poly: Vec2[],
+  spacingCm: number,
+  insetCm?: number,
+  holes: Vec2[][] = []
+): Vec2[] {
   const { min, max } = boundsOf(poly);
   const spacing = Math.max(0.25, spacingCm);
   const out: Vec2[] = [];
@@ -98,7 +123,7 @@ function sampleInteriorGrid(poly: Vec2[], spacingCm: number, insetCm?: number): 
   for (let y = min.y + inset; y <= max.y - inset; y += spacing) {
     for (let x = min.x + inset; x <= max.x - inset; x += spacing) {
       const p = { x, y };
-      if (pointInPolygon(p, poly)) out.push(p);
+      if (pointInCloth(p, poly, holes)) out.push(p);
     }
   }
   return out;
@@ -240,7 +265,7 @@ function compactMeshGeometry(mesh: MeshGeometry): MeshGeometry {
   };
 }
 
-function delaunayFilter(points: Vec2[], poly: Vec2[]): MeshGeometry {
+function delaunayFilter(points: Vec2[], poly: Vec2[], holes: Vec2[][] = []): MeshGeometry {
   if (points.length < 3) {
     return { vertices: points, triangles: [], edges: [] };
   }
@@ -257,7 +282,7 @@ function delaunayFilter(points: Vec2[], poly: Vec2[]): MeshGeometry {
     const i2 = del.triangles[i + 2];
     if (i0 === i1 || i1 === i2 || i0 === i2) continue;
     const c = triangleCentroid(points[i0], points[i1], points[i2]);
-    if (!pointInPolygon(c, poly)) continue;
+    if (!pointInCloth(c, poly, holes)) continue;
     // Delaunator emits near-collinear slivers for thin strips; keep only
     // (near-)non-degenerate triangles so they don't become zero-length springs.
     if (Math.abs(triangleArea2(points[i0], points[i1], points[i2])) < DEGENERATE_AREA2) continue;
@@ -270,7 +295,7 @@ function delaunayFilter(points: Vec2[], poly: Vec2[]): MeshGeometry {
   };
 }
 
-function triangulateStructuredGrid(poly: Vec2[], targetEdgeCm: number): MeshGeometry {
+function triangulateStructuredGrid(poly: Vec2[], targetEdgeCm: number, holes: Vec2[][] = []): MeshGeometry {
   const { min, max } = boundsOf(poly);
   const width = Math.max(max.x - min.x, 1);
   const height = Math.max(max.y - min.y, 1);
@@ -285,7 +310,7 @@ function triangulateStructuredGrid(poly: Vec2[], targetEdgeCm: number): MeshGeom
   for (let j = 0; j < rows; j++) {
     for (let i = 0; i < cols; i++) {
       const p = { x: min.x + i * stepX, y: min.y + j * stepY };
-      if (!pointInPolygon(p, poly)) continue;
+      if (!pointInCloth(p, poly, holes)) continue;
       gridToVert[j * cols + i] = vertices.length;
       vertices.push(p);
     }
@@ -312,7 +337,7 @@ function triangulateStructuredGrid(poly: Vec2[], targetEdgeCm: number): MeshGeom
   // (old behaviour) meshed a rectangle instead of the piece — fall back to a
   // boundary-driven Delaunay mesh that actually follows the outline.
   if (vertices.length < 4 || triangles.length < 6) {
-    return triangulateDelaunay(poly, {
+    return triangulateDelaunay(poly, holes, {
       algorithm: 'delaunay',
       targetEdgeCm,
       boundarySpacingCm: Math.max(0.5, Math.min(2, targetEdgeCm * 0.5)),
@@ -323,15 +348,20 @@ function triangulateStructuredGrid(poly: Vec2[], targetEdgeCm: number): MeshGeom
   return { vertices, triangles, edges: uniqueEdges(triangles) };
 }
 
-function triangulateDelaunay(poly: Vec2[], settings: MeshSettings): MeshGeometry {
-  const boundary = sampleBoundary(poly, settings.boundarySpacingCm);
+function triangulateDelaunay(poly: Vec2[], holes: Vec2[][], settings: MeshSettings): MeshGeometry {
+  // Boundary samples go round every contour: without them the triangulation
+  // would span the hole, because nothing there says the cloth has ended.
+  const boundary = [
+    ...sampleBoundary(poly, settings.boundarySpacingCm),
+    ...holes.flatMap((hole) => sampleBoundary(hole, settings.boundarySpacingCm)),
+  ];
   const half = estimateHalfThickness(poly);
   const { spacing, inset } = adaptiveInteriorSampling(half, settings.targetEdgeCm);
-  const interior = sampleInteriorGrid(poly, spacing, inset).filter(
+  const interior = sampleInteriorGrid(poly, spacing, inset, holes).filter(
     (p) => !boundary.some((b) => dist(b, p) < inset)
   );
   const points = dedupePoints([...boundary, ...interior], COINCIDENT_EPS);
-  return delaunayFilter(points, poly);
+  return delaunayFilter(points, poly, holes);
 }
 
 /**
@@ -351,14 +381,17 @@ function adaptiveInteriorSampling(
 }
 
 /** Lloyd relaxation on interior points, then Delaunay — more even triangles. */
-function triangulateCentroidal(poly: Vec2[], settings: MeshSettings): MeshGeometry {
-  let mesh = triangulateDelaunay(poly, settings);
+function triangulateCentroidal(poly: Vec2[], holes: Vec2[][], settings: MeshSettings): MeshGeometry {
+  let mesh = triangulateDelaunay(poly, holes, settings);
   const iters = Math.max(0, Math.min(12, settings.lloydIterations));
   if (iters === 0 || mesh.vertices.length < 4) return mesh;
 
   const boundarySet = new Set<number>();
   // Treat points near boundary as fixed
-  const boundaryPts = sampleBoundary(poly, settings.boundarySpacingCm);
+  const boundaryPts = [
+    ...sampleBoundary(poly, settings.boundarySpacingCm),
+    ...holes.flatMap((hole) => sampleBoundary(hole, settings.boundarySpacingCm)),
+  ];
   for (let i = 0; i < mesh.vertices.length; i++) {
     const p = mesh.vertices[i];
     if (boundaryPts.some((b) => dist(b, p) < settings.boundarySpacingCm * 0.4)) {
@@ -382,26 +415,26 @@ function triangulateCentroidal(poly: Vec2[], settings: MeshSettings): MeshGeomet
     const next = mesh.vertices.map((p, i) => {
       if (boundarySet.has(i) || accum[i].w === 0) return p;
       const q = { x: accum[i].x / accum[i].w, y: accum[i].y / accum[i].w };
-      return pointInPolygon(q, poly) ? q : p;
+      return pointInCloth(q, poly, holes) ? q : p;
     });
-    mesh = delaunayFilter(next, poly);
+    mesh = delaunayFilter(next, poly, holes);
   }
   return mesh;
 }
 
-export function triangulate(poly: Vec2[], settings: MeshSettings): MeshGeometry {
+export function triangulate(poly: Vec2[], settings: MeshSettings, holes: Vec2[][] = []): MeshGeometry {
   const polygon = poly.length >= 3 ? poly : patternToPolygon(undefined);
   let mesh: MeshGeometry;
   switch (settings.algorithm as MeshAlgorithm) {
     case 'structuredGrid':
-      mesh = triangulateStructuredGrid(polygon, settings.targetEdgeCm);
+      mesh = triangulateStructuredGrid(polygon, settings.targetEdgeCm, holes);
       break;
     case 'centroidal':
-      mesh = triangulateCentroidal(polygon, settings);
+      mesh = triangulateCentroidal(polygon, holes, settings);
       break;
     case 'delaunay':
     default:
-      mesh = triangulateDelaunay(polygon, settings);
+      mesh = triangulateDelaunay(polygon, holes, settings);
       break;
   }
   return compactMeshGeometry(mesh);
@@ -543,15 +576,31 @@ function samplePieceBoundaryWithSeams(
   settings: MeshSettings,
   seamPlans: Map<string, SeamEdgePlan>
 ): ForcedBoundarySample[] {
-  const n = piece.points.length;
+  // Every contour the cloth has: the outline, then each hole. A hole's boundary
+  // is as much a boundary of the cloth as the outline is — the mesh ends there
+  // and a seam can be sewn to it — so it is sampled and tagged the same way.
+  return pieceRings(piece).flatMap((ring, ringIndex) =>
+    sampleRingBoundary(piece, ring, ringIndex, settings, seamPlans)
+  );
+}
+
+function sampleRingBoundary(
+  piece: PatternPiece,
+  ring: PatternPiece['points'],
+  ringIndex: number,
+  settings: MeshSettings,
+  seamPlans: Map<string, SeamEdgePlan>
+): ForcedBoundarySample[] {
+  const n = ring.length;
   if (n < 2) return [];
-  const edgeCount = piece.closed ? n : Math.max(0, n - 1);
+  const closed = ringIndex > 0 || piece.closed;
+  const edgeCount = closed ? n : Math.max(0, n - 1);
   const spacing = Math.max(0.5, settings.boundarySpacingCm);
   const out: ForcedBoundarySample[] = [];
 
   for (let ei = 0; ei < edgeCount; ei++) {
-    const from = piece.points[ei];
-    const to = piece.points[(ei + 1) % n];
+    const from = ring[ei];
+    const to = ring[(ei + 1) % n];
     const plan = seamPlans.get(`${piece.id}:${from.id}>${to.id}`);
     const edgeSamples: ForcedBoundarySample[] = [];
 
@@ -589,7 +638,7 @@ function samplePieceBoundaryWithSeams(
 
   // Closed ring: drop the final point if it coincides with the start corner
   // (avoids a duplicate vertex with a conflicting edge tag).
-  if (piece.closed && out.length >= 2) {
+  if (closed && out.length >= 2) {
     const a = out[0].pos;
     const b = out[out.length - 1].pos;
     if (dist(a, b) < spacing * 0.25) out.pop();
@@ -679,11 +728,10 @@ function tagFromForcedSamples(
   // Structured-grid leftovers only: nearest edge for unmatched boundary verts.
   for (let vi = 0; vi < vertices.length; vi++) {
     if (tags[vi]) continue;
-    const hit = findNearestEdge(piece.points, piece.closed, vertices[vi]);
+    const hit = findNearestPieceEdge(piece, vertices[vi]);
     if (!hit || hit.dist > tol) continue;
-    const n = piece.points.length;
-    const a = piece.points[hit.edgeIndex];
-    const b = piece.points[(hit.edgeIndex + 1) % n];
+    const a = hit.ring[hit.edgeIndex]!;
+    const b = hit.ring[(hit.edgeIndex + 1) % hit.ring.length]!;
     tags[vi] = {
       pieceId: piece.id,
       fromPointId: a.id,
@@ -700,12 +748,13 @@ function triangulatePieceSeamAware(
   seamPlans: Map<string, SeamEdgePlan>
 ): MeshGeometry {
   const poly = pieceToPolygon(piece);
+  const holes = pieceHolePolygons(piece);
   const forced = samplePieceBoundaryWithSeams(piece, settings, seamPlans);
   const forcedPos = forced.map((f) => f.pos);
   const tol = Math.max(0.35, settings.boundarySpacingCm * 0.45);
 
   if (settings.algorithm === 'structuredGrid') {
-    const mesh = triangulate(poly, settings);
+    const mesh = triangulate(poly, settings, holes);
     mesh.vertexPieceIds = mesh.vertices.map(() => piece.id);
     mesh.boundary = tagFromForcedSamples(piece, mesh.vertices, forced, tol, true);
     return mesh;
@@ -720,11 +769,11 @@ function triangulatePieceSeamAware(
   );
   // Strictly smaller than the inset so freshly generated interior points survive.
   const exclude = Math.min(settings.boundarySpacingCm * 0.35, Math.max(0.02, inset * 0.8));
-  const interior = sampleInteriorGrid(poly, interiorSpacing, inset).filter(
+  const interior = sampleInteriorGrid(poly, interiorSpacing, inset, holes).filter(
     (p) => !forcedPos.some((b) => dist(b, p) < exclude)
   );
   let points = [...forcedPos, ...interior];
-  let mesh = delaunayFilter(points, poly);
+  let mesh = delaunayFilter(points, poly, holes);
 
   if (settings.algorithm === 'centroidal') {
     const iters = Math.max(0, Math.min(12, settings.lloydIterations));

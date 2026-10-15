@@ -80,6 +80,77 @@ export function findNearestEdge(
   return best;
 }
 
+/** Nearest edge on a piece to point p, holes included. */
+export function findNearestPieceEdge(
+  piece: PatternPiece,
+  p: Vec2
+): { ring: BezierPoint[]; ringIndex: number; edgeIndex: number; edgeNumber: number; point: Vec2; t: number; dist: number } | null {
+  const rings = pieceRings(piece);
+  let best: {
+    ring: BezierPoint[];
+    ringIndex: number;
+    edgeIndex: number;
+    edgeNumber: number;
+    point: Vec2;
+    t: number;
+    dist: number;
+  } | null = null;
+  for (let r = 0; r < rings.length; r++) {
+    const ring = rings[r]!;
+    const hit = findNearestEdge(ring, r === 0 ? piece.closed : true, p);
+    if (!hit) continue;
+    if (!best || hit.dist < best.dist) {
+      best = {
+        ring,
+        ringIndex: r,
+        edgeIndex: hit.edgeIndex,
+        edgeNumber: pieceEdgeNumber(piece, r, hit.edgeIndex),
+        point: hit.point,
+        t: hit.t,
+        dist: hit.dist,
+      };
+    }
+  }
+  return best;
+}
+
+/** A point's own copy, with an ID of its own: what a cut leaves behind twice. */
+export function cloneBezierPoint(pt: BezierPoint, makeId: () => string): BezierPoint {
+  return {
+    id: makeId(),
+    anchor: { ...pt.anchor },
+    handleIn: pt.handleIn ? { ...pt.handleIn } : null,
+    handleOut: pt.handleOut ? { ...pt.handleOut } : null,
+    handlesParallel: pt.handlesParallel,
+  };
+}
+
+/**
+ * The piece's grainline, when it falls on this ring — a piece cut out of another
+ * keeps the grain it was cut with, and a piece that does not hold it does not
+ * claim it.
+ */
+export function grainlineInside(
+  piece: PatternPiece,
+  ring: BezierPoint[]
+): PatternPiece['grainline'] | undefined {
+  if (!piece.grainline) return undefined;
+  const mid = {
+    x: (piece.grainline.from.x + piece.grainline.to.x) / 2,
+    y: (piece.grainline.from.y + piece.grainline.to.y) / 2,
+  };
+  if (!pointInPolygon(mid, pieceToPolyline(ring, true))) return undefined;
+  return { from: { ...piece.grainline.from }, to: { ...piece.grainline.to } };
+}
+
+/**
+ * Flatten a single ring to a polyline (cm). `pieceToPolyline` does the same for
+ * a bare ring of points; this is the same call with the ring's own closing rule.
+ */
+export function ringToPolyline(ring: BezierPoint[], stepsPerEdge = 12): Vec2[] {
+  return pieceToPolyline(ring, true, stepsPerEdge);
+}
+
 /**
  * Find the edge index whose endpoints match fromPointId → toPointId
  * (piece winding order). Returns null if the points are no longer adjacent
@@ -90,12 +161,104 @@ export function edgeIndexForPointIds(
   fromPointId: string,
   toPointId: string
 ): number | null {
-  const n = piece.points.length;
-  const edgeCount = piece.closed ? n : Math.max(0, n - 1);
-  for (let i = 0; i < edgeCount; i++) {
-    const a = piece.points[i];
-    const b = piece.points[(i + 1) % n];
-    if (a.id === fromPointId && b.id === toPointId) return i;
+  return edgeRingForPointIds(piece, fromPointId, toPointId)?.edgeIndex ?? null;
+}
+
+/**
+ * Every closed ring of a piece: the outline first, then its holes. Point IDs are
+ * unique across the whole piece, so an edge or a point always resolves to a ring
+ * without anyone having to name one.
+ */
+export function pieceRings(piece: PatternPiece): BezierPoint[][] {
+  const holes = piece.closed ? piece.holes ?? [] : [];
+  return [piece.points, ...holes.filter((ring) => ring.length >= 2)];
+}
+
+/**
+ * How many edges a ring has. A hole is always closed; an open outline is the
+ * only ring without a closing edge.
+ */
+export function ringEdgeCount(piece: PatternPiece, ringIndex: number): number {
+  const ring = pieceRings(piece)[ringIndex];
+  if (!ring) return 0;
+  return piece.closed || ringIndex > 0 ? ring.length : Math.max(0, ring.length - 1);
+}
+
+/** How many edges a piece has, its holes' edges included. */
+export function pieceEdgeCount(piece: PatternPiece): number {
+  const rings = pieceRings(piece);
+  let total = 0;
+  for (let r = 0; r < rings.length; r++) total += ringEdgeCount(piece, r);
+  return total;
+}
+
+/**
+ * The edge a piece edge number names. The numbers run right round the outline
+ * first and then round each hole in turn, so an edge index stays a plain number
+ * wherever the editor passes one about — while a hole's edges are drawn, picked,
+ * measured and sewn exactly like the outline's.
+ */
+export function pieceEdgeAt(
+  piece: PatternPiece,
+  edgeNumber: number
+): { ring: BezierPoint[]; ringIndex: number; edgeIndex: number; from: BezierPoint; to: BezierPoint } | null {
+  const rings = pieceRings(piece);
+  let n = edgeNumber;
+  for (let r = 0; r < rings.length; r++) {
+    const count = ringEdgeCount(piece, r);
+    if (n < count) {
+      const ring = rings[r]!;
+      const from = ring[n]!;
+      const to = ring[(n + 1) % ring.length]!;
+      return { ring, ringIndex: r, edgeIndex: n, from, to };
+    }
+    n -= count;
+  }
+  return null;
+}
+
+/** The piece-wide edge number of an edge on one of its rings. */
+export function pieceEdgeNumber(piece: PatternPiece, ringIndex: number, edgeIndex: number): number {
+  let total = 0;
+  for (let r = 0; r < ringIndex; r++) total += ringEdgeCount(piece, r);
+  return total + edgeIndex;
+}
+
+/** The ring a point lives on, or null when the piece has no such point. */
+export function pieceRingForPoint(piece: PatternPiece, pointId: string): BezierPoint[] | null {
+  for (const ring of pieceRings(piece)) {
+    if (ring.some((pt) => pt.id === pointId)) return ring;
+  }
+  return null;
+}
+
+/** A point of the piece by ID, hole points included. */
+export function piecePointById(piece: PatternPiece, pointId: string): BezierPoint | null {
+  for (const ring of pieceRings(piece)) {
+    const pt = ring.find((candidate) => candidate.id === pointId);
+    if (pt) return pt;
+  }
+  return null;
+}
+
+/** The ring an edge lives on, with the edge's index inside that ring. */
+export function edgeRingForPointIds(
+  piece: PatternPiece,
+  fromPointId: string,
+  toPointId: string
+): { ring: BezierPoint[]; ringIndex: number; edgeIndex: number } | null {
+  const rings = pieceRings(piece);
+  for (let r = 0; r < rings.length; r++) {
+    const ring = rings[r]!;
+    const n = ring.length;
+    // A hole is a closed ring whether or not the piece calls itself closed; an
+    // open outline is the only ring without a closing edge.
+    const edgeCount = piece.closed || r > 0 ? n : Math.max(0, n - 1);
+    for (let i = 0; i < edgeCount; i++) {
+      const a = ring[i]!;
+      const b = ring[(i + 1) % n]!;
+      if (a.id === fromPointId && b.id === toPointId) return { ring, ringIndex: r, edgeIndex: i };
+    }
   }
   return null;
 }
@@ -117,11 +280,12 @@ export function sampleEdgeByPointIds(
   toPointId: string,
   steps = 16
 ): Vec2[] | null {
-  const idx = edgeIndexForPointIds(piece, fromPointId, toPointId);
-  if (idx === null) return null;
-  const n = piece.points.length;
-  const a = piece.points[idx];
-  const b = piece.points[(idx + 1) % n];
+  const edge = edgeRingForPointIds(piece, fromPointId, toPointId);
+  if (!edge) return null;
+  const { ring, edgeIndex } = edge;
+  const n = ring.length;
+  const a = ring[edgeIndex]!;
+  const b = ring[(edgeIndex + 1) % n]!;
   const { c0, c1 } = edgeHandles(a, b);
   const linear =
     (!a.handleOut || (a.handleOut.x === a.anchor.x && a.handleOut.y === a.anchor.y)) &&
@@ -238,11 +402,12 @@ export function pointOnEdgeAtT(
   toPointId: string,
   t: number
 ): Vec2 | null {
-  const idx = edgeIndexForPointIds(piece, fromPointId, toPointId);
-  if (idx === null) return null;
-  const n = piece.points.length;
-  const a = piece.points[idx];
-  const b = piece.points[(idx + 1) % n];
+  const edge = edgeRingForPointIds(piece, fromPointId, toPointId);
+  if (!edge) return null;
+  const { ring, edgeIndex } = edge;
+  const n = ring.length;
+  const a = ring[edgeIndex]!;
+  const b = ring[(edgeIndex + 1) % n]!;
   const { c0, c1 } = edgeHandles(a, b);
   const tt = Math.max(0, Math.min(1, t));
   const linear =
@@ -494,6 +659,50 @@ export function pointInPolygon(p: Vec2, poly: Vec2[]): boolean {
   return inside;
 }
 
+/**
+ * Inside the outline and outside every hole: where a piece's cloth actually is.
+ * The rings come in already flattened, because the callers that care are the
+ * ones sampling a boundary or testing a cut against a piece.
+ */
+export function pointInCloth(p: Vec2, outline: Vec2[], holes: Vec2[][] = []): boolean {
+  if (!pointInPolygon(p, outline)) return false;
+  for (const hole of holes) {
+    if (pointInPolygon(p, hole)) return false;
+  }
+  return true;
+}
+
+/** Is a point on a piece's cloth? Holes are not cloth. */
+export function pointInPiece(p: Vec2, piece: PatternPiece): boolean {
+  return pointInCloth(
+    p,
+    pieceToPolyline(piece.points, piece.closed),
+    (piece.closed ? piece.holes ?? [] : []).map((ring) => ringToPolyline(ring))
+  );
+}
+
+/**
+ * The area centroid of a closed polygon — where the shape balances, not where its
+ * points average out. Scaling about it is what makes a piece's smaller copy look
+ * like the piece: a boundary that happens to carry more points on one side does
+ * not pull the copy off centre.
+ */
+export function polygonCentroid(poly: readonly Vec2[]): Vec2 {
+  let twiceArea = 0;
+  let x = 0;
+  let y = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i]!;
+    const b = poly[(i + 1) % poly.length]!;
+    const cross = a.x * b.y - b.x * a.y;
+    twiceArea += cross;
+    x += (a.x + b.x) * cross;
+    y += (a.y + b.y) * cross;
+  }
+  if (Math.abs(twiceArea) < 1e-12) return averagePoint([...poly]);
+  return { x: x / (3 * twiceArea), y: y / (3 * twiceArea) };
+}
+
 export function averagePoint(points: Vec2[]): Vec2 {
   if (points.length === 0) return { x: 0, y: 0 };
   let x = 0,
@@ -563,22 +772,26 @@ export function clonePatternPiece(
   offset: Vec2 = { x: 0, y: 0 }
 ): PatternPiece {
   const pointIdMap = new Map<string, string>();
-  const points = piece.points.map((pt) => {
-    const id = makeId();
-    pointIdMap.set(pt.id, id);
-    return {
-      id,
-      anchor: offsetVec2(pt.anchor, offset.x, offset.y),
-      handleIn: pt.handleIn ? offsetVec2(pt.handleIn, offset.x, offset.y) : null,
-      handleOut: pt.handleOut ? offsetVec2(pt.handleOut, offset.x, offset.y) : null,
-      handlesParallel: pt.handlesParallel,
-    };
-  });
+  const cloneRing = (ring: BezierPoint[]): BezierPoint[] =>
+    ring.map((pt) => {
+      const id = makeId();
+      pointIdMap.set(pt.id, id);
+      return {
+        id,
+        anchor: offsetVec2(pt.anchor, offset.x, offset.y),
+        handleIn: pt.handleIn ? offsetVec2(pt.handleIn, offset.x, offset.y) : null,
+        handleOut: pt.handleOut ? offsetVec2(pt.handleOut, offset.x, offset.y) : null,
+        handlesParallel: pt.handlesParallel,
+      };
+    });
+  const points = cloneRing(piece.points);
+  const holes = piece.holes?.map(cloneRing);
   return {
     id: makeId(),
     name: piece.name.endsWith(' copy') ? piece.name : `${piece.name} copy`,
     closed: piece.closed,
     points,
+    holes: holes && holes.length > 0 ? holes : undefined,
     grainline: piece.grainline
       ? {
           from: offsetVec2(piece.grainline.from, offset.x, offset.y),
@@ -604,25 +817,31 @@ export function mirrorClonePatternPiece(
   const cy = (box.minY + box.maxY) / 2;
 
   const pointIdMap = new Map<string, string>();
-  const mirroredPts: BezierPoint[] = piece.points.map((pt) => {
-    const id = makeId();
-    pointIdMap.set(pt.id, id);
-    return {
-      id,
-      anchor: mirrorVec2(pt.anchor, cx, cy, axis),
-      handleIn: pt.handleIn ? mirrorVec2(pt.handleIn, cx, cy, axis) : null,
-      handleOut: pt.handleOut ? mirrorVec2(pt.handleOut, cx, cy, axis) : null,
-      handlesParallel: pt.handlesParallel,
-    };
-  });
+  // Every ring mirrors the same way: across the axis, then reversed with its
+  // handles swapped, because mirroring turns the winding of each ring over.
+  const mirrorRing = (ring: BezierPoint[]): BezierPoint[] => {
+    const mirrored: BezierPoint[] = ring.map((pt) => {
+      const id = makeId();
+      pointIdMap.set(pt.id, id);
+      return {
+        id,
+        anchor: mirrorVec2(pt.anchor, cx, cy, axis),
+        handleIn: pt.handleIn ? mirrorVec2(pt.handleIn, cx, cy, axis) : null,
+        handleOut: pt.handleOut ? mirrorVec2(pt.handleOut, cx, cy, axis) : null,
+        handlesParallel: pt.handlesParallel,
+      };
+    });
+    mirrored.reverse();
+    for (const pt of mirrored) {
+      const tmp = pt.handleIn;
+      pt.handleIn = pt.handleOut;
+      pt.handleOut = tmp;
+    }
+    return mirrored;
+  };
 
-  // Reverse winding + swap handles so edge directions stay consistent
-  mirroredPts.reverse();
-  for (const pt of mirroredPts) {
-    const tmp = pt.handleIn;
-    pt.handleIn = pt.handleOut;
-    pt.handleOut = tmp;
-  }
+  const mirroredPts = mirrorRing(piece.points);
+  const mirroredHoles = piece.holes?.map(mirrorRing);
 
   const mirroredBox = anchorsBounds(mirroredPts);
   let dx = 0;
@@ -634,11 +853,15 @@ export function mirrorClonePatternPiece(
     dy = box.maxY - mirroredBox.minY + gapCm;
   }
 
-  for (const pt of mirroredPts) {
-    pt.anchor = offsetVec2(pt.anchor, dx, dy);
-    if (pt.handleIn) pt.handleIn = offsetVec2(pt.handleIn, dx, dy);
-    if (pt.handleOut) pt.handleOut = offsetVec2(pt.handleOut, dx, dy);
-  }
+  const offsetRing = (ring: BezierPoint[]) => {
+    for (const pt of ring) {
+      pt.anchor = offsetVec2(pt.anchor, dx, dy);
+      if (pt.handleIn) pt.handleIn = offsetVec2(pt.handleIn, dx, dy);
+      if (pt.handleOut) pt.handleOut = offsetVec2(pt.handleOut, dx, dy);
+    }
+  };
+  offsetRing(mirroredPts);
+  for (const ring of mirroredHoles ?? []) offsetRing(ring);
 
   let grainline = piece.grainline;
   if (grainline) {
@@ -653,6 +876,7 @@ export function mirrorClonePatternPiece(
     name: `${piece.name} ${axis === 'x' ? '↔' : '↕'}`,
     closed: piece.closed,
     points: mirroredPts,
+    holes: mirroredHoles && mirroredHoles.length > 0 ? mirroredHoles : undefined,
     grainline,
     // Mirroring reverses the winding, so the allowance travels with the points
     // it was set on rather than with the edge numbers.

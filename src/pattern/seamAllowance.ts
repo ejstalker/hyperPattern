@@ -1,6 +1,14 @@
-import type { PatternPiece, Vec2 } from '../project/types';
+import type { BezierPoint, PatternPiece, Vec2 } from '../project/types';
 import { CM_PER_INCH } from '../project/types';
-import { edgeHandles, edgeIsStraight, sampleCubic } from './geometry';
+import {
+  edgeHandles,
+  edgeIsStraight,
+  pieceEdgeAt,
+  pieceEdgeNumber,
+  pieceRings,
+  ringEdgeCount,
+  sampleCubic,
+} from './geometry';
 import { polygonArea } from './ringDraft';
 
 /**
@@ -41,9 +49,8 @@ export function defaultSeamAllowanceCm(piece: PatternPiece): number {
  * and it survives inserts and deletes elsewhere on the piece.
  */
 export function allowanceEdgeKey(piece: PatternPiece, edgeIndex: number): string | null {
-  const n = piece.points.length;
-  if (!piece.closed || n < 2 || edgeIndex < 0 || edgeIndex >= n) return null;
-  return piece.points[edgeIndex].id;
+  if (!piece.closed) return null;
+  return pieceEdgeAt(piece, edgeIndex)?.from.id ?? null;
 }
 
 /** The allowance one edge uses: its own override, or the piece's. */
@@ -143,21 +150,26 @@ function mitrePoint(prev: Segment, cur: Segment): Vec2 | null {
 }
 
 function samplesOfEdge(piece: PatternPiece, edgeIndex: number): Vec2[] {
-  const n = piece.points.length;
-  const a = piece.points[edgeIndex];
-  const b = piece.points[(edgeIndex + 1) % n];
-  if (!a || !b) return [];
+  const edge = pieceEdgeAt(piece, edgeIndex);
+  if (!edge) return [];
+  const a = edge.from;
+  const b = edge.to;
   if (edgeIsStraight(a, b)) return [a.anchor, b.anchor];
   const { c0, c1 } = edgeHandles(a, b);
   return sampleCubic(a.anchor, c0, c1, b.anchor, CURVE_STEPS);
 }
 
-/** Every seam segment of the piece, flattened, in winding order. */
-function segmentsOf(piece: PatternPiece, winding: number): Segment[] {
+/** Every seam segment of one ring, flattened, in that ring's winding order. */
+function segmentsOfRing(piece: PatternPiece, ringIndex: number): Segment[] {
+  const ring = pieceRings(piece)[ringIndex];
+  if (!ring) return [];
+  const winding = outwardWinding(ring, ringIndex > 0);
   const out: Segment[] = [];
-  for (let i = 0; i < piece.points.length; i++) {
-    const offset = allowanceForEdge(piece, i);
-    const samples = samplesOfEdge(piece, i);
+  const edgeCount = ringEdgeCount(piece, ringIndex);
+  for (let i = 0; i < edgeCount; i++) {
+    const edgeNumber = pieceEdgeNumber(piece, ringIndex, i);
+    const offset = allowanceForEdge(piece, edgeNumber);
+    const samples = samplesOfEdge(piece, edgeNumber);
     for (let j = 0; j + 1 < samples.length; j++) {
       const seg = segment(samples[j], samples[j + 1], offset, winding);
       if (seg) out.push(seg);
@@ -166,9 +178,36 @@ function segmentsOf(piece: PatternPiece, winding: number): Segment[] {
   return out;
 }
 
-/** Which way is out: the sign that makes a segment's normal point off the piece. */
-function outwardWinding(piece: PatternPiece): number {
-  return polygonArea(piece.points.map((pt) => pt.anchor)) >= 0 ? 1 : -1;
+/**
+ * Which way is out for a ring: the sign that makes a segment's normal point off
+ * the cloth. For the outline that is away from the piece; for a hole it is the
+ * other way about, because the cloth lies *outside* a hole — the allowance
+ * around a hole runs into the hole, making the opening bigger, exactly as an
+ * allowance along the outline runs off the edge of the panel.
+ */
+function outwardWinding(ring: BezierPoint[], isHole = false): number {
+  const sign = polygonArea(ring.map((pt) => pt.anchor)) >= 0 ? 1 : -1;
+  return isHole ? -sign : sign;
+}
+
+/** One ring's allowance line, mitred at every joiner. */
+function allowanceRingFor(piece: PatternPiece, ringIndex: number): Vec2[] {
+  const segments = segmentsOfRing(piece, ringIndex);
+  if (segments.length < 3) return [];
+  const out: Vec2[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const prev = segments[(i - 1 + segments.length) % segments.length];
+    const cur = segments[i];
+    const join = mitrePoint(prev, cur);
+    if (join) {
+      out.push(join);
+    } else {
+      // Bevel: keep both ends. That is a step where the two allowances differ
+      // and a harmless pair of coincident points where they do not.
+      out.push(shiftedPoint(prev.b, prev), shiftedPoint(cur.a, cur));
+    }
+  }
+  return dedupe(out);
 }
 
 function dedupe(points: Vec2[]): Vec2[] {
@@ -194,24 +233,22 @@ function dedupe(points: Vec2[]): Vec2[] {
  * degenerate piece).
  */
 export function seamAllowanceOutline(piece: PatternPiece): Vec2[] {
-  if (!piece.closed || piece.points.length < 3) return [];
-  const segments = segmentsOf(piece, outwardWinding(piece));
-  if (segments.length < 3) return [];
+  return seamAllowanceRings(piece)[0] ?? [];
+}
 
-  const out: Vec2[] = [];
-  for (let i = 0; i < segments.length; i++) {
-    const prev = segments[(i - 1 + segments.length) % segments.length];
-    const cur = segments[i];
-    const join = mitrePoint(prev, cur);
-    if (join) {
-      out.push(join);
-    } else {
-      // Bevel: keep both ends. That is a step where the two allowances differ
-      // and a harmless pair of coincident points where they do not.
-      out.push(shiftedPoint(prev.b, prev), shiftedPoint(cur.a, cur));
-    }
+/**
+ * The allowance line for every contour of the piece: the outline's clock-wise
+ * ring first, then one per hole. A hole's allowance runs *into* the hole, so the
+ * ring drawn for it is the opening the cutter follows rather than the seam line.
+ */
+export function seamAllowanceRings(piece: PatternPiece): Vec2[][] {
+  if (!piece.closed || piece.points.length < 3) return [];
+  const rings: Vec2[][] = [];
+  for (let r = 0; r < pieceRings(piece).length; r++) {
+    const ring = allowanceRingFor(piece, r);
+    if (ring.length >= 3) rings.push(ring);
   }
-  return dedupe(out);
+  return rings;
 }
 
 /** The allowance ring as an SVG path. */
@@ -229,10 +266,12 @@ export function allowanceRingPath(ring: readonly Vec2[]): string {
  */
 export function allowanceSpanForEdge(piece: PatternPiece, edgeIndex: number): Vec2[] {
   if (!piece.closed || piece.points.length < 2) return [];
+  const edge = pieceEdgeAt(piece, edgeIndex);
+  if (!edge) return [];
   const offset = allowanceForEdge(piece, edgeIndex);
   const samples = samplesOfEdge(piece, edgeIndex);
   if (samples.length < 2) return [];
-  const winding = outwardWinding(piece);
+  const winding = outwardWinding(edge.ring, edge.ringIndex > 0);
   const out: Vec2[] = [];
   for (let j = 0; j + 1 < samples.length; j++) {
     const seg = segment(samples[j], samples[j + 1], offset, winding);

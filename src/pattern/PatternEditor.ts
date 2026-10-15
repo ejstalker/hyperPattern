@@ -54,18 +54,31 @@ import { recordPieceSuccessors } from '../sim/pieceTransforms';
 import { circlePiece, rectPiece, uid } from '../project/createDefault';
 import {
   anchorsBounds,
+  cloneBezierPoint,
   clonePatternPiece,
   dist,
   edgeHandles,
   edgeIndexForPointIds,
   edgeIsStraight,
+  edgeRingForPointIds,
   findNearestEdge,
+  findNearestPieceEdge,
+  grainlineInside,
   insertDartOnPiece,
   isSeamEdgeValid,
   lerp,
   mirrorClonePatternPiece,
+  pieceEdgeAt,
+  pieceEdgeNumber,
+  piecePointById,
+  pieceRings,
+  pieceRingForPoint,
   pieceToPolyline,
   pointInPolygon,
+  pointInPiece,
+  polygonCentroid,
+  ringEdgeCount,
+  ringToPolyline,
   pointOnEdgeAtT,
   sameSeamBindingPair,
   sameSeamEdgeTopology,
@@ -81,6 +94,7 @@ import {
   allowanceRingPath,
   allowanceSpanForEdge,
   seamAllowanceOutline,
+  seamAllowanceRings,
   setEdgeAllowance,
   setEveryEdgeAllowance,
   setPieceAllowance,
@@ -94,6 +108,7 @@ import {
   type EdgeParamHit,
 } from './seamHit';
 import {
+  cutterCrossings,
   cutterPathThrough,
   findBoundaryHits,
   pieceUnderChain,
@@ -111,6 +126,14 @@ import {
   type LoopCut,
 } from './loopCut';
 import { parseSvgToPieces, scalePieces, type SvgImportResult } from './importSvg';
+import {
+  insetGap,
+  insetScaleThrough,
+  loopFitsOnCloth,
+  MIN_INSET_SCALE,
+  ringFromCircle,
+  scaleRing,
+} from './inset';
 import { keepCount, MIN_RUN, selectedPointRuns, simplifyRun, type SimplifyFit } from './simplify';
 import { buildGridGroup } from './grid';
 import { buildManyToManySeams } from './multiSew';
@@ -259,10 +282,25 @@ const ICONS = {
 const KNIFE_TIPS: Record<KnifeMode, string> = {
   linear: 'Knife · Linear',
   circle: 'Knife · Circle',
+  inset: 'Knife · Inset loop (hover inside a panel)',
   curve: 'Knife · Curve — click points, then Done (or Enter) to cut',
   loop: 'Knife · Loop cut, following the contours (hover an edge)',
   'loop-straight': 'Knife · Loop cut, straight across (hover an edge)',
 };
+
+/**
+ * The knife's modes, in the order the settings ribbon shows them as toggles. The
+ * labels are the rail menu's names, shortened only where the group heading
+ * already says what they belong to.
+ */
+const KNIFE_MODES: ReadonlyArray<{ mode: KnifeMode; label: string }> = [
+  { mode: 'linear', label: 'Line' },
+  { mode: 'circle', label: 'Circle' },
+  { mode: 'inset', label: 'Inset' },
+  { mode: 'curve', label: 'Curve' },
+  { mode: 'loop', label: 'Loop' },
+  { mode: 'loop-straight', label: 'Loop straight' },
+];
 
 /** The viewBox width the wheel and the zoom control may not pass, in pattern units. */
 const MIN_VIEW_WIDTH = 8;
@@ -280,7 +318,17 @@ const MIN_ZOOM_PERCENT = Math.round((ZOOM_BASE_WIDTH / MAX_VIEW_WIDTH) * 100);
 const MAX_ZOOM_PERCENT = Math.round((ZOOM_BASE_WIDTH / MIN_VIEW_WIDTH) * 100);
 
 
-export type KnifeMode = 'linear' | 'circle' | 'curve' | 'loop' | 'loop-straight';
+export type KnifeMode = 'linear' | 'circle' | 'curve' | 'inset' | 'loop' | 'loop-straight';
+
+/** What the cut bar calls the knife in hand. */
+const KNIFE_BAR_TITLES: Record<KnifeMode, string> = {
+  linear: 'Line cut',
+  circle: 'Circle cut',
+  curve: 'Curve knife',
+  inset: 'Inset cut',
+  loop: 'Loop cut',
+  'loop-straight': 'Loop cut',
+};
 export type SewMode = 'segment' | 'many';
 /** Join picks edge by edge, or a whole run across the outline. */
 export type JoinMode = 'segment' | 'many';
@@ -557,10 +605,33 @@ export class PatternEditor {
   /** How the clicks are joined: a curve through them, or straight edges. */
   private knifeChainFit: CutterChainFit = 'smooth';
   /**
-   * Sew the two halves back together along the cut — cutting a piece to keep its
-   * cloth, not to separate it. Sticky, because it is a way of working.
+   * Sew what the cut separates back together along the cut — cutting a piece to
+   * keep its cloth, not to separate it. For a cut that leaves two halves that
+   * means welding them; for an inset, or a circle dropped inside a panel, it
+   * means sewing the piece that was cut out back into the opening it came from.
+   * Sticky, because it is a way of working.
    */
-  private knifeSewSplit = false;
+  private knifeSew = false;
+  /**
+   * Leave the piece that was cut out behind: the opening is a hole and nothing
+   * else. Only an inset or a circle can cut one out, so only they offer it.
+   */
+  private knifeHole = false;
+  /**
+   * Why the last drag cut was refused, shown in the cut bar until the next one.
+   * A drag has no chain to leave a mark on, so the bar is where it says so.
+   */
+  private knifeNotice: string | null = null;
+  /**
+   * The inset the pointer is asking for: which panel, the loop it would cut, how
+   * much of the size it keeps, and how far in it runs at its tightest.
+   */
+  private knifeInset: {
+    pieceId: string;
+    loop: BezierPoint[];
+    scale: number;
+    gap: number;
+  } | null = null;
   private knifeBar: HTMLElement;
   private sewMode: SewMode = 'segment';
   private sewBar: HTMLElement;
@@ -1053,21 +1124,35 @@ export class PatternEditor {
     this.toolSettings = document.createElement('div');
     this.toolSettings.className = 'pattern-tool-settings';
     this.toolSettings.hidden = true;
+    // One set per tool, so the ribbon carries whichever the tool in hand needs.
+    // The knife's modes live here rather than in the rail menu: picking the mode
+    // *is* the knife's setting, and it belongs beside the canvas you cut on.
     this.toolSettings.innerHTML = `
-      <span class="pattern-settings-title">Join</span>
-      <div class="pattern-settings-group" role="group" aria-label="Edges to pick">
-        <button type="button" data-join-mode="segment" title="One edge on each piece">1:1</button>
-        <button type="button" data-join-mode="many" title="Runs of whole edges, many to many">Many : many</button>
+      <div class="pattern-settings-set" data-settings-for="join">
+        <span class="pattern-settings-title">Join</span>
+        <div class="pattern-settings-group" role="group" aria-label="Edges to pick">
+          <button type="button" data-join-mode="segment" title="One edge on each piece">1:1</button>
+          <button type="button" data-join-mode="many" title="Runs of whole edges, many to many">Many : many</button>
+        </div>
+        <div class="pattern-settings-group" role="group" aria-label="How the moving piece is brought over">
+          <button type="button" data-join-fit="match" title="Move, turn and scale the piece as it is: the edges match if they land within the tolerance, and what is left between them is filled in">Move &amp; scale</button>
+          <button type="button" data-join-fit="warp" title="Bend, stretch and turn the piece until its edges lie exactly on the other's">Warp</button>
+        </div>
+        <label class="pattern-settings-field" title="Move & scale: how far apart the picked edges may sit and still count as matched">
+          <span>Tolerance</span>
+          <input type="number" data-join-tolerance min="0" max="100" step="0.1" value="0.5" aria-label="Join match tolerance" />
+          <span class="pattern-settings-unit">cm</span>
+        </label>
       </div>
-      <div class="pattern-settings-group" role="group" aria-label="How the moving piece is brought over">
-        <button type="button" data-join-fit="match" title="Move, turn and scale the piece as it is: the edges match if they land within the tolerance, and what is left between them is filled in">Move &amp; scale</button>
-        <button type="button" data-join-fit="warp" title="Bend, stretch and turn the piece until its edges lie exactly on the other's">Warp</button>
+      <div class="pattern-settings-set" data-settings-for="knife" hidden>
+        <span class="pattern-settings-title">Knife</span>
+        <div class="pattern-settings-group" role="group" aria-label="Knife mode">
+          ${KNIFE_MODES.map(
+            (entry) =>
+              `<button type="button" data-knife-mode="${entry.mode}" title="${KNIFE_TIPS[entry.mode]}">${entry.label}</button>`
+          ).join('')}
+        </div>
       </div>
-      <label class="pattern-settings-field" title="Move & scale: how far apart the picked edges may sit and still count as matched">
-        <span>Tolerance</span>
-        <input type="number" data-join-tolerance min="0" max="100" step="0.1" value="0.5" aria-label="Join match tolerance" />
-        <span class="pattern-settings-unit">cm</span>
-      </label>
     `;
     this.viewport.appendChild(this.toolSettings);
 
@@ -1142,6 +1227,10 @@ export class PatternEditor {
       this.redraw();
     });
     this.sealOverlay(this.toolSettings);
+    this.toolSettings.querySelectorAll('button[data-knife-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', () => this.setKnifeMode(btn.dataset.knifeMode as KnifeMode));
+    });
     this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
       btn.addEventListener('click', () => this.setJoinMode(btn.dataset.joinMode as JoinMode));
@@ -1486,24 +1575,31 @@ export class PatternEditor {
       this.redraw();
     });
 
-    // Curve knife bar: the chain's options, where the eye already is while
-    // clicking points down the piece.
+    // The cut bar: what the knife in hand is set to, along the bottom of the
+    // viewport where the eye already is while dragging or clicking a cut out.
+    // Every cut mode shares it, so the two things a cut can do with what it
+    // separates — weld it back, or throw it away — are in the same place
+    // whichever knife is in hand; the chain's own controls join them in Curve.
     this.knifeBar = document.createElement('div');
     this.knifeBar.className = 'pattern-knife-bar';
     this.knifeBar.hidden = true;
     this.knifeBar.innerHTML = `
-      <span class="pattern-knife-title">Curve knife</span>
+      <span class="pattern-knife-title" data-knife-title></span>
       <span class="pattern-knife-count" data-knife-count></span>
       <span class="pattern-knife-status" data-knife-status></span>
-      <label class="pattern-knife-field" title="How the clicked points are joined up">
+      <label class="pattern-knife-field" data-knife-fit-field title="How the clicked points are joined up">
         <span>Fit</span>
         <select data-knife-fit aria-label="Chain fit">
           <option value="smooth">Smooth</option>
           <option value="straight">Straight</option>
         </select>
       </label>
-      <label class="pattern-knife-toggle" title="Sew the two halves back together along the cut">
-        <input type="checkbox" data-knife-sew /> Sew split
+      <span class="pattern-knife-readout" data-knife-readout></span>
+      <label class="pattern-knife-toggle" data-knife-sew-field>
+        <input type="checkbox" data-knife-sew /> <span data-knife-sew-label>Sew pieces</span>
+      </label>
+      <label class="pattern-knife-toggle" data-knife-hole-field>
+        <input type="checkbox" data-knife-hole /> <span>Hole</span>
       </label>
       <button type="button" data-knife-done>Done</button>
       <button type="button" data-knife-cancel aria-label="Cancel the curve knife">Cancel</button>
@@ -1517,7 +1613,18 @@ export class PatternEditor {
     });
     const knifeSew = this.knifeBar.querySelector('input[data-knife-sew]') as HTMLInputElement;
     knifeSew.addEventListener('change', () => {
-      this.knifeSewSplit = knifeSew.checked;
+      this.knifeSew = knifeSew.checked;
+      this.redraw();
+    });
+    const knifeHole = this.knifeBar.querySelector('input[data-knife-hole]') as HTMLInputElement;
+    knifeHole.addEventListener('change', () => {
+      this.knifeHole = knifeHole.checked;
+      // A hole and a piece sewn into it are the two things the same cut-out can
+      // become, so picking one lets go of the other.
+      if (this.knifeHole && this.knifeSew) {
+        this.knifeSew = false;
+        this.syncKnifeBar();
+      }
       this.redraw();
     });
     this.knifeBar.querySelector('[data-knife-done]')?.addEventListener('click', () => {
@@ -1912,6 +2019,7 @@ export class PatternEditor {
     }
     if (tool !== 'knife') {
       this.knifeLoop = null;
+      this.knifeInset = null;
       this.clearKnifeDraft();
     }
     // Changing tools is walking away from anything in hand: a simplify preview
@@ -2005,6 +2113,7 @@ export class PatternEditor {
 
   private setKnifeMode(mode: KnifeMode): void {
     this.knifeMode = mode;
+    this.knifeNotice = null;
     this.clearKnifeDraft();
     this.syncKnifeToolbar();
     this.redraw();
@@ -2014,11 +2123,13 @@ export class PatternEditor {
     this.knifeChain = [];
     this.knifeChainHover = null;
     this.knifeChainRefusal = null;
+    this.knifeInset = null;
   }
 
-  /** The Remove menu carries the knife's modes, so this just keeps the rail current. */
+  /** The Remove menu enters the tool; the ribbon carries which knife it is. */
   private syncKnifeToolbar(): void {
     this.syncRailMenus();
+    this.syncToolSettings();
   }
 
   private ensureTipEl(): HTMLDivElement {
@@ -2095,7 +2206,9 @@ export class PatternEditor {
   getSelectedPieces(): string[] {
     const ids: string[] = [];
     for (const piece of this.pattern.pieces) {
-      if (piece.points.some((pt) => this.selectedIds.has(pt.id))) ids.push(piece.id);
+      if (pieceRings(piece).some((ring) => ring.some((pt) => this.selectedIds.has(pt.id)))) {
+        ids.push(piece.id);
+      }
     }
     const primary = this.selectedPieceId;
     if (primary && ids.includes(primary) && ids[0] !== primary) {
@@ -2133,7 +2246,9 @@ export class PatternEditor {
     if (!instance) return;
     const owned = new Set(instance.pieces.map((entry) => entry.pieceId));
     const stillPicked = this.pattern.pieces.some(
-      (piece) => owned.has(piece.id) && piece.points.some((pt) => this.selectedIds.has(pt.id))
+      (piece) =>
+        owned.has(piece.id) &&
+        pieceRings(piece).some((ring) => ring.some((pt) => this.selectedIds.has(pt.id)))
     );
     if (!stillPicked) this.setSelectedBlock(null);
   }
@@ -2704,6 +2819,8 @@ export class PatternEditor {
       this.drawKnifeChainDraft();
     } else if (this.isLoopKnife() && this.knifeLoop) {
       this.drawLoopCut(this.knifeLoop);
+    } else if (this.knifeMode === 'inset' && this.knifeInset) {
+      this.drawInsetLoop(this.knifeInset);
     }
 
     if (this.tool === 'join' && this.joinPreview.piece) {
@@ -2727,7 +2844,7 @@ export class PatternEditor {
   private selectedPoint(): BezierPoint | null {
     if (!this.selectedPointId || this.selectedIds.size !== 1) return null;
     for (const piece of this.pattern.pieces) {
-      const pt = piece.points.find((p) => p.id === this.selectedPointId);
+      const pt = piecePointById(piece, this.selectedPointId);
       if (pt) return pt;
     }
     return null;
@@ -2865,7 +2982,7 @@ export class PatternEditor {
       maxY = -Infinity;
     let found = false;
     for (const piece of this.pattern.pieces) {
-      for (const pt of piece.points) {
+      for (const pt of pieceRings(piece).flat()) {
         if (!this.selectedIds.has(pt.id)) continue;
         found = true;
         minX = Math.min(minX, pt.anchor.x);
@@ -2993,6 +3110,8 @@ export class PatternEditor {
       if (dist(drag.start, b) < 0.2) return null;
       return { kind: 'line', a: drag.start, b };
     }
+    // The drag is the radius about the press point; Shift quantises it to half a
+    // centimetre. Too small to be a gesture is no cut at all.
     let r = drag.radius;
     if (drag.shift) r = Math.round(r * 2) / 2;
     if (r < 0.25) return null;
@@ -3057,6 +3176,39 @@ export class PatternEditor {
     }
   }
 
+  /**
+   * The inset loop under the pointer: the line the cut would run along, with the
+   * patch it would cut out shaded in, because that is the piece that goes.
+   */
+  private drawInsetLoop(hover: { loop: BezierPoint[] }): void {
+    const { loop } = hover;
+    if (loop.length < 2) return;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    let d = `M ${loop[0]!.anchor.x} ${loop[0]!.anchor.y}`;
+    for (let i = 0; i < loop.length; i++) {
+      const a = loop[i]!;
+      const b = loop[(i + 1) % loop.length]!;
+      const { c0, c1 } = edgeHandles(a, b);
+      if (edgeIsStraight(a, b)) d += ` L ${b.anchor.x} ${b.anchor.y}`;
+      else d += ` C ${c0.x} ${c0.y}, ${c1.x} ${c1.y}, ${b.anchor.x} ${b.anchor.y}`;
+    }
+    path.setAttribute('d', `${d} Z`);
+    path.setAttribute('class', 'pattern-knife-inset');
+    path.setAttribute('fill', this.knifeHole ? 'rgba(196,92,38,0.10)' : 'rgba(196,92,38,0.05)');
+    path.setAttribute('stroke-width', String(this.px(1.75)));
+    path.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(path);
+    for (const pt of loop) {
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', String(pt.anchor.x));
+      c.setAttribute('cy', String(pt.anchor.y));
+      c.setAttribute('r', String(this.px(2.5)));
+      c.setAttribute('class', 'pattern-knife-hit-ok');
+      c.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(c);
+    }
+  }
+
   // ── Curve knife ──────────────────────────────────────────────────────────
   //
   // Click points down like the pen, and the chain through them is the cut: it is
@@ -3065,14 +3217,6 @@ export class PatternEditor {
   // the options — the fit between the clicks, whether to sew the halves back
   // together — and Done or Cancel.
 
-  /**
-   * The chain as a cutter, with both ends carried on out of the piece.
-   *
-   * A cut has to start and finish on the outline, and the first click is usually
-   * well inside the piece. Extending along the end tangents (which a straight
-   * chain shares with its last segment) keeps the drawn shape and gives the
-   * cut something to terminate on.
-   */
   /**
    * The chain as a cutter, with each end carried out to *this* piece's outline.
    *
@@ -3145,7 +3289,7 @@ export class PatternEditor {
    * separate.
    */
   private knifeChainCutOk(cut: { cutter: CutterPath; piece: PatternPiece; hits: BoundaryHit[] }): boolean {
-    return this.knifeHasValidHitPair(cut.piece, cut.hits, cut.cutter);
+    return !!cutterCrossings(cut.piece, cut.cutter, cut.hits);
   }
 
   private drawKnifeChainDraft(): void {
@@ -3213,55 +3357,125 @@ export class PatternEditor {
   }
 
   /**
-   * Bottom bar: what the chain is doing, how the clicks are joined, and whether
-   * the halves are sewn back together. Kept in step from `redraw`, so the status
-   * line never lags the preview.
+   * Bottom bar: what the knife in hand is set to, and what the cut in hand
+   * would do. Every cut mode shares it — the chain's own controls (count, fit,
+   * Done, Cancel) come and go with the mode, the toggles stay put — and it is
+   * kept in step from `redraw`, so the status line never lags the preview.
    */
   private syncKnifeBar(): void {
     if (!this.knifeBar) return;
     // One bar at the bottom of the viewport at a time: a simplify preview is the
     // more modal of the two, so it takes the slot while it is up.
-    const active = this.tool === 'knife' && this.knifeMode === 'curve' && !this.simplify;
+    const cutModes: KnifeMode[] = ['linear', 'circle', 'curve', 'inset'];
+    const active = this.tool === 'knife' && cutModes.includes(this.knifeMode) && !this.simplify;
     this.knifeBar.hidden = !active;
     if (!active) return;
 
-    const count = this.knifeBar.querySelector('[data-knife-count]') as HTMLElement;
-    const count_ = this.knifeChain.length;
-    count.textContent = `${count_} ${count_ === 1 ? 'point' : 'points'}`;
+    const chain = this.knifeMode === 'curve';
+    const cutOut = this.knifeMode === 'inset' || this.knifeMode === 'circle';
+    const title = this.knifeBar.querySelector('[data-knife-title]') as HTMLElement;
+    title.textContent = KNIFE_BAR_TITLES[this.knifeMode];
 
-    const status = this.knifeBar.querySelector('[data-knife-status]') as HTMLElement;
-    const cut = this.knifeChainCut();
-    const ok = !!cut && this.knifeChainCutOk(cut);
-    if (this.knifeChainRefusal) {
-      status.textContent = this.knifeChainRefusal;
-      status.title = this.knifeChainRefusal;
-    } else if (count_ < 2) {
-      status.textContent = 'Click points along the cut';
-      status.title = '';
-    } else if (!cut) {
-      status.textContent = 'No panel under the chain';
-      status.title = '';
-    } else if (!ok) {
-      status.textContent = `The cut has to cross ${cut.piece.name} twice`;
-      status.title = 'Two crossings, with panel left on both sides of the line';
+    const show = (selector: string, on: boolean): void => {
+      const el = this.knifeBar.querySelector(selector) as HTMLElement | null;
+      if (el) el.hidden = !on;
+    };
+    show('[data-knife-fit-field]', chain);
+    show('[data-knife-done]', chain);
+    show('[data-knife-cancel]', chain);
+    // A hole and a loose cut-out are the same cut; a cut that leaves two halves
+    // has neither to offer.
+    show('[data-knife-hole-field]', cutOut);
+
+    const sewField = this.knifeBar.querySelector('[data-knife-sew-field]') as HTMLElement;
+    sewField.title = chain
+      ? 'Weld the two halves back together along the cut'
+      : cutOut
+        ? 'Sew the piece that was cut out back into the opening it came from'
+        : 'Sew the two halves back together along the cut';
+    const holeField = this.knifeBar.querySelector('[data-knife-hole-field]') as HTMLElement;
+    holeField.title = 'Leave the opening as a hole: the piece cut out of it is dropped';
+
+    // The inverse of the chain: the drag cutters say it in one line, and the
+    // inset says how far in the loop sits.
+    const readout = this.knifeBar.querySelector('[data-knife-readout]') as HTMLElement;
+    if (this.knifeMode === 'inset') {
+      readout.hidden = false;
+      readout.textContent = this.knifeInset
+        ? `Inset ${Math.round(this.knifeInset.scale * 100)}% · ${formatLength(this.knifeInset.gap, this.unit, 1)} deep`
+        : 'Move the pointer in from an edge';
+      readout.title =
+        'The copy is this much of the panel, and that far in from its edge at the tightest';
     } else {
-      status.textContent = `Cuts ${cut.piece.name} in two`;
-      status.title = `The cut crosses ${cut.piece.name} twice`;
+      readout.hidden = true;
+    }
+
+    const count = this.knifeBar.querySelector('[data-knife-count]') as HTMLElement;
+    const status = this.knifeBar.querySelector('[data-knife-status]') as HTMLElement;
+    if (chain) {
+      const count_ = this.knifeChain.length;
+      count.hidden = false;
+      count.textContent = `${count_} ${count_ === 1 ? 'point' : 'points'}`;
+      const cut = this.knifeChainCut();
+      const ok = !!cut && this.knifeChainCutOk(cut);
+      if (this.knifeChainRefusal) {
+        status.textContent = this.knifeChainRefusal;
+        status.title = this.knifeChainRefusal;
+      } else if (count_ < 2) {
+        status.textContent = 'Click points along the cut';
+        status.title = '';
+      } else if (!cut) {
+        status.textContent = 'No panel under the chain';
+        status.title = '';
+      } else if (!ok) {
+        status.textContent = `The cut has to cross ${cut.piece.name} twice`;
+        status.title = 'Two crossings, with panel left on both sides of the line';
+      } else {
+        status.textContent = `Cuts ${cut.piece.name} in two`;
+        status.title = `The cut crosses ${cut.piece.name} twice`;
+      }
+      const done = this.knifeBar.querySelector('[data-knife-done]') as HTMLButtonElement;
+      done.disabled = !ok;
+    } else if (cutOut) {
+      count.hidden = true;
+      const under = this.knifeInset?.pieceId
+        ? this.pattern.pieces.find((p) => p.id === this.knifeInset!.pieceId)
+        : null;
+      if (this.knifeMode === 'circle') {
+        status.textContent = this.knifeHole
+          ? 'A circle inside the panel is cut out as a hole'
+          : 'Drag: across the panel to cut it in two, or inside it to cut a hole';
+        status.title = '';
+      } else if (under && this.knifeInset) {
+        status.textContent = this.knifeHole
+          ? `Leaves a hole in ${under.name}`
+          : this.knifeSew
+            ? `Cuts a loop out of ${under.name} and sews it back in`
+            : `Cuts a loop out of ${under.name}, keeping the piece`;
+        status.title = '';
+      } else {
+        status.textContent = this.knifeNotice ?? 'Hover inside a panel to size the loop';
+        status.title = '';
+      }
+    } else {
+      count.hidden = true;
+      status.textContent = this.knifeNotice ?? (this.knifeMode === 'linear' ? 'Drag a line across the panel to cut it' : '');
+      status.title = '';
     }
 
     const fit = this.knifeBar.querySelector('select[data-knife-fit]') as HTMLSelectElement;
     fit.value = this.knifeChainFit;
     const sew = this.knifeBar.querySelector('input[data-knife-sew]') as HTMLInputElement;
-    sew.checked = this.knifeSewSplit;
-    const done = this.knifeBar.querySelector('[data-knife-done]') as HTMLButtonElement;
-    done.disabled = !ok;
+    sew.checked = this.knifeSew;
+    const hole = this.knifeBar.querySelector('input[data-knife-hole]') as HTMLInputElement;
+    hole.checked = this.knifeHole;
   }
 
   /** Commit the chain as a cut, and stand the draft down. */
   private commitKnifeChain(): void {
     const cut = this.knifeChainCut();
     if (!cut || !this.knifeChainCutOk(cut)) return;
-    const refusal = this.commitKnife(cut.cutter, this.knifeSewSplit, cut.piece);
+    const refusal = this.commitKnife(cut.cutter, this.knifeSew, cut.piece);
     if (refusal) {
       // The cut looked good in the preview but the slicer would not take it:
       // keep the chain, say why, and let the next click or Cancel decide.
@@ -3293,12 +3507,16 @@ export class PatternEditor {
     // onto its outline just because the board is zoomed out.
     const r = Math.min(this.hitRadius(), 2);
     let best: { point: Vec2; dist: number } | null = null;
+    // A point first, and on its own: a corner is on both the edges that meet
+    // there, so any click near one is near an edge too, and the edges would
+    // otherwise always claim it. A cut aimed at a corner starts on the corner.
     for (const piece of this.pattern.pieces) {
       for (const point of piece.points) {
         const d = dist(p, point.anchor);
         if (d <= r && (!best || d < best.dist)) best = { point: point.anchor, dist: d };
       }
     }
+    if (best) return { ...best.point };
     for (const piece of this.pattern.pieces) {
       if (piece.points.length < 2) continue;
       const hit = findNearestEdge(piece.points, piece.closed, p);
@@ -3340,7 +3558,9 @@ export class PatternEditor {
     this.svg.appendChild(path);
 
     if (!showHits || !piece) return;
-    const validPair = this.knifeHasValidHitPair(piece, hits, cutter);
+    // The same rule the commit slices by, so the dots can never promise a cut
+    // that is then refused.
+    const validPair = !!cutterCrossings(piece, cutter, hits);
     for (const h of hits) {
       const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
       c.setAttribute('cx', String(h.point.x));
@@ -3352,39 +3572,36 @@ export class PatternEditor {
     }
   }
 
-  private knifeHasValidHitPair(
-    piece: PatternPiece,
-    hits: ReturnType<typeof findBoundaryHits>,
-    cutter: CutterPath
-  ): boolean {
-    if (hits.length < 2) return false;
-    const poly = pieceToPolyline(piece.points, true);
-    const sorted = [...hits].sort((a, b) => a.along - b.along);
-    for (let i = 0; i < sorted.length; i++) {
-      for (let j = i + 1; j < sorted.length; j++) {
-        const mid = lerp(sorted[i]!.point, sorted[j]!.point, 0.5);
-        if (cutter.kind !== 'line' || pointInPolygon(mid, poly)) return true;
-      }
-    }
-    return false;
-  }
-
   private pieceForKnife(cutter: CutterPath): PatternPiece | null {
     const closed = this.pattern.pieces.filter((p) => p.closed && p.points.length >= 3);
 
-    // Prefer the piece the cut actually crosses. That covers a line dragged from
-    // outside the panel and a chain that dips into one, without caring where the
-    // gesture happened to start.
-    if (cutter.kind === 'line' || cutter.kind === 'path') {
+    // A line is for the piece the drag itself runs through — the piece between
+    // the press and the pointer — and for no other. Its crossings are worked out
+    // on the infinite line through those two points, so a search that goes by
+    // crossings alone hands the cut to whatever panel that line reaches *behind*
+    // the press, which is a panel the draftsperson was not drawing on.
+    if (cutter.kind === 'line') {
+      const under = pieceUnderChain(closed, [cutter.a, cutter.b], 'straight');
+      if (under) return under;
+      // A drag can also cross a piece without spending any of its samples inside
+      // it — a long drag across a narrow panel — so a piece the line crosses
+      // *between* the two points still counts.
+      const withinDrag = (hit: BoundaryHit) => hit.along >= 0 && hit.along <= 1;
       for (const piece of closed) {
-        const hits = findBoundaryHits(piece, cutter);
-        if (hits.length < 2) continue;
-        const poly = pieceToPolyline(piece.points, true);
-        const sorted = [...hits].sort((a, b) => a.along - b.along);
-        for (let i = 0; i < sorted.length - 1; i++) {
-          const mid = lerp(sorted[i]!.point, sorted[i + 1]!.point, 0.5);
-          if (pointInPolygon(mid, poly)) return piece;
-        }
+        const hits = findBoundaryHits(piece, cutter).filter(withinDrag);
+        if (cutterCrossings(piece, cutter, hits)) return piece;
+      }
+      return null;
+    }
+
+    // Prefer the piece the cut actually crosses. That covers a circle dragged in
+    // from outside the panel and a chain that dips into one, without caring where
+    // the gesture happened to start — or, for a circle, where its centre happens
+    // to fall: a rim laid over an edge trims an arc out of it with its centre well
+    // outside the panel.
+    if (cutter.kind === 'path' || cutter.kind === 'circle') {
+      for (const piece of closed) {
+        if (cutterCrossings(piece, cutter)) return piece;
       }
     }
 
@@ -3393,13 +3610,13 @@ export class PatternEditor {
     // inside no piece.
     const probe = this.knifeProbePoint(cutter);
     for (const piece of closed) {
-      if (pointInPolygon(probe, pieceToPolyline(piece.points, true))) return piece;
+      if (pointInPiece(probe, piece)) return piece;
     }
     // Nothing claimed it: the active piece is the only remaining candidate, and
     // only if the cut is sitting over it at all.
     const fallback = this.activePiece();
     if (!fallback || !fallback.closed || fallback.points.length < 3) return null;
-    return pointInPolygon(probe, pieceToPolyline(fallback.points, true)) ? fallback : null;
+    return pointInPiece(probe, fallback) ? fallback : null;
   }
 
   /** A point on the cut which is meant to be inside the piece it cuts. */
@@ -3412,12 +3629,138 @@ export class PatternEditor {
     return lerp(cutter.a, cutter.b, 0.5);
   }
 
+  /**
+   * Cut a closed loop out of a panel: an inset's contour, or a circle dropped
+   * inside one. The panel keeps every point it had and gains the loop as a hole —
+   * so its cloth really is the panel less what was cut out, and the loop's edges
+   * are edges of it that a seam can be sewn to — and the piece that came out of
+   * the hole is a piece of its own.
+   *
+   * The two toggles decide what becomes of that piece:
+   * - **Hole** — it is dropped, and the opening is left as a hole.
+   * - **Sew pieces** — it is sewn back into the opening it came from, all the way
+   *   round the loop, so the cloth stays whole across the cut.
+   * - Neither — it is left lying in the opening, a piece in its own right.
+   */
+  private commitLoopCut(piece: PatternPiece, loop: BezierPoint[], suffix: string): string | null {
+    if (!piece.closed || piece.points.length < 3) return 'That panel is not a closed outline';
+    if (!loopFitsOnCloth(piece, loop)) return 'The loop has to lie on the panel';
+    const idx = this.pattern.pieces.findIndex((p) => p.id === piece.id);
+    if (idx < 0) return 'That panel is no longer in the pattern';
+    this.markBeforeChange();
+
+    // The loop becomes a contour of the panel and the outline of the piece cut
+    // out of it. Two copies, each with ids of its own: a cut leaves two things
+    // that can be moved apart, and editing one must not drag the other with it.
+    // Both copies read the loop the same way round, so the edges a seam pairs up
+    // are the same edges.
+    const holeRing = loop.map((pt) => cloneBezierPoint(pt, () => uid('pt')));
+    const cutRing = loop.map((pt) => cloneBezierPoint(pt, () => uid('pt')));
+
+    const outer: PatternPiece = {
+      ...piece,
+      holes: [...(piece.holes ?? []), holeRing],
+    };
+    const cutOut: PatternPiece = {
+      id: uid('piece'),
+      name: `${piece.name} ${suffix}`,
+      closed: true,
+      points: cutRing,
+      // Anything already cut out of the panel *inside* the loop belongs to the
+      // piece that came out of it now, not to the panel.
+      holes: (piece.holes ?? [])
+        .filter((ring) => pointInPolygon(ring[0]!.anchor, ringToPolyline(cutRing)))
+        .map((ring) => ring.map((pt) => cloneBezierPoint(pt, () => uid('pt')))),
+      grainline: grainlineInside(piece, cutRing),
+    };
+    if (cutOut.holes && cutOut.holes.length === 0) delete cutOut.holes;
+
+    const seams: SeamBinding[] = [];
+    if (this.knifeSew && !this.knifeHole) {
+      const n = holeRing.length;
+      for (let i = 0; i < n; i++) {
+        seams.push({
+          id: uid('seam'),
+          a: {
+            pieceId: outer.id,
+            fromPointId: holeRing[i]!.id,
+            toPointId: holeRing[(i + 1) % n]!.id,
+            t0: 0,
+            t1: 1,
+          },
+          b: {
+            pieceId: cutOut.id,
+            fromPointId: cutRing[i]!.id,
+            toPointId: cutRing[(i + 1) % n]!.id,
+            t0: 0,
+            t1: 1,
+          },
+          restGapCm: DEFAULT_SEAM_GAP_CM,
+        });
+      }
+    }
+
+    this.pattern.pieces.splice(idx, 1, outer, ...(this.knifeHole ? [] : [cutOut]));
+    this.pattern.seams = [...this.pattern.seams, ...seams];
+    this.pattern.pieceSuccessors = recordPieceSuccessors(
+      this.pattern.pieceSuccessors,
+      piece.id,
+      this.knifeHole ? [outer.id] : [outer.id, cutOut.id]
+    );
+    const selected = this.knifeHole ? outer : cutOut;
+    this.selectedPieceId = selected.id;
+    this.selectEntirePiece(selected);
+    this.clearKnifeDraft();
+    this.syncKnifeToolbar();
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    return null;
+  }
+
+  /**
+   * A dragged cut — a line, or a circle — and what it does to the panel it is
+   * over. A circle that lies wholly inside a panel is cut *out* of it, the way an
+   * inset is, rather than refused for not reaching the outline: that is the
+   * gesture for a hole, and the toggles then decide what becomes of the piece
+   * that comes out of it.
+   */
+  private commitDragCut(cutter: CutterPath): void {
+    const piece = this.pieceForKnife(cutter);
+    if (!piece) {
+      this.knifeNotice = 'No panel under the cut';
+      return;
+    }
+    if (piece.holes && piece.holes.length > 0) {
+      this.knifeNotice = 'Panels with a hole cannot be cut — cut the panel first, then punch the hole';
+      return;
+    }
+    if (cutter.kind === 'circle') {
+      const hits = findBoundaryHits(piece, cutter);
+      const ring = ringFromCircle(cutter, () => uid('pt'));
+      if (hits.length === 0 && loopFitsOnCloth(piece, ring)) {
+        this.knifeNotice = this.commitLoopCut(piece, ring, 'cut-out');
+        return;
+      }
+      if (hits.length < 2) {
+        this.knifeNotice = 'A circle cuts a panel it crosses twice, or one it sits inside';
+        return;
+      }
+    }
+    this.knifeNotice = this.commitKnife(cutter, this.knifeSew, piece);
+  }
+
   private commitKnife(
     cutter: CutterPath,
     sewSplit = false,
     piece: PatternPiece | null = this.pieceForKnife(cutter)
   ): string | null {
     if (!piece) return 'No panel under the cut';
+    // A ring is not something the slicer can split: it cuts closed outlines, and
+    // a panel with a hole in it is an outline *and* a hole. Refused rather than
+    // quietly handing back two halves with the hole dropped.
+    if (piece.holes && piece.holes.length > 0) {
+      return 'Panels with a hole cannot be cut — cut the panel first, then punch the hole';
+    }
     this.markBeforeChange();
     const result = slicePiece(piece, cutter, () => uid('id'));
     if (!result.ok) {
@@ -3578,7 +3921,7 @@ export class PatternEditor {
     // Chord midpoints between every pair of free anchors (incl. cross-piece).
     const free: Vec2[] = [];
     for (const piece of this.pattern.pieces) {
-      for (const pt of piece.points) {
+      for (const pt of pieceRings(piece).flat()) {
         if (!this.selectedIds.has(pt.id)) free.push(pt.anchor);
       }
     }
@@ -3620,7 +3963,7 @@ export class PatternEditor {
 
     const refs: Vec2[] = [];
     for (const piece of this.pattern.pieces) {
-      for (const pt of piece.points) {
+      for (const pt of pieceRings(piece).flat()) {
         if (this.selectedIds.has(pt.id)) continue;
         refs.push(pt.anchor);
       }
@@ -3831,6 +4174,8 @@ export class PatternEditor {
       const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       path.setAttribute('d', this.piecePathD(piece));
       path.setAttribute('class', `pattern-fill${blockCls}`);
+      // Even-odd, so a hole in the piece is genuinely not cloth.
+      path.setAttribute('fill-rule', 'evenodd');
       path.setAttribute('stroke-width', String(this.px(2)));
       path.dataset.pieceId = piece.id;
       this.svg.appendChild(path);
@@ -3842,29 +4187,37 @@ export class PatternEditor {
     // the text fits along it *and* the resulting box is clear of every label
     // already placed. Longest edges are considered first, because those are the
     // ones you actually measure; short ones fill the gaps if there is room.
-    const lengths = segmentLengths(piece.points, piece.closed);
-    const edgeCount = piece.closed ? n : Math.max(0, n - 1);
     const labelPx = 11;
     const fontSize = this.px(labelPx);
     const scale = this.viewScale();
-    type Candidate = { index: number; text: string; x: number; y: number; w: number; h: number };
+    type Candidate = { index: number; length: number; text: string; x: number; y: number; w: number; h: number };
     const candidates: Candidate[] = [];
-    for (let i = 0; i < edgeCount; i++) {
-      const text = formatLength(lengths[i], this.unit, 1);
-      const w = text.length * labelPx * 0.62;
-      if (lengths[i] * scale < w + 8) continue;
-      const a = piece.points[i].anchor;
-      const b = piece.points[(i + 1) % n].anchor;
-      candidates.push({
-        index: i,
-        text,
-        x: (a.x + b.x) / 2,
-        y: (a.y + b.y) / 2 - this.px(10),
-        w,
-        h: labelPx * 1.1,
-      });
+    // Holes are labelled like the outline: their edges are measured, sewn and
+    // allowed for like any other, so they read the same way.
+    const rings = pieceRings(piece);
+    for (let r = 0; r < rings.length; r++) {
+      const ring = rings[r]!;
+      const lengths = segmentLengths(ring, r === 0 ? piece.closed : true);
+      const edgeCount = ringEdgeCount(piece, r);
+      for (let i = 0; i < edgeCount; i++) {
+        const length = lengths[i] ?? 0;
+        const text = formatLength(length, this.unit, 1);
+        const w = text.length * labelPx * 0.62;
+        if (length * scale < w + 8) continue;
+        const a = ring[i].anchor;
+        const b = ring[(i + 1) % ring.length].anchor;
+        candidates.push({
+          index: pieceEdgeNumber(piece, r, i),
+          length,
+          text,
+          x: (a.x + b.x) / 2,
+          y: (a.y + b.y) / 2 - this.px(10),
+          w,
+          h: labelPx * 1.1,
+        });
+      }
     }
-    candidates.sort((a, b) => lengths[b.index] - lengths[a.index]);
+    candidates.sort((a, b) => b.length - a.length);
     const placed: Array<{ index: number; text: string; x: number; y: number }> = [];
     const boxes: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
     for (const c of candidates) {
@@ -3910,7 +4263,7 @@ export class PatternEditor {
 
     const pointR = this.px(5);
     const pointSw = this.px(1.5);
-    for (const pt of piece.points) {
+    for (const pt of pieceRings(piece).flat()) {
       if (showHandles && (pt.handleIn || pt.handleOut || this.selectedIds.has(pt.id))) {
         this.drawHandles(piece, pt);
       }
@@ -3933,18 +4286,23 @@ export class PatternEditor {
   private piecePathD(piece: PatternPiece): string {
     const pts = piece.points;
     if (pts.length === 0) return '';
-    let d = `M ${pts[0].anchor.x} ${pts[0].anchor.y}`;
-    const n = pts.length;
-    const edgeCount = piece.closed ? n : Math.max(0, n - 1);
-    for (let i = 0; i < edgeCount; i++) {
-      const a = pts[i];
-      const b = pts[(i + 1) % n];
-      const { c0, c1 } = edgeHandles(a, b);
-      if (edgeIsStraight(a, b)) d += ` L ${b.anchor.x} ${b.anchor.y}`;
-      else d += ` C ${c0.x} ${c0.y}, ${c1.x} ${c1.y}, ${b.anchor.x} ${b.anchor.y}`;
-    }
-    if (piece.closed) d += ' Z';
-    return d;
+    const subpath = (ring: BezierPoint[]): string => {
+      let d = `M ${ring[0].anchor.x} ${ring[0].anchor.y}`;
+      const n = ring.length;
+      const edgeCount = piece.closed || ring !== pts ? n : Math.max(0, n - 1);
+      for (let i = 0; i < edgeCount; i++) {
+        const a = ring[i];
+        const b = ring[(i + 1) % n];
+        const { c0, c1 } = edgeHandles(a, b);
+        if (edgeIsStraight(a, b)) d += ` L ${b.anchor.x} ${b.anchor.y}`;
+        else d += ` C ${c0.x} ${c0.y}, ${c1.x} ${c1.y}, ${b.anchor.x} ${b.anchor.y}`;
+      }
+      if (piece.closed || ring !== pts) d += ' Z';
+      return d;
+    };
+    // Each hole is a subpath of the same path, and the path is filled even-odd, so
+    // what the fill covers is the cloth: the outline less everything cut out of it.
+    return pieceRings(piece).map(subpath).join(' ');
   }
 
   private drawHandles(piece: PatternPiece, pt: BezierPoint): void {
@@ -4045,7 +4403,9 @@ export class PatternEditor {
   private snapshotSelection(): PointSnapshot[] {
     const out: PointSnapshot[] = [];
     for (const piece of this.pattern.pieces) {
-      for (const pt of piece.points) {
+      // Every ring, so a panel picked up whole takes the holes cut out of it
+      // along with it instead of sliding off them.
+      for (const pt of pieceRings(piece).flat()) {
         if (!this.selectedIds.has(pt.id)) continue;
         out.push({
           pieceId: piece.id,
@@ -4062,7 +4422,7 @@ export class PatternEditor {
   private applySnapshotsTranslated(snapshots: PointSnapshot[], dx: number, dy: number): void {
     for (const s of snapshots) {
       const piece = this.pattern.pieces.find((x) => x.id === s.pieceId);
-      const pt = piece?.points.find((x) => x.id === s.pointId);
+      const pt = piece ? piecePointById(piece, s.pointId) : null;
       if (!pt) continue;
       pt.anchor = { x: s.anchor.x + dx, y: s.anchor.y + dy };
       if (s.handleIn) pt.handleIn = { x: s.handleIn.x + dx, y: s.handleIn.y + dy };
@@ -4097,7 +4457,7 @@ export class PatternEditor {
   private mapSnapshots(snapshots: PointSnapshot[], map: (v: Vec2) => Vec2): void {
     for (const s of snapshots) {
       const piece = this.pattern.pieces.find((x) => x.id === s.pieceId);
-      const pt = piece?.points.find((x) => x.id === s.pointId);
+      const pt = piece ? piecePointById(piece, s.pointId) : null;
       if (!pt) continue;
       pt.anchor = map(s.anchor);
       if (s.handleIn) pt.handleIn = map(s.handleIn);
@@ -4244,12 +4604,12 @@ export class PatternEditor {
 
   private selectEntirePiece(piece: PatternPiece): void {
     this.selectedPieceId = piece.id;
-    this.setSelection(piece.points.map((pt) => pt.id));
+    this.setSelection(pieceRings(piece).flat().map((pt) => pt.id));
   }
 
   private pieceFromPointId(pointId: string): PatternPiece | null {
     for (const piece of this.pattern.pieces) {
-      if (piece.points.some((pt) => pt.id === pointId)) return piece;
+      if (pieceRings(piece).some((ring) => ring.some((pt) => pt.id === pointId))) return piece;
     }
     return null;
   }
@@ -4276,7 +4636,7 @@ export class PatternEditor {
     const p = this.svgPointFromClient(e.clientX, e.clientY);
     const piece = this.activePiece();
     if (piece && piece.points.length >= 2) {
-      const hit = findNearestEdge(piece.points, piece.closed, p);
+      const hit = findNearestPieceEdge(piece, p);
       if (hit && hit.dist <= this.hitRadius() * 2.5) return piece;
     }
     return null;
@@ -5729,6 +6089,12 @@ export class PatternEditor {
             active: () => (this.tool === 'dart' || this.tool === 'knife' ? this.tool : null),
             choose: (id) => {
               if (id === 'dart') this.setTool('dart');
+              // The knife comes up in whatever mode the ribbon is set to: the
+              // mode is a setting, not a way in.
+              if (id === 'knife') {
+                this.setTool('knife');
+                this.syncToolSettings();
+              }
             },
             entries: [
               {
@@ -5739,25 +6105,10 @@ export class PatternEditor {
               },
               {
                 id: 'knife',
-                name: 'Knife…',
-                desc: 'Cut a piece along a line, circle, chain or loop',
+                name: 'Knife',
+                desc: `Cut a piece — pick the mode in the canvas ribbon (${KNIFE_MODES.find((entry) => entry.mode === this.knifeMode)?.label ?? 'Line'})`,
                 icon: ICONS.knife,
-                view: 'knife',
               },
-            ],
-          },
-          knife: {
-            active: () => this.knifeMode,
-            choose: (id) => {
-              this.setKnifeMode(id as KnifeMode);
-              this.setTool('knife');
-            },
-            entries: [
-              { id: 'linear', name: 'Linear', desc: 'Drag a straight cutter across the piece' },
-              { id: 'circle', name: 'Circle', desc: 'Drag out a round cutter' },
-              { id: 'curve', name: 'Curve', desc: 'Click points down, then Done to cut' },
-              { id: 'loop', name: 'Loop (follow)', desc: 'Hover an edge; the cut bends with the contours' },
-              { id: 'loop-straight', name: 'Loop (straight)', desc: 'Hover an edge; the cut runs straight across' },
             ],
           },
         }),
@@ -7244,7 +7595,12 @@ export class PatternEditor {
 
   /** True when every point of the piece is in the selection (whole shape selected). */
   private isEntirePieceSelected(piece: PatternPiece): boolean {
-    return piece.points.length > 0 && piece.points.every((pt) => this.selectedIds.has(pt.id));
+    return (
+      piece.points.length > 0 &&
+      pieceRings(piece)
+        .flat()
+        .every((pt) => this.selectedIds.has(pt.id))
+    );
   }
 
   private deleteSelectedPoints(): void {
@@ -7261,6 +7617,15 @@ export class PatternEditor {
     }
 
     piece.points = remaining;
+    // A hole's points belong to the hole: taking them away takes away the part of
+    // the ring they were on, and a ring with too few points left to enclose
+    // anything is a hole that is gone — which is how a hole is filled back in.
+    const holes = (piece.holes ?? [])
+      .map((ring) => ring.filter((pt) => !this.selectedIds.has(pt.id)))
+      .filter((ring) => ring.length >= 3);
+    if (holes.length > 0) piece.holes = holes;
+    else delete piece.holes;
+
     this.clearSelection();
     this.cbs.onChange();
     this.endHistoryGesture();
@@ -7590,7 +7955,7 @@ export class PatternEditor {
       if (!pointId || !pieceId) return;
       this.selectOnly(pointId, pieceId);
       const piece = this.pattern.pieces.find((x) => x.id === pieceId)!;
-      const pt = piece.points.find((x) => x.id === pointId)!;
+      const pt = piecePointById(piece, pointId)!;
       this.markBeforeChange();
       this.drag = {
         type: 'handle',
@@ -7738,6 +8103,44 @@ export class PatternEditor {
     return { pieceId: hit.piece.id, edgeIndex: hit.edgeIndex, t: hit.t, cut };
   }
 
+  /**
+   * The inset the pointer is asking for: how far in from an edge it is, read as
+   * the distance from the pointer to the nearest edge of the panel it is over —
+   * so the loop runs *through* the pointer, and pushing the pointer about pushes
+   * the line about with it. On a circle that is a smaller circle the pointer sits
+   * on; on a panel it is the panel's own contour, carried in.
+   *
+   * Refused (null) when there is no room for the loop: too close to the edge to be
+   * a cut, or so deep that the loop would cross itself or run off the cloth.
+   */
+  private insetAtPointer(
+    p: Vec2,
+    quantise: boolean
+  ): { pieceId: string; loop: BezierPoint[]; scale: number; gap: number } | null {
+    // The panel the pointer is standing on, topmost first: the one it is over, or
+    // failing that the one whose edge it is nearest to.
+    const covered = [...this.pattern.pieces]
+      .reverse()
+      .find(
+        (piece) =>
+          piece.closed &&
+          piece.points.length >= 3 &&
+          !this.isGeneratedPiece(piece.id) &&
+          pointInPiece(p, piece)
+      );
+    const piece = covered ?? this.findNearestEdgeAcrossPieces(p)?.piece ?? null;
+    if (!piece || !piece.closed || piece.points.length < 3) return null;
+    const centre = polygonCentroid(pieceToPolyline(piece.points, true, 8));
+    let scale = insetScaleThrough(piece.points, centre, p);
+    if (scale === null) return null;
+    // Shift quantises the size, so the same loop can be asked for twice.
+    if (quantise) scale = Math.round(scale * 100) / 100;
+    if (scale <= MIN_INSET_SCALE || scale >= 1) return null;
+    const loop = scaleRing(piece.points, scale, centre);
+    if (!loopFitsOnCloth(piece, loop)) return null;
+    return { pieceId: piece.id, loop, scale, gap: insetGap(piece.points, loop) };
+  }
+
   private extrudeEdgeAt(p: Vec2): PieceEdge | null {
     const hit = this.findNearestEdgeAcrossPieces(p);
     if (!hit || this.isGeneratedPiece(hit.piece.id)) return null;
@@ -7762,15 +8165,14 @@ export class PatternEditor {
   } | null {
     const piece = this.pattern.pieces.find((x) => x.id === drag.pieceId);
     if (!piece) return null;
-    const edgeIndex = edgeIndexForPointIds(piece, drag.fromPointId, drag.toPointId);
-    if (edgeIndex === null) return null;
-    const n = piece.points.length;
-    const a = piece.points[edgeIndex];
-    const b = piece.points[(edgeIndex + 1) % n];
+    const edge = edgeRingForPointIds(piece, drag.fromPointId, drag.toPointId);
+    if (!edge) return null;
+    const a = edge.ring[edge.edgeIndex];
+    const b = edge.ring[(edge.edgeIndex + 1) % edge.ring.length];
     if (!a || !b) return null;
     return {
       piece,
-      edgeIndex,
+      edgeIndex: pieceEdgeNumber(piece, edge.ringIndex, edge.edgeIndex),
       a,
       b,
       offset: { x: drag.current.x - drag.start.x, y: drag.current.y - drag.start.y },
@@ -7802,12 +8204,19 @@ export class PatternEditor {
       handleOut: null,
       handlesParallel: false,
     };
+    // The edge number is the piece-wide one, so the tab goes onto the ring the
+    // edge actually lives on — a hole's edge extrudes like any other.
+    const on = pieceEdgeAt(piece, edgeIndex);
+    if (!on) {
+      this.endHistoryGesture();
+      return;
+    }
     this.markBeforeChange();
     // The two edges leading in and out of the tab are straight, so whatever
     // curvature the base edge had goes with the copy.
     a.handleOut = null;
     b.handleIn = null;
-    piece.points.splice(edgeIndex + 1, 0, insertA, insertB);
+    on.ring.splice(on.edgeIndex + 1, 0, insertA, insertB);
     this.setSelection([insertA.id, insertB.id], insertB.id);
     this.selectedPieceId = piece.id;
     this.cbs.onChange();
@@ -7897,16 +8306,13 @@ export class PatternEditor {
     }> = [];
     for (const piece of this.pattern.pieces) {
       if (piece.points.length < 2) continue;
-      const hit = findNearestEdge(piece.points, piece.closed, p);
+      const hit = findNearestPieceEdge(piece, p);
       if (!hit || hit.dist > threshold) continue;
-      const n = piece.points.length;
-      const a = piece.points[hit.edgeIndex];
-      const b = piece.points[(hit.edgeIndex + 1) % n];
       hits.push({
         piece,
-        edgeIndex: hit.edgeIndex,
-        fromPointId: a.id,
-        toPointId: b.id,
+        edgeIndex: hit.edgeNumber,
+        fromPointId: hit.ring[hit.edgeIndex]!.id,
+        toPointId: hit.ring[(hit.edgeIndex + 1) % hit.ring.length]!.id,
         t: hit.t,
         dist: hit.dist,
       });
@@ -8262,12 +8668,12 @@ export class PatternEditor {
 
   /** True while the tool in hand has settings of its own, which own the popover. */
   private hasToolSettings(): boolean {
-    return this.tool === 'join';
+    return this.tool === 'join' || this.tool === 'knife';
   }
 
   /**
-   * Keep the settings popover up to date: it is only there for the tools that
-   * have settings, and it shows what the join is set to.
+   * Keep the settings ribbon up to date: it shows the set belonging to the tool
+   * in hand — what the join is set to, or which knife is in hand.
    */
   private syncToolSettings(): void {
     if (!this.toolSettings) return;
@@ -8275,6 +8681,17 @@ export class PatternEditor {
     const showing = this.hasToolSettings() && !(this.allowanceOn && !!this.allowanceEdge);
     this.toolSettings.hidden = !showing;
     if (!showing) return;
+
+    for (const set of Array.from(
+      this.toolSettings.querySelectorAll<HTMLElement>('[data-settings-for]')
+    )) {
+      set.hidden = set.dataset.settingsFor !== this.tool;
+    }
+
+    this.toolSettings.querySelectorAll('button[data-knife-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.classList.toggle('is-active', btn.dataset.knifeMode === this.knifeMode);
+    });
     this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
       btn.classList.toggle('is-active', btn.dataset.joinMode === this.joinMode);
@@ -8489,6 +8906,12 @@ export class PatternEditor {
 
   /** The fuse the picks and the settings in hand would make. */
   private runJoin(move: PatternPiece, keep: PatternPiece): JoinResult {
+    // A fuse and a bridge both work from a piece's outline: a panel with a hole
+    // has one *and* a hole, and handing that over would quietly lose the hole.
+    const holed = [move, keep].find((piece) => (piece.holes?.length ?? 0) > 0);
+    if (holed) {
+      return { ok: false, reason: `A panel with a hole cannot be fused — ${holed.name} has one` };
+    }
     return joinPieces(move, this.joinMove, keep, this.joinKeep, {
       fit: this.joinFit,
       tolerance: this.joinTolerance,
@@ -8816,6 +9239,16 @@ export class PatternEditor {
       this.bridgePreview = { piece: null, reason: 'Those pieces are no longer in the pattern' };
       return;
     }
+    const holed = [first, second].find((piece) => (piece.holes?.length ?? 0) > 0);
+    if (holed) {
+      this.bridgePreview = { piece: null, reason: `A panel with a hole cannot be bridged — ${holed.name} has one` };
+      return;
+    }
+    const holedSecond = [first, second].find((piece) => (piece.holes?.length ?? 0) > 0);
+    if (holedSecond) {
+      this.bridgePreview = { piece: null, reason: `A panel with a hole cannot be bridged — ${holedSecond.name} has one` };
+      return;
+    }
     const result = bridgePieces(first, this.bridgeFirst, second, this.bridgeSecond);
     this.bridgePreview = result.ok
       ? { piece: result.piece, reason: null }
@@ -8957,7 +9390,7 @@ export class PatternEditor {
     // adds stays behind `allowanceOn` — a projection is not a drafting session.
     if (!this.allowanceOn && !this.hiconOn) return;
     for (const piece of this.pattern.pieces) {
-      const d = allowanceRingPath(seamAllowanceOutline(piece));
+      const d = seamAllowanceRings(piece).map((ring) => allowanceRingPath(ring)).join(' ');
       if (!d) continue;
       const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       path.setAttribute('d', d);
@@ -8985,10 +9418,10 @@ export class PatternEditor {
     if (!sel) return;
     const piece = this.pattern.pieces.find((entry) => entry.id === sel.pieceId);
     if (!piece) return;
-    const n = piece.points.length;
-    const from = piece.points[sel.edgeIndex];
-    const to = piece.points[(sel.edgeIndex + 1) % n];
-    if (!from || !to) return;
+    const edge = pieceEdgeAt(piece, sel.edgeIndex);
+    if (!edge) return;
+    const from = edge.from;
+    const to = edge.to;
     this.drawSeamEdgeStroke(
       { pieceId: piece.id, fromPointId: from.id, toPointId: to.id, t0: 0, t1: 1 },
       `pattern-allowance-edge ${state}`,
@@ -9237,8 +9670,8 @@ export class PatternEditor {
         this.appendPenPoint(e, under, p);
         return;
       }
-      const own = findNearestEdge(under.points, under.closed, p);
-      if (own) this.insertPenPoint(e, under, own.edgeIndex, own.point);
+      const own = findNearestPieceEdge(under, p);
+      if (own) this.insertPenPoint(e, under, own.edgeNumber, own.point);
       return;
     }
 
@@ -9287,7 +9720,7 @@ export class PatternEditor {
     for (let i = this.pattern.pieces.length - 1; i >= 0; i--) {
       const piece = this.pattern.pieces[i];
       if (piece.points.length < 3 || this.isGeneratedPiece(piece.id)) continue;
-      if (pointInPolygon(p, pieceToPolyline(piece.points, true))) return piece;
+      if (pointInPiece(p, piece)) return piece;
     }
     return null;
   }
@@ -9319,10 +9752,10 @@ export class PatternEditor {
     let best: { piece: PatternPiece; edgeIndex: number; point: Vec2; dist: number } | null = null;
     for (const piece of order) {
       if (piece.points.length < 2 || this.isGeneratedPiece(piece.id)) continue;
-      const hit = findNearestEdge(piece.points, piece.closed, p);
+      const hit = findNearestPieceEdge(piece, p);
       if (!hit || hit.dist > threshold) continue;
       if (!best || hit.dist < best.dist) {
-        best = { piece, edgeIndex: hit.edgeIndex, point: hit.point, dist: hit.dist };
+        best = { piece, edgeIndex: hit.edgeNumber, point: hit.point, dist: hit.dist };
       }
     }
     if (!best) return null;
@@ -9335,10 +9768,11 @@ export class PatternEditor {
    * second point would only read as noise.
    */
   private insertEdgePoint(piece: PatternPiece, edgeIndex: number, at: Vec2): BezierPoint | null {
-    const n = piece.points.length;
-    const a = piece.points[edgeIndex];
-    const b = piece.points[(edgeIndex + 1) % n];
-    if (!a || !b) return null;
+    const edge = pieceEdgeAt(piece, edgeIndex);
+    if (!edge) return null;
+    const { ring, edgeIndex: local } = edge;
+    const a = edge.from;
+    const b = edge.to;
     if (dist(at, a.anchor) < this.hitRadius() || dist(at, b.anchor) < this.hitRadius()) return null;
     const pt: BezierPoint = {
       id: uid('pt'),
@@ -9351,7 +9785,7 @@ export class PatternEditor {
     // Split the edge: the handles that spanned it no longer apply.
     a.handleOut = null;
     b.handleIn = null;
-    piece.points.splice(edgeIndex + 1, 0, pt);
+    ring.splice(local + 1, 0, pt);
     return pt;
   }
 
@@ -9392,11 +9826,13 @@ export class PatternEditor {
   }
 
   private createDefaultHandles(piece: PatternPiece, pt: BezierPoint): void {
-    const idx = piece.points.findIndex((p) => p.id === pt.id);
+    const ring = pieceRingForPoint(piece, pt.id);
+    if (!ring) return;
+    const idx = ring.findIndex((p) => p.id === pt.id);
     if (idx < 0) return;
-    const n = piece.points.length;
-    const prev = piece.points[(idx - 1 + n) % n];
-    const next = piece.points[(idx + 1) % n];
+    const n = ring.length;
+    const prev = ring[(idx - 1 + n) % n];
+    const next = ring[(idx + 1) % n];
     const toPrev = { x: prev.anchor.x - pt.anchor.x, y: prev.anchor.y - pt.anchor.y };
     const toNext = { x: next.anchor.x - pt.anchor.x, y: next.anchor.y - pt.anchor.y };
     const lenPrev = Math.hypot(toPrev.x, toPrev.y) || 1;
@@ -9445,6 +9881,23 @@ export class PatternEditor {
             seamReadsFromSecondHalf(next) !== seamReadsFromSecondHalf(this.hoverEdge)));
       if (changed) {
         this.hoverEdge = next;
+        this.redraw();
+      }
+      return;
+    }
+
+    // Inset: the loop the pointer is asking for is worked out from how far in
+    // from an edge it is, so every move redraws it.
+    if (this.tool === 'knife' && this.knifeMode === 'inset' && !this.drag) {
+      const next = this.insetAtPointer(this.svgPoint(e), e.shiftKey);
+      const changed =
+        !!next !== !!this.knifeInset ||
+        (!!next &&
+          !!this.knifeInset &&
+          (next.pieceId !== this.knifeInset!.pieceId ||
+            Math.abs(next.scale - this.knifeInset!.scale) > 1e-4));
+      if (changed) {
+        this.knifeInset = next;
         this.redraw();
       }
       return;
@@ -9668,26 +10121,22 @@ export class PatternEditor {
     }
 
     if (this.drag.type === 'knifeLine') {
-      this.drag.current = p;
+      // The far end snaps to a point or edge too, so a cut can be run from one
+      // corner to another. Shift is an instruction about the angle rather than
+      // the place, so it keeps the end where the pointer is and the preview
+      // shows the locked line instead.
+      this.drag.current = e.shiftKey ? p : this.snapKnifePoint(p);
       this.drag.shift = e.shiftKey;
       this.redraw();
       return;
     }
 
     if (this.drag.type === 'knifeCircle') {
-      if (e.shiftKey) {
-        // Shift: edit radius from fixed center (snap to 0.5 cm).
-        this.drag.radius = dist(this.drag.center, p);
-        this.drag.shift = true;
-      } else if (this.drag.radius < 0.25) {
-        // Establish radius on the first free drag.
-        this.drag.radius = dist(this.drag.center, p);
-        this.drag.shift = false;
-      } else {
-        // Free drag repositions the circle (keeps radius).
-        this.drag.center = p;
-        this.drag.shift = false;
-      }
+      // The drag is the radius, measured from the press, and never moves the
+      // centre — so the circle grows under the pointer instead of following it.
+      // Shift quantises the radius (see knifeCutterFromDrag).
+      this.drag.radius = dist(this.drag.center, p);
+      this.drag.shift = e.shiftKey;
       this.redraw();
       return;
     }
@@ -9757,7 +10206,7 @@ export class PatternEditor {
     if (this.drag.type === 'handle') {
       const d = this.drag;
       const piece = this.pattern.pieces.find((x) => x.id === d.pieceId)!;
-      const pt = piece.points.find((x) => x.id === d.pointId)!;
+      const pt = piecePointById(piece, d.pointId)!;
       if (d.which === 'out') {
         pt.handleOut = { ...p };
         if (d.mirror) {
@@ -9783,7 +10232,7 @@ export class PatternEditor {
     if (this.drag.type === 'penCurve') {
       const d = this.drag;
       const piece = this.pattern.pieces.find((x) => x.id === d.pieceId)!;
-      const pt = piece.points.find((x) => x.id === d.pointId)!;
+      const pt = piecePointById(piece, d.pointId)!;
       const dx = p.x - pt.anchor.x;
       const dy = p.y - pt.anchor.y;
       if (Math.hypot(dx, dy) > 0.3) {
@@ -9865,7 +10314,8 @@ export class PatternEditor {
 
     if (finished.type === 'knifeLine' || finished.type === 'knifeCircle') {
       const cutter = this.knifeCutterFromDrag(finished);
-      if (cutter) this.commitKnife(cutter);
+      if (cutter) this.commitDragCut(cutter);
+      this.syncKnifeBar();
       this.redraw();
       return;
     }
@@ -9891,11 +10341,29 @@ export class PatternEditor {
       return;
     }
 
+    if (this.knifeMode === 'inset') {
+      // The hover has already decided the loop: a click cuts it out.
+      const hover = this.knifeInset ?? this.insetAtPointer(p, e.shiftKey);
+      const piece = hover ? this.pattern.pieces.find((entry) => entry.id === hover.pieceId) : null;
+      if (hover && piece) {
+        this.knifeNotice = this.commitLoopCut(piece, hover.loop, 'inset');
+      } else {
+        this.knifeNotice = 'Hover inside a panel to size the loop';
+      }
+      this.knifeInset = null;
+      this.syncKnifeBar();
+      this.redraw();
+      return;
+    }
+
     if (this.knifeMode === 'linear') {
       this.drag = {
         type: 'knifeLine',
-        start: p,
-        current: p,
+        // The cut starts where the press landed, snapped to a point or edge the
+        // way every other knife click is: a cut aimed at a corner starts *on*
+        // the corner rather than a few pixels from it.
+        start: this.snapKnifePoint(p),
+        current: this.snapKnifePoint(p),
         shift: e.shiftKey,
       };
       this.svg.setPointerCapture(e.pointerId);
@@ -9905,6 +10373,9 @@ export class PatternEditor {
     }
 
     if (this.knifeMode === 'circle') {
+      // Press sets the centre and the drag sets the radius: the circle is not
+      // dragged around by its rim, so it lands centred on the spot it was aimed
+      // at however far it is dragged out.
       this.drag = {
         type: 'knifeCircle',
         center: p,

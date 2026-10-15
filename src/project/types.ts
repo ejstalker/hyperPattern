@@ -43,6 +43,16 @@ export type PatternPiece = {
   name: string;
   closed: boolean;
   points: BezierPoint[];
+  /**
+   * Inner contours cut out of the piece — one ring of points each. The cloth is
+   * what lies inside `points` and *outside* every one of these, so a hole is a
+   * hole whichever way round its ring happens to be wound. Holes are named apart
+   * from the outline only in this one place: anywhere a point or an edge is
+   * referred to — a seam, a seam allowance override, a measurement — it is named
+   * by its point IDs, which are unique across the whole piece, so nothing else
+   * has to know which ring it lives on.
+   */
+  holes?: BezierPoint[][];
   grainline?: { from: Vec2; to: Vec2 };
   seamAllowance?: SeamAllowance;
 };
