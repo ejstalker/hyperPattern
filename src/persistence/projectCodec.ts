@@ -2,6 +2,58 @@ import type { MeshDocument, ProjectDocument } from '../project/types';
 import { DEFAULT_DISPLAY_UNIT } from '../project/types';
 import { createMeshDocument, uid } from '../project/createDefault';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
+import { DEFAULT_CANVAS_CM_SCALE, fitContainerView } from '../project/containers';
+/**
+ * The container fields are the whole of what v3 adds, and every one of them is
+ * optional, so a v2 document is a v3 document that simply has not been asked yet.
+ */
+export function migrateProjectV2ToV3(raw: ProjectDocument): ProjectDocument {
+  const project: ProjectDocument = {
+    ...raw,
+    version: 3,
+    canvas: { ...raw.canvas },
+  };
+
+  const scales: number[] = [];
+  for (const node of project.canvas.nodes) {
+    if (node.type !== 'patternFrame') continue;
+    const pattern = project.patterns.find((p) => p.id === node.patternId);
+    // The frame keeps the view it had: a pattern node used to fit its pattern to
+    // the node, letterboxed and padded, and this is that same box expressed as
+    // centimetres instead of as a zoom.
+    const view = fitContainerView(pattern?.pieces ?? [], node.width, node.height);
+    node.cmScale = view.cmScale;
+    node.viewX = view.viewX;
+    node.viewY = view.viewY;
+    node.clip = true;
+    if (pattern?.pieces.length) scales.push(view.cmScale);
+  }
+
+  if (!project.canvas.draftScale) {
+    project.canvas.draftScale = scales.length
+      ? median(scales)
+      : DEFAULT_CANVAS_CM_SCALE;
+  }
+  if (!project.canvas.rootPatternId) {
+    const canvasPattern = {
+      id: uid('pattern'),
+      name: 'Canvas',
+      pieces: [],
+      seams: [],
+    };
+    project.patterns = [...project.patterns, canvasPattern];
+    project.canvas.rootPatternId = canvasPattern.id;
+  }
+  return project;
+}
+
+function median(values: readonly number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1]! + sorted[middle]!) / 2
+    : sorted[middle]!;
+}
 
 export function normalizeProject(project: ProjectDocument): ProjectDocument {
   const normalized: ProjectDocument = {
@@ -15,6 +67,26 @@ export function normalizeProject(project: ProjectDocument): ProjectDocument {
     meshTransformAssignments: project.meshTransformAssignments ?? [],
     transformSimAssignments: project.transformSimAssignments ?? [],
   };
+
+  // Every document has a canvas pattern to draw on: the canvas is a surface in
+  // its own right, so it can never be "the one without a pattern".
+  const rootId = normalized.canvas.rootPatternId;
+  if (!rootId || !normalized.patterns.some((p) => p.id === rootId)) {
+    const canvasPattern = {
+      id: uid('pattern'),
+      name: 'Canvas',
+      pieces: [],
+      seams: [],
+    };
+    normalized.patterns = [...normalized.patterns, canvasPattern];
+    normalized.canvas = { ...normalized.canvas, rootPatternId: canvasPattern.id };
+  }
+  if (!normalized.canvas.draftScale || normalized.canvas.draftScale <= 0) {
+    normalized.canvas = {
+      ...normalized.canvas,
+      draftScale: DEFAULT_CANVAS_CM_SCALE,
+    };
+  }
 
   for (const transform of normalized.transforms) {
     if (!transform.pieceTransforms) transform.pieceTransforms = {};
@@ -78,8 +150,12 @@ export function parseProject(json: string): ProjectDocument {
     activeSimId?: string | null;
   };
 
+  if (raw.version === 3) {
+    return normalizeProject(raw as unknown as ProjectDocument);
+  }
+
   if (raw.version === 2 && Array.isArray(raw.meshes)) {
-    return normalizeProject(raw as ProjectDocument);
+    return normalizeProject(migrateProjectV2ToV3(raw as unknown as ProjectDocument));
   }
 
   if (raw.version === 1) {
@@ -115,26 +191,28 @@ export function parseProject(json: string): ProjectDocument {
       }
     }
 
-    return normalizeProject({
-      version: 2,
-      id: raw.id,
-      name: raw.name,
-      displayUnit: raw.displayUnit,
-      canvas: {
-        panX: raw.canvas?.panX ?? 0,
-        panY: raw.canvas?.panY ?? 0,
-        zoom: raw.canvas?.zoom ?? 1,
-        nodes,
-      },
-      patterns,
-      meshes,
-      transforms: [],
-      sims,
-      assignments,
-      meshTransformAssignments: [],
-      transformSimAssignments: [],
-      activeSimId: raw.activeSimId ?? null,
-    });
+    return normalizeProject(
+      migrateProjectV2ToV3({
+        version: 2,
+        id: raw.id,
+        name: raw.name,
+        displayUnit: raw.displayUnit,
+        canvas: {
+          panX: raw.canvas?.panX ?? 0,
+          panY: raw.canvas?.panY ?? 0,
+          zoom: raw.canvas?.zoom ?? 1,
+          nodes,
+        },
+        patterns,
+        meshes,
+        transforms: [],
+        sims,
+        assignments,
+        meshTransformAssignments: [],
+        transformSimAssignments: [],
+        activeSimId: raw.activeSimId ?? null,
+      } as unknown as ProjectDocument)
+    );
   }
 
   throw new Error(`Unsupported project version: ${raw.version}`);

@@ -470,6 +470,11 @@ optgroup {
   overflow: hidden;
 }
 
+/* An unclipped container draws past its own edge, so nothing here may hide it. */
+.canvas-node.is-unclipped > .node-body {
+  overflow: visible;
+}
+
 .canvas-node > .node-chrome {
   border-radius: 8px 8px 0 0;
 }
@@ -550,14 +555,25 @@ optgroup {
  * chip and the button are live — so a gesture near the top of the viewport
  * still lands on the viewport.
  *
- * Text notes keep their bar: it is a plain editor with no viewport to overlay,
- * and the bar doubles as its drag handle.
+ * Text notes have no bar at all: they are their text, and they are dragged by the
+ * band around their edge instead (see `.node-text-grab`).
+ *
+ * The strip is *counter-scaled* so its chip and buttons keep one size on screen
+ * however far the board is zoomed: at zoom `z` everything inside a node is drawn
+ * `z` times its size, so the strip is laid out `1/z` times its size and made `z`
+ * times as wide, which leaves its contents exactly as they were and its right edge
+ * still on the frame's right edge. A frame can still be narrower on screen than its
+ * own chrome; the title then gives ground — it is the chip that shortens to an
+ * ellipsis — rather than the buttons, which stay put at the frame's corner.
  */
 .studio-board .canvas-node:not(.is-expanded):not(.node-text) > .node-chrome {
   position: absolute;
   top: 0;
   left: 0;
-  right: 0;
+  right: auto;
+  width: calc(100% * var(--board-zoom, 1));
+  transform: scale(calc(1 / var(--board-zoom, 1)));
+  transform-origin: 0 0;
   z-index: 9;
   min-height: 0;
   padding: 6px 8px;
@@ -710,6 +726,17 @@ optgroup {
   pointer-events: auto;
 }
 
+/*
+ * Shading belongs to a 3D container you are working *in*. On the canvas the
+ * container is being placed and arranged, and the control only gets in the way —
+ * it is there in full screen, where the viewport is the point.
+ */
+.studio-board
+  .canvas-node:not(.is-expanded):is(.node-simViewport, .node-transform3d, .node-meshFrame)
+  .viewport-shading {
+  display: none;
+}
+
 .node-actions button {
   font-size: 11px;
   padding: 2px 6px;
@@ -746,6 +773,141 @@ optgroup {
 .node-expand-btn:hover {
   border-color: var(--accent);
   background: #454038;
+}
+
+/* ── Containers ─────────────────────────────────────────────────────────────
+   A 2D container is a frame looking at a pattern's centimetre space. The clip
+   toggle rides in the frame's chrome, next to full screen. */
+
+/*
+ * On the canvas a frame is not a panel: it has no ground of its own, so the
+ * page's grid runs through it and the only shading is the veil inside the frame.
+ * That is what makes a container read as a window onto the canvas rather than a
+ * window onto something else. The veil stays light enough that the grid under it
+ * still reads — the frame is meant to darken the page, not hide it.
+ */
+.canvas-node.node-patternFrame:not(.is-expanded) {
+  background: transparent;
+  box-shadow: none;
+}
+
+.canvas-node.node-patternFrame:not(.is-expanded) > .node-body {
+  background: rgba(8, 7, 6, 0.22);
+}
+
+/*
+ * Frame edges: live only while ⌘/Ctrl is down, so a plain drag along the border
+ * still belongs to the pattern editor inside it. They are sized against the board
+ * zoom so the grab area stays the same width on screen however far out you are.
+ */
+.node-frame-edges {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 8;
+}
+
+.canvas-node.is-expanded .node-frame-edges {
+  display: none;
+}
+
+.node-frame-edge {
+  position: absolute;
+  pointer-events: none;
+}
+
+.is-frame-resize .node-frame-edge {
+  pointer-events: auto;
+}
+
+.is-frame-resize .node-frame-edge:hover {
+  background: var(--accent);
+  opacity: 0.45;
+}
+
+.node-frame-edge-n,
+.node-frame-edge-s {
+  left: 0;
+  right: 0;
+  height: calc(9px / var(--board-zoom, 1));
+  cursor: ns-resize;
+}
+
+.node-frame-edge-n {
+  top: 0;
+}
+
+.node-frame-edge-s {
+  bottom: 0;
+}
+
+.node-frame-edge-e,
+.node-frame-edge-w {
+  top: 0;
+  bottom: 0;
+  width: calc(9px / var(--board-zoom, 1));
+  cursor: ew-resize;
+}
+
+.node-frame-edge-e {
+  right: 0;
+}
+
+.node-frame-edge-w {
+  left: 0;
+}
+
+.node-clip-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #3a342c;
+  border: 1px solid var(--border);
+  color: var(--ink-muted, #a89f92);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.node-clip-btn.is-active {
+  color: var(--ink);
+  border-color: var(--accent);
+  background: #454038;
+}
+
+.node-clip-btn:hover {
+  border-color: var(--accent);
+}
+
+/*
+ * Unclipped: the frame does not hide what hangs over its edge. Nothing here
+ * clips the node anyway — the container's own svg stops hiding its overflow —
+ * so this only marks the frame as one you may draw past.
+ */
+.canvas-node.is-unclipped {
+  border-style: dashed;
+}
+
+/* The frame an expanded container draws around itself. */
+.pattern-container-frame rect {
+  stroke: rgba(244, 240, 234, 0.28);
+}
+
+/*
+ * The page: the canvas itself is a 2D editor, so it sits under the frames and
+ * takes the whole board. Its rail floats over the work the way the option
+ * ribbons do, because on the page the drawing surface *is* the viewport.
+ *
+ * Deliberately no z-index: the page must not become a stacking context, or its
+ * popovers (the piece menu, the rails) could never rise above the frames the
+ * board draws on top of it.
+ */
+.canvas-surface.pattern-host {
+  position: absolute;
+  inset: 0;
 }
 
 .canvas-node-placeholder {
@@ -1621,6 +1783,17 @@ optgroup {
   min-height: 0;
   position: relative;
   background: var(--bg);
+}
+
+/*
+ * A container on the canvas is a window, so its viewport has no ground of its
+ * own either — the page's grid has to run straight through the frame and be
+ * tinted, not hidden, by the frame's own shading (`.node-body`, over this).
+ * Full screen is the case that needs the panel colour, because there the frame
+ * is all there is.
+ */
+.canvas-node.node-patternFrame:not(.is-expanded) .pattern-viewport {
+  background: transparent;
 }
 
 .pattern-avatar-svg {
@@ -3961,12 +4134,72 @@ optgroup {
   display: block;
 }
 
+/* A note has no title bar and no bar to grab: it is dragged by the band around its
+   edge, so a press in the middle stays a press on the text. */
+.canvas-node.node-text > .node-chrome {
+  display: none;
+}
+
+.canvas-node.node-text > .node-body {
+  position: relative;
+}
+
+.node-text-grab {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* 12px of invisible border, one strip per edge so each can carry the move cursor.
+   Sizes are divided by the board zoom because these live inside it and the band is
+   meant to be 12 *screen* px, like the frame edges. No z-index: the resize handles
+   are appended after the body, so they still win the corners.
+
+   The `25%` cap matters on a note small enough on screen that a 12px band would
+   leave no room to type in the middle: the band gives way rather than the note. */
+.node-text-grab-band {
+  position: absolute;
+  pointer-events: auto;
+  cursor: move;
+}
+
+.node-text-grab-band-n,
+.node-text-grab-band-s {
+  left: 0;
+  right: 0;
+  height: min(calc(12px / var(--board-zoom, 1)), 25%);
+}
+
+.node-text-grab-band-e,
+.node-text-grab-band-w {
+  top: 0;
+  bottom: 0;
+  width: min(calc(12px / var(--board-zoom, 1)), 25%);
+}
+
+.node-text-grab-band-n {
+  top: 0;
+}
+
+.node-text-grab-band-s {
+  bottom: 0;
+}
+
+.node-text-grab-band-e {
+  right: 0;
+}
+
+.node-text-grab-band-w {
+  left: 0;
+}
+
 .node-text textarea {
   width: 100%;
   height: 100%;
   border: none;
   resize: none;
-  padding: 10px;
+  /* At least the grab band's width, so no line of text sits under it. */
+  padding: 14px;
   background: transparent;
   color: var(--ink);
   font: inherit;

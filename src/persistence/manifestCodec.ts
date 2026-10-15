@@ -6,7 +6,7 @@ import type {
   Transform3dInstance,
 } from '../project/types';
 import { uid } from '../project/createDefault';
-import { normalizeProject } from './projectCodec';
+import { migrateProjectV2ToV3, normalizeProject } from './projectCodec';
 import {
   meshSettingsHash,
   packMeshGeometry,
@@ -182,6 +182,8 @@ export async function documentToSavePayload(
       panY: project.canvas.panY,
       zoom: project.canvas.zoom,
       nodes: manifestNodesFromDocument(project.canvas.nodes, assetMap),
+      rootPatternId: project.canvas.rootPatternId,
+      draftScale: project.canvas.draftScale,
     },
     patterns: project.patterns,
     meshes,
@@ -251,8 +253,8 @@ export function manifestToDocument(
     return { ...rest, pose };
   });
 
-  return normalizeProject({
-    version: 2,
+  const document: ProjectDocument = {
+    version: 3,
     id: manifest.id,
     name: manifest.name,
     displayUnit: manifest.displayUnit,
@@ -265,7 +267,13 @@ export function manifestToDocument(
     meshTransformAssignments: manifest.meshTransformAssignments,
     transformSimAssignments: manifest.transformSimAssignments,
     activeSimId: manifest.activeSimId,
-  });
+  };
+  // A manifest written before containers has no canvas pattern: give its frames
+  // back the view they were fitted with, then let `normalizeProject` fill in
+  // anything else a hand-edited file might be missing.
+  return normalizeProject(
+    manifest.canvas.rootPatternId ? document : migrateProjectV2ToV3(document)
+  );
 }
 
 /** Convert v2 JSON document directly to save payload (migration). */

@@ -190,6 +190,26 @@ export type PatternDocument = {
    * of resetting them. Optional — older documents simply have no lineage.
    */
   pieceSuccessors?: Record<string, string[]>;
+  /**
+   * The procedural stack this container will run over its pieces (the Blender
+   * geometry-nodes / Houdini VOPs half of a container). Not implemented yet:
+   * nothing reads this, and an empty or absent list means "plain pieces".
+   */
+  modifiers?: PatternModifier[];
+};
+
+/**
+ * One entry in a container's modifier stack. Deliberately opaque for now — the
+ * stack exists in the data model so containers can be designed around it, and
+ * the operations themselves are still to come.
+ */
+export type PatternModifier = {
+  id: string;
+  /** Operation name, e.g. `offset-edges`, `pleat`. */
+  type: string;
+  enabled?: boolean;
+  /** Operation parameters, owned by whichever operation `type` names. */
+  params?: Record<string, unknown>;
 };
 
 /**
@@ -398,9 +418,29 @@ export type CanvasNodeBase = {
   zIndex: number;
 };
 
+/**
+ * A 2D container: a frame on the canvas showing a pattern's centimetre space.
+ *
+ * The pattern owns the work (pieces, seams, modifiers); the node is the frame
+ * that looks at it. There is no inner zoom — the frame is a window, so a piece
+ * is the same size inside a container as it is on the canvas itself. All four
+ * fields are optional and default to "one canvas unit per centimetre, origin at
+ * the frame's top-left corner, clipping on", which is what a container made by
+ * hand or by drawing on the canvas gets.
+ */
 export type PatternFrameNode = CanvasNodeBase & {
   type: 'patternFrame';
   patternId: string;
+  /** Canvas units per centimetre (see `CONTAINER_DEFAULT_CM_SCALE`). */
+  cmScale?: number;
+  /** Centimetre point shown at the frame's top-left corner. */
+  viewX?: number;
+  viewY?: number;
+  /**
+   * Figma-style "clip contents": hide whatever falls outside the frame without
+   * changing the frame's extent. Off, the work spills over its neighbours.
+   */
+  clip?: boolean;
 };
 
 export type MeshFrameNode = CanvasNodeBase & {
@@ -484,7 +524,7 @@ export type TransformSimAssignment = {
 };
 
 export type ProjectDocument = {
-  version: 2;
+  version: 3;
   id: string;
   name: string;
   displayUnit: UnitDisplay;
@@ -493,6 +533,19 @@ export type ProjectDocument = {
     panY: number;
     zoom: number;
     nodes: CanvasNode[];
+    /**
+     * The canvas is a drawing surface in its own right — one of Figma's pages.
+     * Its work lives in the pattern named here; pieces drawn on the canvas are
+     * put into a container by moving them into that container's pattern.
+     * Absent means "no canvas pattern yet", which `normalizeProject` fills in.
+     */
+    rootPatternId?: string;
+    /**
+     * Canvas units per centimetre for work drawn straight onto the canvas, and
+     * the scale a new container opens at. Defaults to
+     * `CONTAINER_DEFAULT_CM_SCALE` for documents that predate containers.
+     */
+    draftScale?: number;
   };
   patterns: PatternDocument[];
   meshes: MeshDocument[];

@@ -10,6 +10,11 @@ import type {
   Vec2,
 } from './types';
 import { DEFAULT_DISPLAY_UNIT } from './types';
+import {
+  DEFAULT_CANVAS_CM_SCALE,
+  CONTAINER_PADDING_CM,
+  piecesBoundsCm,
+} from './containers';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import { getDefaultSimCamera, syncDefaultCameraFromDrapeA } from '../sim/cameraDefaults';
 
@@ -197,6 +202,34 @@ export function createDefaultProject(): ProjectDocument {
     seams: [],
   };
 
+  // The canvas itself draws too — a page with its own centimetre space, which is
+  // also the scale every new container opens at.
+  const canvasPattern: PatternDocument = {
+    id: uid('pattern'),
+    name: 'Canvas',
+    pieces: [],
+    seams: [],
+  };
+
+  // The study's frame is fitted around its work at the canvas scale, so the
+  // pattern is the same size inside the container as it would be on the page.
+  const studyBounds = piecesBoundsCm(pattern.pieces)!;
+  const canvasContainer = {
+    type: 'patternFrame' as const,
+    patternId,
+    x: (studyBounds.min.x - CONTAINER_PADDING_CM) * DEFAULT_CANVAS_CM_SCALE,
+    y: (studyBounds.min.y - CONTAINER_PADDING_CM) * DEFAULT_CANVAS_CM_SCALE,
+    width: (studyBounds.max.x - studyBounds.min.x + CONTAINER_PADDING_CM * 2) *
+      DEFAULT_CANVAS_CM_SCALE,
+    height: (studyBounds.max.y - studyBounds.min.y + CONTAINER_PADDING_CM * 2) *
+      DEFAULT_CANVAS_CM_SCALE,
+    zIndex: 1,
+    cmScale: DEFAULT_CANVAS_CM_SCALE,
+    viewX: 0,
+    viewY: 0,
+    clip: true,
+  };
+
   const mesh: MeshDocument = {
     id: meshId,
     name: 'Panel mesh',
@@ -219,7 +252,7 @@ export function createDefaultProject(): ProjectDocument {
   });
 
   const project: ProjectDocument = {
-    version: 2,
+    version: 3,
     id: uid('project'),
     name: 'Untitled project',
     displayUnit: DEFAULT_DISPLAY_UNIT,
@@ -227,16 +260,12 @@ export function createDefaultProject(): ProjectDocument {
       panX: 40,
       panY: 40,
       zoom: 1,
+      draftScale: DEFAULT_CANVAS_CM_SCALE,
+      rootPatternId: canvasPattern.id,
       nodes: [
         {
-          type: 'patternFrame',
+          ...canvasContainer,
           id: uid('node'),
-          patternId,
-          x: 20,
-          y: 70,
-          width: 360,
-          height: 440,
-          zIndex: 1,
         },
         {
           type: 'meshFrame',
@@ -270,7 +299,7 @@ export function createDefaultProject(): ProjectDocument {
         },
       ],
     },
-    patterns: [pattern],
+    patterns: [canvasPattern, pattern],
     meshes: [mesh],
     transforms: [transform],
     sims: [makeSim(simId, 'Drape A')],

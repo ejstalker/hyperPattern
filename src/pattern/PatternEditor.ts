@@ -185,7 +185,124 @@ export type PatternEditorCallbacks = {
    * the 3D selection; it is not a document edit.
    */
   onSelectionChange?: (pieceIds: string[]) => void;
+  /**
+   * The canvas surface is asked to put a run of its own pieces into a container.
+   * Only wired up where that makes sense — on the canvas itself.
+   */
+  onGroupIntoContainer?: (pieceIds: string[]) => void;
+  /**
+   * A panel marquee finished, in pattern centimetres. On the canvas the hosts
+   * read this as "and the frames the rectangle crossed", so one ⌘/Ctrl-drag
+   * picks up whole panels and whole containers together.
+   */
+  onPanelMarquee?: (box: { x: number; y: number; w: number; h: number }) => void;
 };
+
+/**
+ * How much of a pattern to draw.
+ *
+ * A pattern drawn a hundred pixels wide is a smudge, and every mark on it — the
+ * points, the edge lengths, the measurement chips, all of them a fixed size on
+ * screen — would be a smear of chrome over the work rather than a reading of it.
+ * So the drawing thins out as it shrinks: `preview` keeps the silhouettes,
+ * `frame` keeps nothing but the grid the frame sits on.
+ */
+export type PatternDetail = 'full' | 'preview' | 'frame';
+
+/**
+ * A frame that looks at this pattern's centimetre space — see `containers.ts`.
+ *
+ * A locked container *is* its view: the box the element occupies is the box the
+ * pattern shows, at `cmScale` canvas units per centimetre, so the work is the
+ * same size inside a frame as it is on the canvas and nothing zooms it. An
+ * unlocked one is a container opened full screen: free pan and zoom, with the
+ * frame drawn where it sits so you can work past its edge.
+ */
+export type PatternEditorContainer = {
+  /** Canvas units per centimetre. */
+  cmScale: number;
+  /** Centimetre point shown at the frame's top-left corner. */
+  viewX: number;
+  viewY: number;
+  /** The frame's own size in cm — where its boundary is drawn when expanded. */
+  frameWidthCm: number;
+  frameHeightCm: number;
+  /** Figma's "clip contents": hide work outside the frame without moving it. */
+  clip: boolean;
+  /** Freeze the view to the frame. False once the container is opened up. */
+  locked: boolean;
+  /**
+   * Draw this editor's own reference grid. A frame sitting on the canvas does
+   * not: the page's grid runs behind it, so the two would disagree by a hair and
+   * the frame would look pasted on. The page itself, and a frame opened full
+   * screen (no page behind it), draw their own.
+   */
+  drawsGrid: boolean;
+  /**
+   * The CSS scale the host puts *on top of* this editor's layout box — the board's
+   * zoom, for a frame sitting on the canvas.
+   *
+   * Every fixed-size thing the editor draws (strokes, labels, handles, hit radii)
+   * is worked out from `viewScale`, the layout pixels per centimetre, so a host
+   * that scales the whole element would scale all of it too and zooming the canvas
+   * would turn outlines into hairlines. Dividing by the host's scale puts the
+   * chrome back to the size it has in a full-screen container, which is what the
+   * canvas is supposed to feel like. 1 means the element is drawn 1:1.
+   */
+  chromeScale: number;
+  /** How much of the pattern to draw — see `PatternDetail`. */
+  detail: PatternDetail;
+  /**
+   * Who takes the pointer when `detail` is coarser than full.
+   *
+   * A container sitting on the canvas is a window: at the canvas's lowest zooms a
+   * press belongs to the frame, so a drag moves the container rather than grabbing
+   * a point that is not on screen. The page and a full-screen container are
+   * workspaces, and take the pointer at every zoom.
+   */
+  coarsePointer: 'editor' | 'frame';
+};
+
+const CONTAINER_MODE_FIELDS = [
+  'cmScale',
+  'viewX',
+  'viewY',
+  'frameWidthCm',
+  'frameHeightCm',
+  'clip',
+  'locked',
+  'drawsGrid',
+  'chromeScale',
+  'detail',
+  'coarsePointer',
+] as const satisfies readonly (keyof PatternEditorContainer)[];
+
+/** The fields that change the *drawing*, as opposed to how big its chrome is. */
+const CONTAINER_SHAPE_FIELDS = CONTAINER_MODE_FIELDS.filter(
+  (field) => field !== 'chromeScale'
+);
+
+/** Do two container modes ask for the same drawing? */
+function sameContainerMode(
+  a: PatternEditorContainer | null,
+  b: PatternEditorContainer | null
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return CONTAINER_MODE_FIELDS.every((field) => a[field] === b[field]);
+}
+
+/**
+ * Same frame, same detail, same clipping — only the host's scale differs. That is
+ * the one difference a moving zoom make that can wait for the gesture to settle.
+ */
+function sameContainerShape(
+  a: PatternEditorContainer | null,
+  b: PatternEditorContainer | null
+): boolean {
+  if (!a || !b) return false;
+  return CONTAINER_SHAPE_FIELDS.every((field) => a[field] === b[field]);
+}
 
 /** Figma-aligned vector tools inside a pattern frame. */
 export type PatternTool =
@@ -301,6 +418,13 @@ const KNIFE_MODES: ReadonlyArray<{ mode: KnifeMode; label: string }> = [
   { mode: 'loop', label: 'Loop' },
   { mode: 'loop-straight', label: 'Loop straight' },
 ];
+
+/**
+ * How faint a silhouette is when the canvas is zoomed too far out to draw the work
+ * properly. Solid enough to read the shape of a panel, light enough that the grid
+ * underneath still shows through it.
+ */
+const SILHOUETTE_FILL_OPACITY = 0.45;
 
 /** The viewBox width the wheel and the zoom control may not pass, in pattern units. */
 const MIN_VIEW_WIDTH = 8;
@@ -677,6 +801,13 @@ export class PatternEditor {
   private selectedPieceId: string | null = null;
   private drag: DragKind | null = null;
   private viewBox = { x: -10, y: -10, w: 80, h: 90 };
+  /**
+   * The frame this pattern is shown through, when it is shown through one — see
+   * `PatternEditorContainer`. Null is a plain pattern window with its own zoom.
+   */
+  private container: PatternEditorContainer | null = null;
+  /** The host scale the drawing was last built with — see `restateContainer`. */
+  private drawnChromeScale = 1;
   private cbs: PatternEditorCallbacks;
   /** Last reported piece selection, so `onSelectionChange` only fires on change. */
   private lastSelectionSig = '';
@@ -1724,6 +1855,7 @@ export class PatternEditor {
       <button type="button" data-act="mirror-x">Mirror duplicate X</button>
       <button type="button" data-act="mirror-y">Mirror duplicate Y</button>
       <button type="button" data-act="simplify-points" hidden>Simplify points</button>
+      <button type="button" data-act="new-container" hidden>Put selection in container</button>
       <button type="button" data-act="delete-piece" class="danger">Delete piece</button>
       <button type="button" data-act="reverse-seam" hidden>Reverse seam</button>
       <button type="button" data-act="reverse-seam-order" hidden>Reverse seam order here</button>
@@ -1742,6 +1874,7 @@ export class PatternEditor {
       else if (act === 'mirror-y') this.mirrorDuplicateContextPiece('y');
       else if (act === 'delete-piece') this.deleteContextPiece();
       else if (act === 'simplify-points') this.startSimplifyPoints();
+      else if (act === 'new-container') this.groupSelectionIntoContainer();
       else if (act === 'reverse-seam') this.reverseContextSeam();
       else if (act === 'reverse-seam-order') this.reverseContextSeamOrder();
       else if (act === 'remove-seam') this.removeContextSeam();
@@ -1764,6 +1897,9 @@ export class PatternEditor {
     this.viewport.addEventListener(
       'wheel',
       (e) => {
+        // A locked container is not zoomable, so the wheel belongs to whatever
+        // holds it — on the canvas, that is the canvas itself.
+        if (this.container?.locked) return;
         e.preventDefault();
         e.stopPropagation();
         this.zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 1.12 : 0.89);
@@ -1972,13 +2108,172 @@ export class PatternEditor {
 
   /** The visible pattern-space rectangle (the editor's zoom/pan), for history. */
   getViewBox(): { x: number; y: number; w: number; h: number } {
-    return { ...this.viewBox };
+    return { ...this.effectiveViewBox() };
   }
 
   /** Restore a saved visible rectangle verbatim — view state, not document. */
   setViewBox(box: { x: number; y: number; w: number; h: number }): void {
+    // A locked container has no view of its own to restore: it shows the frame.
+    if (this.container?.locked) return;
     this.viewBox = { ...box };
     this.redraw();
+  }
+
+  /** Put this pattern behind a container frame, or take it out of one. */
+  setContainer(mode: PatternEditorContainer | null): void {
+    // The host re-states the frame on every board pan, and almost every one of
+    // those leaves it identical; redrawing for those would be the whole cost of
+    // panning the canvas.
+    if (sameContainerMode(this.container, mode)) return;
+    this.container = mode;
+    // `redraw` re-applies the clip, so the frame's own box is up to date too.
+    this.redraw();
+  }
+
+  /**
+   * Restate the frame for a host scale that is still moving, repainting only once
+   * the difference would show.
+   *
+   * Zooming the canvas changes nothing about a container's drawing except the size
+   * of its chrome: the geometry is centimetres, and the host's transform scales it
+   * exactly. So a gesture that crosses fifty scales — the board zooms tenfold, and
+   * a trackpad sends several events a frame — does not need fifty repaints of
+   * every pattern on the page. It needs one at the end; until then the drawn
+   * chrome is within `tolerance` of right, which at a quarter is a 2px stroke
+   * drawn as 1.6px, or as 2.5px, while everything on the canvas is moving anyway.
+   */
+  restateContainer(mode: PatternEditorContainer | null, tolerance: number): void {
+    const previous = this.container;
+    if (sameContainerMode(previous, mode)) return;
+    this.container = mode;
+    // A different frame, or a different amount of it, is a different drawing.
+    if (!sameContainerShape(previous, mode)) {
+      this.redraw();
+      return;
+    }
+    const drawn = this.drawnChromeScale;
+    const now = this.chromeScale();
+    const drift = now > drawn ? now / drawn : drawn / now;
+    if (drift < tolerance) return;
+    this.redraw();
+  }
+
+  /** Catch up chrome a `restateContainer` deliberately left trailing. */
+  settleContainer(): void {
+    if (this.drawnChromeScale === this.chromeScale()) return;
+    this.redraw();
+  }
+
+  /**
+   * The host's CSS scale, which the fixed-size chrome is divided by. See
+   * `PatternEditorContainer.chromeScale`.
+   */
+  private chromeScale(): number {
+    const scale = this.container?.chromeScale;
+    return scale && scale > 0 ? scale : 1;
+  }
+
+  /**
+   * What to draw right now. Any tool but the move tool is a reason to see
+   * everything: a knife, a ruler, a pen and a sewing run all work from the
+   * geometry and its marks, and a press with one of them in hand is meant to land
+   * on the pattern — so picking one up brings the whole drawing back.
+   */
+  private detail(): PatternDetail {
+    if (this.tool !== 'move') return 'full';
+    return this.container?.detail ?? 'full';
+  }
+
+  /**
+   * The box actually drawn. A locked container is its frame: the element's size
+   * in centimetres, anchored at the container's view origin. Everything else —
+   * including an expanded container — is the editor's own zoom and pan.
+   */
+  private effectiveViewBox(): { x: number; y: number; w: number; h: number } {
+    const container = this.container;
+    if (!container || !container.locked) return this.viewBox;
+    const w = this.svg.clientWidth / container.cmScale;
+    const h = this.svg.clientHeight / container.cmScale;
+    // Layout may not have settled yet; a zero-width box would blank the drawing.
+    if (!(w > 0) || !(h > 0)) return this.viewBox;
+    return { x: container.viewX, y: container.viewY, w, h };
+  }
+
+  /**
+   * Clipping. A container that clips hides whatever is outside its frame: the
+   * element's own overflow covers the part that runs past the drawing area, and
+   * when the view reaches beyond the frame (an expanded container) the frame's
+   * rectangle is cut out of the viewport as well — leaving the ribbons alone.
+   */
+  private applyContainerClip(): void {
+    const container = this.container;
+    if (!container) {
+      this.svg.style.overflow = '';
+      this.viewport.style.clipPath = '';
+      return;
+    }
+    this.svg.style.overflow = container.clip ? 'hidden' : 'visible';
+    if (!container.clip || container.locked) {
+      // Frame-sized view: the element *is* the frame, so there is nothing left
+      // to cut out of it.
+      this.viewport.style.clipPath = '';
+      return;
+    }
+    const { x, y, w, h } = this.viewBox;
+    const scale = Math.min(
+      this.svg.clientWidth / w,
+      this.svg.clientHeight / h
+    );
+    if (!(scale > 0) || !Number.isFinite(scale)) {
+      this.viewport.style.clipPath = '';
+      return;
+    }
+    // The SVG letterboxes, so the frame's rectangle is offset as well as scaled.
+    const left = (container.viewX - x) * scale + (this.svg.clientWidth - w * scale) / 2;
+    const top = (container.viewY - y) * scale + (this.svg.clientHeight - h * scale) / 2;
+    const right = this.svg.clientWidth - (left + container.frameWidthCm * scale);
+    const bottom = this.svg.clientHeight - (top + container.frameHeightCm * scale);
+    this.viewport.style.clipPath = `inset(${Math.max(0, top)}px ${Math.max(
+      0,
+      right
+    )}px ${Math.max(0, bottom)}px ${Math.max(0, left)}px)`;
+  }
+
+  /** The container's frame, drawn where it sits once the container is opened up. */
+  private drawContainerFrame(): SVGGElement {
+    const group = document.createElementNS(SVG_NS, 'g');
+    group.setAttribute('class', 'pattern-container-frame');
+    const container = this.container;
+    if (!container || container.locked) return group;
+    const rect = document.createElementNS(SVG_NS, 'rect');
+    rect.setAttribute('x', String(container.viewX));
+    rect.setAttribute('y', String(container.viewY));
+    rect.setAttribute('width', String(container.frameWidthCm));
+    rect.setAttribute('height', String(container.frameHeightCm));
+    rect.setAttribute('fill', 'none');
+    rect.setAttribute('stroke-width', String(this.px(1)));
+    rect.setAttribute(
+      'stroke-dasharray',
+      `${this.px(6)} ${this.px(4)}`
+    );
+    group.appendChild(rect);
+    return group;
+  }
+
+  /** Repaint without touching the pattern — the host moved or changed data. */
+  refresh(): void {
+    this.redraw();
+  }
+
+  /**
+   * Where the pattern is drawn inside the host, in layout pixels. A host may
+   * carry chrome (a rail) beside the drawing, and a locked container's view is
+   * written against the drawing rather than against the host's own corner.
+   */
+  viewOriginInHost(): { x: number; y: number } {
+    const view = this.svg.getBoundingClientRect();
+    const root = this.root.getBoundingClientRect();
+    return { x: view.left - root.left, y: view.top - root.top };
   }
 
   /** Reload avatar silhouette after the studio avatar mesh/prefs change. */
@@ -2705,7 +3000,7 @@ export class PatternEditor {
   }
 
   private syncAvatarSvg(): void {
-    const { x, y, w, h } = this.viewBox;
+    const { x, y, w, h } = this.effectiveViewBox();
     this.avatarSvg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
     this.avatarSvg.innerHTML = '';
     if (!this.avatarOverlayOn || !this.avatarOverlayPath) return;
@@ -2725,8 +3020,12 @@ export class PatternEditor {
    * Minor/major reference grid — see `buildGridGroup` for the letterbox overscan
    * and the zoom-out ladder.
    */
-  private drawGrid(layoutW: number, layoutH: number): SVGGElement {
-    return buildGridGroup(this.viewBox, this.unit, {
+  private drawGrid(
+    layoutW: number,
+    layoutH: number,
+    box: { x: number; y: number; w: number; h: number }
+  ): SVGGElement {
+    return buildGridGroup(box, this.unit, {
       width: layoutW,
       height: layoutH,
     });
@@ -2747,21 +3046,48 @@ export class PatternEditor {
 
   private redraw(): void {
     this.emitSelectionChange();
-    const { x, y, w, h } = this.viewBox;
+    this.drawnChromeScale = this.chromeScale();
+    const view = this.effectiveViewBox();
+    const { x, y, w, h } = view;
     // The single layout read for this redraw — see `viewScaleCache`. Taken before
     // anything is written so it cannot force a flush of its own.
     const layoutW = this.svg.clientWidth;
     const layoutH = this.svg.clientHeight;
     const sized = layoutW >= 2 && layoutH >= 2;
-    this.viewScaleCache = sized ? Math.min(layoutW / w, layoutH / h) : null;
+    this.viewScaleCache = sized
+      ? (Math.min(layoutW / w, layoutH / h)) * this.chromeScale()
+      : null;
     if (sized) this.lastChromeLayout = { w: layoutW, h: layoutH };
 
     this.svg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
     this.avatarSvg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
     this.svg.innerHTML = '';
 
-    const grid = this.drawGrid(layoutW, layoutH);
-    this.svg.appendChild(grid);
+    if (this.container?.drawsGrid !== false) {
+      const grid = this.drawGrid(layoutW, layoutH, view);
+      this.svg.appendChild(grid);
+    }
+
+    // An expanded container draws its own boundary: the work may run past it, and
+    // which side of that line you are on is the whole point of the frame.
+    const frame = this.drawContainerFrame();
+    if (frame.childNodes.length > 0) this.svg.appendChild(frame);
+    this.applyContainerClip();
+
+    // Zoomed far enough out that every mark would be a smear of chrome over the
+    // work, there is less to draw — see `PatternDetail`. A frame on the canvas
+    // hands the pointer over as well, so a press there moves the container.
+    const detail = this.detail();
+    this.svg.style.pointerEvents =
+      detail === 'full' || this.container?.coarsePointer === 'editor' ? '' : 'none';
+    if (detail !== 'full') {
+      // Outlines are drawn at every level: the shape of the work is what a
+      // zoomed-out canvas is *for*. What the coarser levels drop is the fill and
+      // all the chrome.
+      const mark = detail === 'preview' ? 'silhouette' : 'outline';
+      for (const piece of this.pattern.pieces) this.drawPiece(piece, mark);
+      return;
+    }
 
     // Ownership has to be known before anything is drawn, and the group boxes go
     // down first so a piece stroke can never be painted over by one.
@@ -4163,7 +4489,19 @@ export class PatternEditor {
     }
   }
 
-  private drawPiece(piece: PatternPiece): void {
+  /**
+   * One piece: its outline and fill, then everything drawn *on* it — edge lengths,
+   * the grainline, its points and handles.
+   *
+   * `mark` is what a zoomed-out canvas asks for. The outline is always drawn —
+   * however far out you go, the shape of the work is the one thing worth showing —
+   * and the marks that would be unreadable at that size are dropped: `silhouette`
+   * keeps a faint fill as well, `outline` is the bare line.
+   */
+  private drawPiece(
+    piece: PatternPiece,
+    mark: 'full' | 'silhouette' | 'outline' = 'full'
+  ): void {
     const n = piece.points.length;
     // Generated geometry reads as one family: lavender lines and points say
     // "this is drafted from variables" at a glance, and marks the pieces that
@@ -4177,9 +4515,15 @@ export class PatternEditor {
       // Even-odd, so a hole in the piece is genuinely not cloth.
       path.setAttribute('fill-rule', 'evenodd');
       path.setAttribute('stroke-width', String(this.px(2)));
+      if (mark === 'silhouette') {
+        path.setAttribute('fill-opacity', String(SILHOUETTE_FILL_OPACITY));
+      } else if (mark === 'outline') {
+        path.setAttribute('fill', 'none');
+      }
       path.dataset.pieceId = piece.id;
       this.svg.appendChild(path);
     }
+    if (mark !== 'full') return;
 
     // Drafted blocks are full of short edges — dart legs, the waistband notch,
     // ease offsets. Labelling every one of them piles unreadable text over the
@@ -4366,6 +4710,7 @@ export class PatternEditor {
   /** Layout CSS px per pattern unit (xMidYMid meet). */
   private viewScale(): number {
     if (this.viewScaleCache != null) return this.viewScaleCache;
+    const box = this.effectiveViewBox();
     const w = this.svg.clientWidth;
     const h = this.svg.clientHeight;
     // Before flex layout settles, client size is 0 — assume a typical pattern
@@ -4374,16 +4719,22 @@ export class PatternEditor {
     // for a viewport that never existed.
     if (w < 2 || h < 2) {
       const assumed = 360;
-      return Math.min(assumed / this.viewBox.w, assumed / this.viewBox.h);
+      return (Math.min(assumed / box.w, assumed / box.h)) * this.chromeScale();
     }
-    return Math.min(w / this.viewBox.w, h / this.viewBox.h);
+    return (Math.min(w / box.w, h / box.h)) * this.chromeScale();
   }
 
-  /** Screen px per pattern unit (includes board CSS zoom) — for pointer math. */
+  /**
+   * Screen px per pattern unit — for pointer math and for anything that has to
+   * judge a distance the way the eye sees it. The element's rendered box already
+   * includes the host's CSS scale, and `effectiveViewBox` is what is actually
+   * drawn, so this is the screen scale for a container as well as a free editor.
+   */
   private screenToPatternScale(): number {
     const rect = this.svg.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1) return 1;
-    return Math.min(rect.width / this.viewBox.w, rect.height / this.viewBox.h);
+    const box = this.effectiveViewBox();
+    return Math.min(rect.width / box.w, rect.height / box.h);
   }
 
   private hitRadius(): number {
@@ -4753,16 +5104,22 @@ export class PatternEditor {
       reverseSeamsAcrossEdge(this.pattern.seams, this.contextSeamHit) !== null;
     for (const btn of Array.from(this.contextMenu.querySelectorAll('button[data-act]'))) {
       const act = (btn as HTMLElement).dataset.act!;
+      // Putting work in a container is a canvas act: only the canvas has the
+      // room for a new frame, and only there would it mean anything.
+      const containerOk =
+        !!this.cbs.onGroupIntoContainer && this.getSelectedPieces().length > 0;
       const show =
-        mode === 'piece'
-          ? act === 'simplify-points'
-            ? simplifyOk
-            : pieceActs.includes(act)
-          : mode === 'ruler'
-            ? rulerActs.includes(act)
-            : act === 'reverse-seam-order'
-              ? canReorder
-              : seamActs.includes(act);
+        act === 'new-container'
+          ? containerOk
+          : mode === 'piece'
+            ? act === 'simplify-points'
+              ? simplifyOk
+              : pieceActs.includes(act)
+            : mode === 'ruler'
+              ? rulerActs.includes(act)
+              : act === 'reverse-seam-order'
+                ? canReorder
+                : seamActs.includes(act);
       (btn as HTMLButtonElement).hidden = !show;
     }
 
@@ -7514,6 +7871,19 @@ export class PatternEditor {
 
   private makePieceId = (): string => uid('pt');
 
+  /**
+   * Hand the picked panels to the canvas to put in a new container. The pattern
+   * data moves, so this is a document edit — but the pieces themselves are only
+   * translated, so nothing changes shape or place on screen.
+   */
+  private groupSelectionIntoContainer(): void {
+    const ids = this.getSelectedPieces();
+    if (ids.length === 0) return;
+    this.markBeforeChange();
+    this.cbs.onGroupIntoContainer?.(ids);
+    this.endHistoryGesture();
+  }
+
   private afterPieceDuplicated(copy: PatternPiece): void {
     this.markBeforeChange();
     this.pattern.pieces.push(copy);
@@ -7663,8 +8033,13 @@ export class PatternEditor {
     const onScaleHandle =
       this.tool === 'move' && hitEl.dataset?.kind === 'scale' && !!hitEl.dataset.handle;
 
-    // Middle-mouse (or Alt-left) pans the pattern view
-    if (e.button === 1 || (e.button === 0 && e.altKey && !onScaleHandle)) {
+    // Middle-mouse (or Alt-left) pans the pattern view. A locked frame has no
+    // view of its own, so there the gesture belongs to the canvas behind it.
+    const lockedFrame = !!this.container?.locked;
+    const panGesture =
+      e.button === 1 || (e.button === 0 && e.altKey && !onScaleHandle);
+    if (lockedFrame && panGesture) return;
+    if (panGesture) {
       this.drag = {
         type: 'pan',
         startClient: { x: e.clientX, y: e.clientY },
@@ -10273,6 +10648,14 @@ export class PatternEditor {
         else if (!finished.additive) this.clearSelection();
       } else if (finished.panels) {
         this.addPiecesInRect(finished.start, finished.current);
+        // The same rectangle picks up the frames it crossed: on the canvas these
+        // are the containers, and a marquee over the page should take both.
+        this.cbs.onPanelMarquee?.({
+          x: Math.min(finished.start.x, finished.current.x),
+          y: Math.min(finished.start.y, finished.current.y),
+          w: Math.abs(finished.current.x - finished.start.x),
+          h: Math.abs(finished.current.y - finished.start.y),
+        });
       } else if (finished.additive) {
         const hit = this.pointsInRect(finished.start, finished.current);
         const merged = new Set(this.selectedIds);

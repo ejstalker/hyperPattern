@@ -3,8 +3,9 @@ import { normalizeProject, parseProject, serializeProject } from './projectCodec
 import { documentToSavePayload, manifestToDocument } from './manifestCodec';
 import { packMeshGeometry, unpackMeshGeometry, packPose, unpackPose, type PoseRecord } from './schema';
 import { createSmallFixture } from './fixtures';
-import { createDefaultProject } from '../project/createDefault';
+import { createDefaultProject, rectPiece } from '../project/createDefault';
 import { DEFAULT_DISPLAY_UNIT } from '../project/types';
+import { DEFAULT_CANVAS_CM_SCALE } from '../project/containers';
 import { projectStore } from './ProjectStore';
 import { deleteAsset, getAssetsForProject } from './idb';
 import type { ProjectDocument } from '../project/types';
@@ -43,6 +44,157 @@ async function deleteStoredAssets(projectId: string): Promise<void> {
   for (const record of records) await deleteAsset(record.id);
 }
 
+describe('document version migration', () => {
+  /** A v2 file: a pattern shown in a node that fits it, as the old app saved it. */
+  function legacyDocument(): Record<string, unknown> {
+    const piece = rectPiece('Front panel', 40, 50, { x: 5, y: 5 });
+    return {
+      version: 2,
+      id: 'project_legacy',
+      name: 'Legacy',
+      displayUnit: 'cm',
+      canvas: {
+        panX: 40,
+        panY: 40,
+        zoom: 1,
+        nodes: [
+          {
+            type: 'patternFrame',
+            id: 'node_pattern',
+            patternId: 'pattern_a',
+            x: 20,
+            y: 70,
+            width: 360,
+            height: 440,
+            zIndex: 1,
+          },
+        ],
+      },
+      patterns: [
+        { id: 'pattern_a', name: 'Study A', pieces: [piece], seams: [] },
+      ],
+      meshes: [],
+      transforms: [],
+      sims: [],
+      assignments: [],
+      meshTransformAssignments: [],
+      transformSimAssignments: [],
+      activeSimId: null,
+    };
+  }
+
+  it('reads a v2 file and leaves its geometry exactly where it was', () => {
+    const raw = legacyDocument();
+    const original = JSON.parse(JSON.stringify(raw)) as typeof raw;
+    const project = parseProject(JSON.stringify(raw));
+
+    expect(project.version).toBe(3);
+    const originalPiece = (original.patterns as Array<{ pieces: unknown[] }>)[0]!.pieces[0];
+    const migrated = project.patterns.find((p) => p.id === 'pattern_a')!.pieces[0];
+    expect(migrated).toEqual(originalPiece);
+  });
+
+  it('gives every old pattern node the view it used to fit', () => {
+    const project = parseProject(JSON.stringify(legacyDocument()));
+    const node = project.canvas.nodes.find((n) => n.type === 'patternFrame');
+    expect(node?.type).toBe('patternFrame');
+    if (node?.type !== 'patternFrame') return;
+
+    // 40×50 cm with 8 cm padding is 56×66 cm, and 360×440 letterboxes at 6.4.
+    expect(node.cmScale).toBeCloseTo(360 / 56, 6);
+    expect(node.clip).toBe(true);
+    const view = { x: node.viewX!, y: node.viewY!, w: 360 / node.cmScale!, h: 440 / node.cmScale! };
+    // The frame is centred on the padded work, so the work is still framed.
+    expect(view.x + view.w / 2).toBeCloseTo(25, 4);
+    expect(view.y + view.h / 2).toBeCloseTo(30, 4);
+    expect(node.x).toBe(20);
+    expect(node.width).toBe(360);
+  });
+
+  it('adds a canvas pattern and a drafting scale', () => {
+    const project = parseProject(JSON.stringify(legacyDocument()));
+    const rootId = project.canvas.rootPatternId;
+    expect(rootId).toBeTruthy();
+    const canvasPattern = project.patterns.find((p) => p.id === rootId);
+    expect(canvasPattern?.pieces).toHaveLength(0);
+    // The canvas scale follows the file's own containers, so a piece drawn on
+    // the page is the same size as the work already there.
+    expect(project.canvas.draftScale).toBeCloseTo(360 / 56, 6);
+  });
+
+  it('round-trips the canvas pattern through JSON and the save payload', async () => {
+    const project = parseProject(JSON.stringify(legacyDocument()));
+    const again = parseProject(serializeProject(project));
+    expect(again.canvas.rootPatternId).toBe(project.canvas.rootPatternId);
+    expect(again.canvas.draftScale).toBe(project.canvas.draftScale);
+
+    const payload = await documentToSavePayload(project, { projectId: project.id, revision: 1 });
+    expect(payload.manifest.canvas.rootPatternId).toBe(project.canvas.rootPatternId);
+    expect(payload.manifest.canvas.draftScale).toBe(project.canvas.draftScale);
+    const hydrated = manifestToDocument(
+      payload.manifest,
+      new Map(),
+      new Map(),
+      new Map(),
+      () => ''
+    );
+    expect(hydrated.canvas.rootPatternId).toBe(project.canvas.rootPatternId);
+    expect(hydrated.canvas.draftScale).toBe(project.canvas.draftScale);
+    const hydratedNode = hydrated.canvas.nodes.find((n) => n.type === 'patternFrame');
+    expect(hydratedNode?.type === 'patternFrame' ? hydratedNode.clip : null).toBe(true);
+  });
+
+  it('upgrades a project stored before containers were introduced', async () => {
+    const project = parseProject(JSON.stringify(legacyDocument()));
+    const payload = await documentToSavePayload(project, {
+      projectId: project.id,
+      revision: 1,
+    });
+    // Rewind the manifest to what the previous build wrote: no canvas pattern,
+    // no drafting scale, and frames with nothing but their box.
+    const manifest = JSON.parse(JSON.stringify(payload.manifest)) as typeof payload.manifest;
+    delete manifest.canvas.rootPatternId;
+    delete manifest.canvas.draftScale;
+    for (const node of manifest.canvas.nodes) {
+      const loose = node as Record<string, unknown>;
+      delete loose.cmScale;
+      delete loose.viewX;
+      delete loose.viewY;
+      delete loose.clip;
+    }
+
+    const hydrated = manifestToDocument(
+      manifest,
+      new Map(),
+      new Map(),
+      new Map(),
+      () => ''
+    );
+    const node = hydrated.canvas.nodes.find((n) => n.type === 'patternFrame');
+    expect(node?.type).toBe('patternFrame');
+    if (node?.type !== 'patternFrame') return;
+    // The frame gets back the view it used to fit, and clips as it did.
+    expect(node.cmScale).toBeCloseTo(360 / 56, 6);
+    expect(node.clip).toBe(true);
+    expect(hydrated.canvas.rootPatternId).toBeTruthy();
+    const piece = hydrated.patterns.find((p) => p.id === 'pattern_a')?.pieces[0];
+    expect(piece).toBeTruthy();
+    expect(piece!.points).toHaveLength(4);
+  });
+
+  it('opens a brand new project on the canvas scale', () => {    const project = createDefaultProject();
+    expect(project.version).toBe(3);
+    expect(project.canvas.draftScale).toBe(DEFAULT_CANVAS_CM_SCALE);
+    const canvasPattern = project.patterns.find((p) => p.id === project.canvas.rootPatternId);
+    expect(canvasPattern?.name).toBe('Canvas');
+    const node = project.canvas.nodes.find((n) => n.type === 'patternFrame');
+    if (node?.type !== 'patternFrame') throw new Error('no pattern node');
+    // The one container opens at the canvas scale, so the pattern in it is the
+    // size it would be if it were drawn on the page.
+    expect(node.cmScale).toBe(DEFAULT_CANVAS_CM_SCALE);
+  });
+});
+
 describe('projectCodec', () => {
   it('round-trips a small fixture', () => {
     const project = createSmallFixture();
@@ -63,7 +215,7 @@ describe('projectCodec', () => {
 
   it('keeps transform settings through a JSON round trip', () => {
     const project = createSmallFixture();
-    const pieceId = project.patterns[0]!.pieces[0]!.id;
+    const pieceId = project.patterns.find((p) => p.id === 'pattern_small')!.pieces[0]!.id;
     const expected = project.transforms[0]!.pieceTransforms[pieceId];
     expect(expected).toBeDefined();
 
@@ -120,7 +272,7 @@ describe('display units', () => {
 describe('transform persistence through the save payload', () => {
   it('keeps per-piece transform settings', async () => {
     const project = createSmallFixture();
-    const pieceId = project.patterns[0]!.pieces[0]!.id;
+    const pieceId = project.patterns.find((p) => p.id === 'pattern_small')!.pieces[0]!.id;
     const expected = project.transforms[0]!.pieceTransforms[pieceId];
 
     const payload = await documentToSavePayload(project, {
@@ -144,7 +296,7 @@ describe('transform persistence through the save payload', () => {
 
   it('keeps transform settings through an archive round trip', async () => {
     const project = createSmallFixture();
-    const pieceId = project.patterns[0]!.pieces[0]!.id;
+    const pieceId = project.patterns.find((p) => p.id === 'pattern_small')!.pieces[0]!.id;
     const expected = project.transforms[0]!.pieceTransforms[pieceId];
 
     const bytes = await exportProjectArchiveBytes(project);

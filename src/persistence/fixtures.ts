@@ -1,6 +1,7 @@
 import type { ProjectDocument } from '../project/types';
 import { uid, DEFAULT_SIM_PARAMS, rectPiece } from '../project/createDefault';
 import { getDefaultSimCamera } from '../sim/cameraDefaults';
+import { DEFAULT_CANVAS_CM_SCALE } from '../project/containers';
 import { triangulatePattern, DEFAULT_MESH_SETTINGS } from '../mesh/triangulate';
 
 /** ~1 KB synthetic project for unit tests. */
@@ -11,12 +12,27 @@ export function createSmallFixture(): ProjectDocument {
   const transformId = 'transform_small';
   const piece = rectPiece('Panel', 20, 30, { x: 0, y: 0 });
   return {
-    version: 2,
+    version: 3,
     id: 'project_small',
     name: 'Small fixture',
     displayUnit: 'cm',
-    canvas: { panX: 0, panY: 0, zoom: 1, nodes: [] },
-    patterns: [{ id: patternId, name: 'P', pieces: [piece], seams: [] }],
+    canvas: {
+      panX: 0,
+      panY: 0,
+      zoom: 1,
+      nodes: [],
+      rootPatternId: 'pattern_canvas',
+      draftScale: DEFAULT_CANVAS_CM_SCALE,
+    },
+    patterns: [
+      {
+        id: 'pattern_canvas',
+        name: 'Canvas',
+        pieces: [],
+        seams: [],
+      },
+      { id: patternId, name: 'P', pieces: [piece], seams: [] },
+    ],
     meshes: [
       {
         id: meshId,

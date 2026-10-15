@@ -35,13 +35,28 @@ If you see “WebGPU is not supported,” update the browser and confirm WebGPU 
 
 ### Canvas project
 - Pan the board (Alt-drag empty space) · zoom with ⌘/Ctrl-wheel
-- **Right-click empty canvas** to add a node — **New pattern** (2D), **New drape** (3D), a **Note**, or an **Image reference…** — and it lands where you clicked
+- **Right-click empty canvas** to add a node — **New pattern** (a 2D container/frame), **New drape** (3D), a **Note**, or an **Image reference…** — and it lands where you clicked. Right-click a panel on the page instead for the piece menu, which is where **Put selection in container** lives
 - Wire **pattern → remesh → transform → drape**; wires show assignments
 - Save / load / import projects from the **Projects** modal · undo / redo (⌘Z / ⌘⇧Z)
 - Image refs (the **Image reference…** menu entry, paste, or drop) are stored with the project, so they come back on reload. An image whose stored bytes are gone shows a **Re-link image…** button on the node
 - Duplicate a node with **⌘D** or **⌥-drag**. Select several (Shift- or ⌘/Ctrl-click a node, or ⌘/Ctrl-drag the board to rectangle-select) and **⌘D** duplicates the set as one group: links between the copies stay between the copies, so a duplicated pattern → remesh → transform → drape is a chain of its own. Duplicating a drape brings the remesh / transform it hides along as copies too, so the new drape drapes the new pattern
 - **Backspace / Delete** removes the selected node(s) — no confirmation, undo brings them back · **Esc** clears the selection
 - Fullscreen a node (**⛶**); when wired, header **tabs** jump between Pattern / Remesh / Transform / Drape
+
+### Containers
+- The canvas is a drawing surface in its own right: the 2D rail is on it, so panels can be drawn, measured and edited straight onto the page with or without a node around them. The page has one drafting scale — canvas units per centimetre — so work on the canvas and work in a container are the same size
+- A **2D container** is a **frame** looking at a pattern's centimetre space, the way a Figma frame does — not a window with a zoom of its own. Containers on the canvas are not zoomable: they draw at the canvas scale and pan and zoom with the board
+- **Zooming the canvas never changes what the pattern is drawn with.** Outlines, seam allowance, measurements, edge lengths, handles and hit areas are all the same size on screen at 4% as at 400% — the canvas behaves exactly like a full-screen container, which only changes how much of the work you can see. The frame's own label and **⛶** keep their size too: the strip they sit on is counter-scaled against the board's zoom, so the chip stays in the frame's top-left corner and the buttons in its top-right at 4% and at 400% alike. A frame narrower on screen than its own chrome gives up its title — shortened to an ellipsis — rather than letting the buttons wander off its corner
+- A frame on the canvas has **no ground of its own**: nothing inside it is opaque, so the page's grid runs straight through it and is *tinted*, not hidden, by the frame's own shading (a 22% veil) — containers read as windows onto the canvas rather than panels pasted on it
+- **A frame thins out as the canvas zooms away from it.** Above 2 px to the centimetre (about 31% of the board's zoom, at the drafting scale a new project uses) a container draws everything. Between 2 and 0.9 px/cm it draws **silhouettes**: the panels filled at 45% with their outlines, and none of the marks that would be unreadable at that size — no points, no handles, no edge lengths, no measurement readouts, no seam allowance. Below 0.9 px/cm (about 14%) the fills go too and it draws the panel **outlines** alone. An outline is drawn at every zoom, however far out the canvas is: the marks that thin out are the ones that cannot be read at that size, never the shape of the work itself. Picking any tool other than Move — a pen, a knife, a ruler, a sewing run — brings the whole drawing straight back, so nothing is ever drawn blind; and while a frame is drawing coarsely, a press inside it belongs to the **frame**, so a drag moves the container instead of grabbing a point that is not on screen. Opening a container full screen always draws everything: there, zooming out is a way of looking at the work rather than a way of looking at the canvas
+- Move a frame and its work moves with it. **Resize** it by a corner handle, or hold **⌘/Ctrl** and drag any border (the edges only take the pointer while the modifier is down, so a plain drag along the border still belongs to the pattern inside). Either way the frame slides *over* its work — the pieces keep the canvas position they had, so a frame grows outwards and never rescales or shifts what it holds, exactly like a Figma frame. A frame **never** changes its extent to fit the work
+- **Clip contents** — the dashed-square button in the frame's chrome, left of **⛶** — hides whatever falls outside the frame without moving it, exactly like Figma's clip contents. Turned off, the work spills over its neighbours and the frame is drawn above them
+- **Put selection in container**: pick panels on the canvas, right-click one, and choose it from the piece menu. The run moves into a new frame drawn around it — the pieces are translated into the frame's own space, so nothing moves or changes size on screen
+- Fullscreen a container (**⛶**) to work **beyond its border**: the view pans and zooms freely, the frame is drawn where it sits (a dashed outline), and Clip contents decides whether the overhang is drawn
+- The 3D stages — **New drape**, and the remesh / transform inside it — are the 3D containers, and they link to a 2D container by wiring, as before. Piping 3D data back into 2D is still to come
+- A 3D container on the canvas keeps its **gnomon** but not its **shading** control: shading is a choice about a viewport you are working *in*, so it is there in full screen and out of the way while you are arranging the canvas
+- Each container will carry a **modifier stack** (procedural operations over its pieces, like geometry nodes). The document already reserves the field; nothing reads it yet
+- Files saved by earlier versions open unchanged: each frame keeps the view it used to fit, the pieces arrive exactly as they were, and the project gains its canvas pattern on load
 
 ### Pattern editor
 - Move, and four rail menus: **Add** (pen, rectangle, circle, block library, SVG import), **Modify** (extrude, join, bridge), **Remove** (knife, dart) and **Sew** (segment, many-to-many), plus the ruler button — which puts either a **Ruler** or a **Measure line** in hand — and lengths in **cm or inches**
@@ -51,7 +66,7 @@ If you see “WebGPU is not supported,” update the browser and confirm WebGPU 
 - Bridge closes the gap between two pieces — or between two runs of one piece — with new straight edges, leaving the outlines exactly where they are
 - Simplify a picked run of points: live reduce/fit preview, seam ends protected
 - **Seam allowance**: show the allowance line outside every piece — half an inch by default — and click an edge to give that one its own value, from the ribbon at the top left
-- **View**: a typed viewport zoom with **Fit to pattern**, a **lock** that holds the zoom level while you pan, and **hicon projection** — outlines and their measurements in white, the allowance shown, over a grid at double opacity
+- **View**: a typed viewport zoom with **Fit to pattern**, a **lock** that holds the zoom level while you pan, and **hicon projection** — outlines and their measurements in white, the allowance shown, over a grid at double opacity. Inside a container the zoom and the wheel belong to the canvas until the container is opened full screen, because a frame on the board *is* its own view
 - Soft snap, multi-select scale, avatar reference overlay, X-ray fill
 - Seam bindings become sew constraints after remesh
 
@@ -122,10 +137,10 @@ If you see “WebGPU is not supported,” update the browser and confirm WebGPU 
 
 | Action | Input |
 | --- | --- |
-| Pan board | Alt-drag empty canvas |
-| Zoom board | ⌘/Ctrl + wheel |
+| Pan board | Alt-drag empty canvas (or the middle mouse button) |
+| Zoom board | Wheel / ⌘/Ctrl-wheel over the canvas — the page scales from 4% to 400%, and a frame on the board is not zoomable itself |
 | Undo / Redo | ⌘/Ctrl+Z · ⌘/Ctrl+Shift+Z |
-| Select several nodes | Shift- or ⌘/Ctrl-click a node to add it (⌘/Ctrl-click it again to drop it) · ⌘/Ctrl-drag empty board to rectangle-select · click empty board or press Esc to clear |
+| Select several nodes | Shift- or ⌘/Ctrl-click a node to add it (⌘/Ctrl-click it again to drop it) · ⌘/Ctrl-drag empty canvas to rectangle-select, which takes the panels on the page and the frames the rectangle crosses · click empty canvas or press Esc to clear |
 | Duplicate node(s) | ⌘/Ctrl+D · or ⌥/Alt-drag — a group duplicated together keeps its links between the copies |
 | Delete node(s) | Backspace / Delete (undo restores them) · or right-click → Delete, or the inspector's Delete button |
 | Orbit 3D (sim / transform) | Drag empty space in the viewport |
@@ -171,6 +186,12 @@ If you see “WebGPU is not supported,” update the browser and confirm WebGPU 
 | Exit fullscreen | Esc or ✕ |
 
 Pattern viewport: ⌘/Ctrl-wheel (or a plain wheel, or a trackpad scroll) zooms the pattern, the **Zoom** button types an exact percent of the default framing (or steps it 1% at a time), and **Fit to pattern** frames the work; Alt-drag pans inside the editor. **Lock zoom**, in the zoom popover, holds the level where it is — the wheel and the zoom controls stop moving it, while panning stays free.
+
+A frame that is off the canvas is not drawn at all: the board only restates the containers it can see, remembers the ones it skipped, and catches them up the moment they come back into view. Panning across a large canvas therefore costs nothing for the work behind you, and a zoom sweep over a canvas of scattered containers only pays for what is on screen.
+
+Zooming the board is done a frame at a time, not an event at a time: a trackpad sends several wheel events per frame, and each one used to restate every container and the page in full — with three or four forced layouts of its own — so a fast two-finger zoom could cost more than a frame's budget per event. The events now gather and compose into a single pass per frame (exactly the same zoom, since the steps multiply), and the frames let their chrome *trail* while the board is moving, catching up in one repaint when it settles: only the size of the chrome depends on the zoom, never the geometry. A twenty-four-step sweep therefore repaints each container about ten times rather than twenty-four, and a pan — which changes no frame's own scale at all — touches none of them.
+
+Zooming, on the canvas and in a container alike, only ever changes *how much* of the work is on screen. Every fixed-size thing the editor draws — outline weights, seam allowance, ruler and measurement readouts, edge lengths, points and handles, the rotate ring, the click radius that decides what a press lands on — is computed from the editor's own screen scale, so it comes out the same number of pixels whatever the zoom. Zooming the board out to 4% shows more of the canvas at hairline-thin *geometry*, not hairline-thin *lines*: a piece drawn 2 px wide at 100% is still 2 px wide at 4%, and its edge labels are still 11 px and still legible. That is the same rule a full-screen container follows, and the two are the same code: a frame on the canvas tells its editor how far the board is scaling it, and the editor divides its chrome by that. The frame's *own* label and clip button are canvas chrome rather than pattern chrome, and they hold their size the same way: the strip they sit on is laid out against the board's zoom and scaled by its inverse, so the chip is the same 12px type in the frame's top-left corner at any zoom and the buttons stay in its top-right — the title shortens to an ellipsis when the frame is smaller on screen than its own chrome, which is what keeps a zoomed-out canvas readable instead of covered in overlapping labels.
 
 The knife's modes, in detail: they are toggles on the canvas ribbon at the top left, not rows in the rail menu, because the mode *is* the knife's setting and changing it is something you do while looking at the piece you are about to cut. **Remove** → **Knife** puts the knife in hand in whatever mode the ribbon is set to, and the row that opened it names that mode; the rail's own tip carries it too ("Remove · Knife · Loop cut, straight across"). Switching modes mid-session drops any draft in hand — a half-clicked chain belongs to the knife that was drawing it.
 
@@ -236,10 +257,12 @@ npm run preview   # preview the build
 
 - Canonical units are **centimeters**; the **Units** button on the toolbar opens a popover to switch the display to inches. The change is document data, so every canvas follows it and the project file records it.
 - The studio toolbar is icons only: **New**, **Projects**, project name, **Undo / Redo**, **Avatars** (the person icon), **Units**. Each carries its label as a tooltip. Nodes are added from the canvas — right-click empty board.
-- A boarded node draws its title and **⛶** over the top of its own viewport rather than in a bar above it, so the preview gets the whole rectangle. The strip between them is transparent: dragging a node on the board is done by its title chip, and a gesture in that top band still reaches the viewport underneath. Text notes keep their bar.
+- A boarded node draws its title and **⛶** over the top of its own viewport rather than in a bar above it, so the preview gets the whole rectangle. The strip between them is transparent: dragging a node on the board is done by its title chip, and a gesture in that top band still reaches the viewport underneath. Both keep their size on screen however far the board is zoomed.
+- A **Note** has no bar at all. It is a rectangle of text you can type in, and it is dragged by the **12px border** around it — an invisible band inside the note's edge, sized on screen so it stays 12px however far you are zoomed out (and gives way to a quarter of the note when the whole note is smaller than that, so there is always somewhere to type). A press in the middle of a note lands in the text, where the caret belongs; a press within 12px of the edge picks the note up, so a drag on the border moves it and ⌫ deletes it
 - Loading a **custom avatar model** (your own OBJ / SDF) is off the toolbar for now; avatars come from **Avatars** (measurements → generated model).
 - Type is **IBM Plex Sans** throughout, with **IBM Plex Mono** for anything read as a number, a code or a key; both are pulled from Google Fonts in [`index.html`](index.html).
 - Rebuild the mesh (and sim) after pattern or sew changes so topology stays in sync.
+- The canvas and every container share one drafting scale (`canvas.draftScale`, canvas units per centimetre). A container's frame carries the rest of its view — `cmScale`, the centimetre point at its top-left corner, and `clip` — so a board of containered patterns still measures and reads at the canvas's own size.
 - Avatar SDF baking can write into `refPpl/` via the Vite dev API so you don’t rebake every session.
 
 Legacy WebGPU cloth demos and GIFs from the earlier drop/wind playground remain available via [`demo.html`](demo.html).

@@ -24,6 +24,7 @@ import type {
   MeshDocument,
   MeshFrameNode,
   PatternDocument,
+  PatternFrameNode,
   PatternPiece,
   PieceTransform3d,
   ProjectDocument,
@@ -36,7 +37,11 @@ import type {
   MeshAlgorithm,
   SimCameraState,
 } from '../project/types';
-import { PatternEditor } from '../pattern/PatternEditor';
+import {
+  PatternEditor,
+  type PatternDetail,
+  type PatternEditorContainer,
+} from '../pattern/PatternEditor';
 import { remapSeamAllowance, sameSeamBindingPair } from '../pattern/geometry';
 import { DEFAULT_SEAM_GAP_CM } from '../mesh/triangulate';
 import { generateBlockPieces } from '../pattern/blocks/generate';
@@ -57,12 +62,66 @@ import {
   simChainIds,
   type DuplicateLinks,
 } from '../project/nodeDuplicates';
+import {
+  CONTAINER_PADDING_CM,
+  canvasAtCm,
+  canvasCmScale,
+  containerClips,
+  containerView,
+  groupIntoContainer,
+  piecesBoundsCm,
+  containerViewShifted,
+  rootPattern,
+  topNodeZ,
+  type ContainerView,
+} from '../project/containers';
 import { MeshPreview } from '../mesh/MeshPreview';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
 import { Environment, loadEnvironmentSettings } from '../render/environment';
 import { MaterialLibrary } from '../render/materials';
 import { Transform3dRuntime } from '../sim/Transform3dRuntime';
 import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from '../sim/transformDefaults';
+
+type Rect = { x: number; y: number; w: number; h: number };
+
+/** Does a node's box on the canvas meet `rect`? Both are in canvas units. */
+function nodeBoxIntersects(
+  node: { x: number; y: number; width: number; height: number },
+  rect: Rect
+): boolean {
+  return (
+    node.x < rect.x + rect.w &&
+    node.x + node.width > rect.x &&
+    node.y < rect.y + rect.h &&
+    node.y + node.height > rect.y
+  );
+}
+
+/** The board's zoom range — it is the whole page's scale, so it reaches far out. */
+const MIN_BOARD_ZOOM = 0.04;
+const MAX_BOARD_ZOOM = 4;
+
+/**
+ * How far a container's chrome may trail a moving board zoom before it repaints,
+ * and how still the board has to be before the rest catches up. Zooming a frame
+ * only changes the size of its chrome — see `PatternEditor.restateContainer` — so
+ * paying for every frame of a gesture is the difference between a canvas with a
+ * few containers and one with a dozen.
+ */
+const CONTAINER_CHROME_TOLERANCE = 1.25;
+const CONTAINER_CHROME_SETTLE_MS = 140;
+
+/**
+ * How much of a pattern to draw, measured by how big a centimetre is on screen:
+ * full detail above 2 px, silhouettes down to 0.9 px, and nothing but the frame's
+ * own ground below that. At the canvas's own drafting scale (6.5 canvas units per
+ * centimetre) those land at board zooms of about 31% and 14%.
+ */
+const CONTAINER_DETAIL_FULL_PX_PER_CM = 2;
+const CONTAINER_DETAIL_PREVIEW_PX_PER_CM = 0.9;
+
+/** How far outside the board a frame still counts as visible, in screen px. */
+const CONTAINER_CULL_MARGIN_PX = 256;
 import {
   createIcons,
   FilePlus2,
@@ -162,6 +221,9 @@ export class StudioApp {
   private studioBody: HTMLElement;
   private inspector: HTMLElement;
   private editors = new Map<string, PatternEditor>();
+  /** The page itself: a pattern editor under the frames (see `mountCanvasSurface`). */
+  private canvasEditor: PatternEditor | null = null;
+  private canvasSurface: HTMLElement | null = null;
   private meshPreviews = new Map<string, MeshPreview>();
   private simRuntimes = new Map<string, SimViewportRuntime>();
   private transformRuntimes = new Map<string, Transform3dRuntime>();
@@ -209,15 +271,25 @@ export class StudioApp {
   private wireDrag: WireDrag | null = null;
   private resizingNode: {
     id: string;
-    corner: 'nw' | 'ne' | 'sw' | 'se';
+    corner: 'nw' | 'ne' | 'sw' | 'se' | 'n' | 'e' | 's' | 'w';
     startBoardX: number;
     startBoardY: number;
     origX: number;
     origY: number;
     origW: number;
     origH: number;
+    /** A container's view at the start of the resize — see `containerViewShifted`. */
+    origView?: ContainerView;
   } | null = null;
   private raf = 0;
+  /** Wheel events gathered for the next frame, and the frame that will apply them. */
+  private pendingZoom: { factor: number; clientX: number; clientY: number } | null = null;
+  private zoomRaf = 0;
+  /** The board zoom the containers were last told about — see `applyBoardTransform`. */
+  private chromeZoomSynced: number | null = null;
+  private chromeSettleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Frames that were off the canvas when the board last moved — see `syncContainerDetail`. */
+  private culledContainers = new Set<string>();
   /** Bumped on each board remount so in-flight initGpuAndSims cannot register stale runtimes. */
   private gpuInitGeneration = 0;
   private modalRoot: HTMLElement;
@@ -286,6 +358,7 @@ export class StudioApp {
     this.bindNodeContextMenu();
     this.bindBoardHotkeys();
     this.bindUndoHotkey();
+    this.bindFrameResizeModifier();
     this.bindImagePasteAndDrop();
     window.addEventListener('resize', () => this.drawWires());
   }
@@ -531,6 +604,10 @@ export class StudioApp {
   }
 
   private async syncLiveRuntimesFromProject(): Promise<void> {
+    // The page's editor is not a node, so it is not re-pointed by the loop below:
+    // without this it would go on drawing the document the undo replaced. Its view
+    // is the board's, restated every frame, so it is not fitted either.
+    this.canvasEditor?.setPattern(rootPattern(this.project), { preserveView: true });
     for (const node of this.project.canvas.nodes) {
       if (node.type === 'patternFrame') {
         const pattern = this.project.patterns.find((p) => p.id === node.patternId);
@@ -734,6 +811,29 @@ export class StudioApp {
     window.addEventListener('keyup', (e) => {
       if (e.key === 'Shift') this.resizeShiftKey = false;
     });
+  }
+
+  /**
+   * Arm the frame edges. Holding ⌘/Ctrl is what asks for "the frame, not the work
+   * inside it", so the border bands only take the pointer while it is down.
+   */
+  private bindFrameResizeModifier(): void {
+    const watch = (e: KeyboardEvent, armed: boolean): void => {
+      if (e.key === 'Meta' || e.key === 'Control') this.setFrameResizeArmed(armed);
+    };
+    window.addEventListener('keydown', (e) => watch(e, true));
+    window.addEventListener('keyup', (e) => watch(e, false));
+    // A modifier held while the window loses focus never reports its keyup.
+    window.addEventListener('blur', () => this.setFrameResizeArmed(false));
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) this.setFrameResizeArmed(false);
+    });
+  }
+
+  private setFrameResizeArmed(armed: boolean): void {
+    const wrap = document.getElementById('boardWrap');
+    if (!wrap || wrap.classList.contains('is-frame-resize') === armed) return;
+    wrap.classList.toggle('is-frame-resize', armed);
   }
 
   private bindImageImport(): void {
@@ -1791,39 +1891,127 @@ export class StudioApp {
       'wheel',
       (e) => {
         e.preventDefault();
-        const factor = e.deltaY > 0 ? 0.9 : 1.1;
-        const oldZoom = this.project.canvas.zoom;
-        const newZoom = Math.min(2.5, Math.max(0.35, oldZoom * factor));
-        if (newZoom === oldZoom) return;
-        // Zoom toward cursor: keep the board point under the pointer fixed on screen.
-        const rect = wrap.getBoundingClientRect();
-        const mx = e.clientX - rect.left;
-        const my = e.clientY - rect.top;
-        const { panX, panY } = this.project.canvas;
-        const boardX = (mx - panX) / oldZoom;
-        const boardY = (my - panY) / oldZoom;
-        this.project.canvas.zoom = newZoom;
-        this.project.canvas.panX = mx - boardX * newZoom;
-        this.project.canvas.panY = my - boardY * newZoom;
-        this.applyBoardTransform();
-        this.drawWires();
+        // A trackpad sends several of these per frame, and each one would restate
+        // the whole board — every container's chrome, the page's grid, the wires.
+        // Gather a frame's worth and apply them together; the steps compose, so a
+        // flick still travels exactly as far as it asked to.
+        const step = e.deltaY > 0 ? 0.9 : 1.1;
+        if (this.pendingZoom) {
+          this.pendingZoom.factor *= step;
+          this.pendingZoom.clientX = e.clientX;
+          this.pendingZoom.clientY = e.clientY;
+        } else {
+          this.pendingZoom = { factor: step, clientX: e.clientX, clientY: e.clientY };
+        }
+        if (!this.zoomRaf) {
+          this.zoomRaf = requestAnimationFrame(() => this.flushBoardZoom());
+        }
       },
       { passive: false }
     );
   }
 
+  /**
+   * Bring the frames on screen into step with the board's zoom.
+   *
+   * Two things keep this cheap enough to run on a gesture. A frame that is not on
+   * the canvas is skipped outright and remembered (`culledContainers`): it does not
+   * need to follow a zoom nobody can see, and it is caught up the moment it comes
+   * back into view — which is what `wasZoom` being false is for, since a pan is
+   * when a culled frame usually returns. Everything else is restated through
+   * `restateContainer`, which lets a moving zoom leave the chrome behind and
+   * repaints at once for anything that changes the drawing itself.
+   */
+  private syncContainerDetail(zoomChanged: boolean): void {
+    const culled = this.culledContainers;
+    if (!zoomChanged && culled.size === 0) return;
+    const view = this.boardViewportRect(CONTAINER_CULL_MARGIN_PX);
+    for (const node of this.project.canvas.nodes) {
+      if (node.type !== 'patternFrame') continue;
+      const editor = this.editors.get(node.id);
+      if (!editor) continue;
+      if (!zoomChanged && !culled.has(node.id)) continue;
+      if (!nodeBoxIntersects(node, view)) {
+        culled.add(node.id);
+        continue;
+      }
+      culled.delete(node.id);
+      editor.restateContainer(
+        this.containerModeFor(node, this.expandedNodeId === node.id),
+        CONTAINER_CHROME_TOLERANCE
+      );
+    }
+    if (zoomChanged) this.scheduleChromeSettle();
+  }
+
+  /** The canvas-space rectangle the board is showing, grown by `marginPx`. */
+  private boardViewportRect(marginPx: number): Rect {
+    const wrap = document.getElementById('boardWrap');
+    const { panX, panY, zoom } = this.project.canvas;
+    const width = (wrap?.clientWidth ?? 0) / zoom;
+    const height = (wrap?.clientHeight ?? 0) / zoom;
+    const margin = marginPx / zoom;
+    return {
+      x: -panX / zoom - margin,
+      y: -panY / zoom - margin,
+      w: width + margin * 2,
+      h: height + margin * 2,
+    };
+  }
+
+  /** Apply the wheel events gathered since the last frame — once. */
+  private flushBoardZoom(): void {
+    this.zoomRaf = 0;
+    const pending = this.pendingZoom;
+    this.pendingZoom = null;
+    const wrap = document.getElementById('boardWrap');
+    if (!pending || !wrap) return;
+
+    const { panX, panY, zoom: oldZoom } = this.project.canvas;
+    const newZoom = Math.min(
+      MAX_BOARD_ZOOM,
+      Math.max(MIN_BOARD_ZOOM, oldZoom * pending.factor)
+    );
+    if (newZoom === oldZoom) return;
+
+    // Zoom toward the cursor: keep the board point under the pointer fixed on
+    // screen. Composing the steps and doing this once is the same as doing it per
+    // step, as long as the anchor does not move — and the last event's anchor is
+    // where the pointer actually is.
+    const rect = wrap.getBoundingClientRect();
+    const mx = pending.clientX - rect.left;
+    const my = pending.clientY - rect.top;
+    this.project.canvas.zoom = newZoom;
+    this.project.canvas.panX = mx - ((mx - panX) / oldZoom) * newZoom;
+    this.project.canvas.panY = my - ((my - panY) / oldZoom) * newZoom;
+    this.applyBoardTransform();
+    this.drawWires();
+  }
+
   private applyBoardTransform(): void {
     const { panX, panY, zoom } = this.project.canvas;
     this.board.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    // Chrome inside the board is scaled with it; anything that has to stay a
+    // constant size on screen (a frame's resize edges) divides by this.
+    this.board.style.setProperty('--board-zoom', String(zoom));
+    // A frame on the board is scaled by that transform, so its editor needs to
+    // know by how much before it draws its next stroke.
+    this.syncContainerDetail(this.chromeZoomSynced !== zoom);
+    this.chromeZoomSynced = zoom;
+    // The page has no transform of its own; it is drawn in screen space and the
+    // board's pan and zoom are folded into its view instead.
+    this.syncCanvasSurfaceView();
   }
 
   private renderAll(): void {
     this.gpuInitGeneration++;
+    this.settleContainerChrome();
     this.closeNodeFullscreen();
     this.teardownSims();
     this.board.innerHTML = '';
     this.editors.clear();
     this.meshPreviews.clear();
+    this.mountCanvasSurface();
     this.applyBoardTransform();
     const nodes = [...this.project.canvas.nodes].sort((a, b) => a.zIndex - b.zIndex);
     for (const node of nodes) {
@@ -1831,6 +2019,120 @@ export class StudioApp {
     }
     this.drawWires();
     this.renderInspector();
+  }
+
+  /**
+   * The canvas itself, as a drawing surface.
+   *
+   * It is a 2D editor like any other — same rail, same tools — but its view is
+   * the canvas's: the frames sit on top of it at the canvas's own scale, and work
+   * drawn here is measured against the same centimetres they are. Panning and
+   * zooming the board moves this view with it, so the page and its containers can
+   * never drift apart.
+   */
+  private mountCanvasSurface(): void {
+    const wrap = document.getElementById('boardWrap');
+    if (!wrap) return;
+    this.canvasSurface?.remove();
+    const host = document.createElement('div');
+    // Under `#board`, so every frame (and its chrome) stays on top of the page.
+    host.className = 'canvas-surface pattern-host is-canvas-surface';
+    wrap.insertBefore(host, this.board);
+    const pattern = rootPattern(this.project);
+    this.canvasEditor = new PatternEditor(host, pattern, this.project.displayUnit, {
+      onBeforeChange: () => this.pushUndo(),
+      onChange: () => {
+        this.invalidateMeshesForPattern(pattern.id);
+        this.markDirty();
+      },
+      onRulerChange: () => this.markDirty(),
+      getMeasurementLibrary: () => cachedMeasurementLibrary(),
+      onGroupIntoContainer: (pieceIds) => this.groupCanvasPiecesIntoContainer(pieceIds),
+      onPanelMarquee: (box) => this.selectContainersInCanvasRect(box),
+    });
+    this.canvasSurface = host;
+    this.syncCanvasSurfaceView();
+  }
+
+  /** Keep the canvas pattern's view locked to the board's pan and zoom. */
+  private syncCanvasSurfaceView(): void {
+    const editor = this.canvasEditor;
+    if (!editor) return;
+    // Screen pixels per centimetre on the page: the drafting scale, zoomed. The
+    // page is drawn in screen space, so this *is* the on-screen size of a
+    // centimetre, and it is what the detail ladder is measured against.
+    const cmScale = canvasCmScale(this.project) * this.project.canvas.zoom;
+    if (!(cmScale > 0)) return;
+    // The page's editor keeps its rail beside the drawing, so the view starts
+    // where the drawing does rather than at the host's own corner.
+    const origin = editor.viewOriginInHost();
+    editor.setContainer({
+      cmScale,
+      viewX: (origin.x - this.project.canvas.panX) / cmScale,
+      viewY: (origin.y - this.project.canvas.panY) / cmScale,
+      frameWidthCm: 0,
+      frameHeightCm: 0,
+      clip: false,
+      locked: true,
+      drawsGrid: true,
+      // The page is drawn in screen space and folds the board's zoom into its
+      // centimetre scale instead, so nothing extra is scaling its chrome.
+      chromeScale: 1,
+      // The page's own work thins out with the board like a frame's, but the page
+      // is the drawing surface: it keeps the pointer and its grid at every zoom.
+      detail: this.detailForScale(cmScale),
+      coarsePointer: 'editor',
+    });
+  }
+
+  /** "Put selection in container", from the canvas editor's context menu. */
+  private groupCanvasPiecesIntoContainer(pieceIds: string[]): void {
+    const canvas = rootPattern(this.project);
+    const chosen = canvas.pieces.filter((piece) => pieceIds.includes(piece.id));
+    // Name the new frame after the work when there is one obvious answer.
+    const name =
+      chosen.length === 1
+        ? chosen[0]!.name
+        : `Pattern ${this.project.patterns.length + 1}`;
+    const outcome = groupIntoContainer(this.project, pieceIds, name);
+    if (!outcome.ok) {
+      this.setStatus(outcome.reason);
+      return;
+    }
+    this.mountNode(outcome.node);
+    this.layoutNodes();
+    this.drawWires();
+    this.selectNodes([outcome.node.id]);
+    // The pieces left the page for the new frame; the page has one less thing on it.
+    this.canvasEditor?.refresh();
+    this.renderInspector();
+    this.markDirty();
+    this.setStatus(
+      `Moved ${outcome.pieceCount} piece${outcome.pieceCount === 1 ? '' : 's'} into a container`
+    );
+  }
+
+  /**
+   * A panel marquee on the canvas also picks up the frames it crossed: on the
+   * page, "everything in this rectangle" means containers too.
+   */
+  private selectContainersInCanvasRect(box: {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  }): void {
+    const topLeft = canvasAtCm(this.project, box.x, box.y);
+    const bottomRight = canvasAtCm(this.project, box.x + box.w, box.y + box.h);
+    const hits = nodesInBoardRect(this.project.canvas.nodes, {
+      x: Math.min(topLeft.x, bottomRight.x),
+      y: Math.min(topLeft.y, bottomRight.y),
+      width: Math.abs(bottomRight.x - topLeft.x),
+      height: Math.abs(bottomRight.y - topLeft.y),
+    });
+    if (hits.length === 0) return;
+    const merged = new Set([...this.selectedNodeIds, ...hits.map((node) => node.id)]);
+    this.selectNodes([...merged], hits[hits.length - 1]!.id);
   }
 
   private findNodeEl(nodeId: string): HTMLElement | null {
@@ -1924,6 +2226,9 @@ export class StudioApp {
     this.dockInspectorToFullscreen();
     this.syncFullscreenTabs(el, nodeId);
     this.layoutNodes();
+    // Expanded, a container stops being a window and becomes a workspace: the
+    // view frees up and the frame is drawn where it sits.
+    if (node.type === 'patternFrame') this.syncContainer(node);
     this.renderInspector();
     this.drawWires();
 
@@ -1960,7 +2265,7 @@ export class StudioApp {
       el.style.top = `${node.y}px`;
       el.style.width = `${node.width}px`;
       el.style.height = `${node.height}px`;
-      el.style.zIndex = String(node.zIndex);
+      el.style.zIndex = String(this.nodeZIndex(node));
       this.setExpandButtonMode(el, false);
       this.clearFullscreenTabs(el);
       this.expandPlaceholder.replaceWith(el);
@@ -1977,6 +2282,7 @@ export class StudioApp {
     this.expandPlaceholder = null;
     this.expandOverlay = null;
     this.layoutNodes();
+    if (node?.type === 'patternFrame') this.syncContainer(node);
     this.drawWires();
     requestAnimationFrame(() => this.notifyNodeViewportResize(nodeId));
   }
@@ -2083,6 +2389,8 @@ export class StudioApp {
     this.dockInspectorToFullscreen();
     this.syncFullscreenTabs(nextEl, nextId);
     this.layoutNodes();
+    if (prevNode.type === 'patternFrame') this.syncContainer(prevNode);
+    if (nextNode.type === 'patternFrame') this.syncContainer(nextNode);
     this.renderInspector();
     this.drawWires();
     requestAnimationFrame(() => {
@@ -2614,7 +2922,7 @@ export class StudioApp {
     el.style.top = `${node.y}px`;
     el.style.width = `${node.width}px`;
     el.style.height = `${node.height}px`;
-    el.style.zIndex = String(node.zIndex);
+    el.style.zIndex = String(this.nodeZIndex(node));
     placeholder.replaceWith(el);
   }
 
@@ -2897,6 +3205,80 @@ export class StudioApp {
   }
 
   /**
+   * How a 2D container fronts its pattern. Locked is the frame on the canvas: the
+   * box the node occupies *is* the view, so the work is the canvas's own size and
+   * nothing inside it zooms. Expanded drops the lock and lets the view run past
+   * the frame, which is what makes working beyond the border possible.
+   */
+  private containerModeFor(
+    node: PatternFrameNode,
+    expanded: boolean
+  ): PatternEditorContainer {
+    const view = containerView(node);
+    const zoom = expanded ? 1 : this.project.canvas.zoom;
+    return {
+      cmScale: view.cmScale,
+      viewX: view.viewX,
+      viewY: view.viewY,
+      frameWidthCm: node.width / view.cmScale,
+      frameHeightCm: node.height / view.cmScale,
+      clip: containerClips(node),
+      locked: !expanded,
+      // On the board the page's grid is behind the frame and shows through it, so
+      // the frame must not draw a second one; opened up, it has to draw its own.
+      drawsGrid: expanded,
+      // On the board the whole node is scaled by the board's zoom, so the frame's
+      // strokes, labels and handles have to be told how far — otherwise zooming
+      // the canvas turns them into hairlines. Full screen is drawn 1:1, which is
+      // the look this is matching.
+      chromeScale: zoom,
+      // A frame on the canvas thins out as the board zooms away from it; opened up
+      // it draws the whole pattern, because at that point zooming out is a way of
+      // looking at the work rather than a way of looking at the canvas.
+      detail: expanded ? 'full' : this.detailForScale(view.cmScale * zoom),
+      coarsePointer: expanded ? 'editor' : 'frame',
+    };
+  }
+
+  /** How much of a pattern to draw, from how big a centimetre is on screen. */
+  private detailForScale(screenPxPerCm: number): PatternDetail {
+    if (screenPxPerCm >= CONTAINER_DETAIL_FULL_PX_PER_CM) return 'full';
+    if (screenPxPerCm >= CONTAINER_DETAIL_PREVIEW_PX_PER_CM) return 'preview';
+    return 'frame';
+  }
+
+  /**
+   * A container that does not clip is allowed to draw outside itself, so it
+   * paints above the frames it spills onto — otherwise its work would vanish
+   * under whichever neighbour happened to be stacked next.
+   */
+  private nodeZIndex(node: CanvasNode): number {
+    return node.type === 'patternFrame' && !containerClips(node)
+      ? node.zIndex + 1000
+      : node.zIndex;
+  }
+
+  /** Push a container's frame settings at its editor and the node element. */
+  private syncContainer(node: PatternFrameNode, hostEl?: HTMLElement | null): void {
+    // A node being mounted is not in the board yet, so the caller can hand over
+    // the element it just built rather than have us look for it.
+    const el = hostEl ?? this.findNodeEl(node.id);
+    el?.classList.toggle('is-unclipped', !containerClips(node));
+    const clipBtn = el?.querySelector('.node-clip-btn') as HTMLButtonElement | null;
+    if (clipBtn) {
+      const on = containerClips(node);
+      clipBtn.classList.toggle('is-active', on);
+      clipBtn.setAttribute('aria-pressed', String(on));
+      clipBtn.title = on
+        ? 'Clip contents to the frame (work outside is hidden)'
+        : 'Contents spill past the frame';
+    }
+    this.editors
+      .get(node.id)
+      ?.setContainer(this.containerModeFor(node, this.expandedNodeId === node.id));
+  }
+
+  /**
    * Replace the node selection. `primary` is the node whose inspector is shown —
    * the one just clicked — and defaults to the last of `ids`.
    */
@@ -3074,6 +3456,37 @@ export class StudioApp {
   }
 
   /**
+   * Start a resize off a corner handle or, on a container, a frame edge. The
+   * edges answer to the same letters as the corners, so `w` widens leftwards and
+   * `n` grows upwards by the same code path.
+   */
+  private beginNodeResize(
+    node: CanvasNode,
+    corner: 'nw' | 'ne' | 'sw' | 'se' | 'n' | 'e' | 's' | 'w',
+    e: PointerEvent
+  ): void {
+    if (!this.isNodeSelected(node.id)) this.selectNodes([node.id]);
+    else this.selectNodes(this.selectedNodeIds, node.id);
+    this.pushUndo();
+    this.draggingNodes = null;
+    const zoom = this.project.canvas.zoom;
+    this.resizingNode = {
+      id: node.id,
+      corner,
+      startBoardX: (e.clientX - this.project.canvas.panX) / zoom,
+      startBoardY: (e.clientY - this.project.canvas.panY) / zoom,
+      origX: node.x,
+      origY: node.y,
+      origW: node.width,
+      origH: node.height,
+      origView: node.type === 'patternFrame' ? containerView(node) : undefined,
+    };
+    this.layoutNodes();
+    this.renderInspector();
+    document.getElementById('boardWrap')?.setPointerCapture(e.pointerId);
+  }
+
+  /**
    * The floating action bar at the bottom middle of a viewport. Created on
    * demand and returned as the `.node-actions` element, so the existing button
    * styling and click handlers still apply.
@@ -3116,7 +3529,7 @@ export class StudioApp {
     el.style.top = `${node.y}px`;
     el.style.width = `${node.width}px`;
     el.style.height = `${node.height}px`;
-    el.style.zIndex = String(node.zIndex);
+    el.style.zIndex = String(this.nodeZIndex(node));
 
     const body = document.createElement('div');
     body.className = 'node-body';
@@ -3160,6 +3573,18 @@ export class StudioApp {
       });
     }
 
+    // A pattern frame drags by its body too, which is the whole frame when its
+    // editor has handed the pointer over — at the canvas's coarser detail levels a
+    // press there is meant to move the container. While the editor is drawing it
+    // takes the press first and stops it here, so this costs an active frame
+    // nothing.
+    if (node.type === 'patternFrame') {
+      body.addEventListener('pointerdown', (e) => {
+        if ((e.target as HTMLElement).closest('.resize-handle')) return;
+        this.beginNodeDrag(node, e);
+      });
+    }
+
     el.appendChild(body);
 
     for (const corner of ['nw', 'ne', 'sw', 'se'] as const) {
@@ -3170,32 +3595,56 @@ export class StudioApp {
       handle.addEventListener('pointerdown', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        if (!this.isNodeSelected(node.id)) this.selectNodes([node.id]);
-        else this.selectNodes(this.selectedNodeIds, node.id);
-        this.pushUndo();
-        this.draggingNodes = null;
-        const zoom = this.project.canvas.zoom;
-        this.resizingNode = {
-          id: node.id,
-          corner,
-          startBoardX: (e.clientX - this.project.canvas.panX) / zoom,
-          startBoardY: (e.clientY - this.project.canvas.panY) / zoom,
-          origX: node.x,
-          origY: node.y,
-          origW: node.width,
-          origH: node.height,
-        };
-        this.layoutNodes();
-        this.renderInspector();
-        const wrap = document.getElementById('boardWrap');
-        wrap?.setPointerCapture(e.pointerId);
+        this.beginNodeResize(node, corner, e);
       });
       el.appendChild(handle);
     }
 
+    // A frame can be resized by its edges as well as its corners: hold ⌘/Ctrl and
+    // drag any border. Plain drags along the border stay the editor's — the band
+    // only takes the pointer while the modifier is down.
+    if (node.type === 'patternFrame') {
+      const edges = document.createElement('div');
+      edges.className = 'node-frame-edges';
+      for (const edge of ['n', 'e', 's', 'w'] as const) {
+        const band = document.createElement('div');
+        band.className = `node-frame-edge node-frame-edge-${edge}`;
+        band.dataset.corner = edge;
+        band.title = '⌘/Ctrl-drag to resize the frame';
+        band.addEventListener('pointerdown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.beginNodeResize(node, edge, e);
+        });
+        edges.appendChild(band);
+      }
+      el.appendChild(edges);
+    }
+
     if (node.type === 'patternFrame') {
       const pattern = this.project.patterns.find((p) => p.id === node.patternId)!;
-      chrome!.querySelector('.node-title')!.textContent = `Pattern · ${pattern.name}`;
+      chrome!.querySelector('.node-title')!.textContent = `Container · ${pattern.name}`;
+      // The frame is the container's own chrome, so the clip toggle lives on it.
+      const clipBtn = document.createElement('button');
+      clipBtn.type = 'button';
+      clipBtn.className = 'node-clip-btn';
+      clipBtn.setAttribute('aria-label', 'Clip contents to frame');
+      clipBtn.innerHTML = `<svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M5.5 2.5h-3v3"/><path d="M10.5 13.5h3v-3"/><rect x="2.5" y="2.5" width="11" height="11" rx="1.5" stroke-dasharray="3 2.5"/></svg>`;
+      clipBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.pushUndo();
+        node.clip = !containerClips(node);
+        this.syncContainer(node);
+        this.layoutNodes();
+        this.markDirty();
+        this.setStatus(
+          node.clip
+            ? 'Clipping contents to the frame — nothing outside it is drawn'
+            : 'Contents spill past the frame — the frame is unchanged'
+        );
+      });
+      chrome!.querySelector('.node-chrome-right')?.prepend(clipBtn);
       const editorHost = document.createElement('div');
       editorHost.className = 'pattern-host';
       body.appendChild(editorHost);
@@ -3216,6 +3665,7 @@ export class StudioApp {
         onSelectionChange: (pieceIds) => this.syncSplitSelectionFrom2d(pieceIds),
       });
       this.editors.set(node.id, editor);
+      this.syncContainer(node, el);
     } else if (node.type === 'meshFrame') {
       const mesh = this.project.meshes.find((m) => m.id === node.meshId)!;
       chrome!.querySelector('.node-title')!.textContent = `Mesh · ${mesh.name}`;
@@ -3324,6 +3774,22 @@ export class StudioApp {
         node.text = ta.value;
       });
       body.appendChild(ta);
+      // A note is dragged by the border around its text rather than by a bar: the
+      // band is invisible and only 12px thick, so the middle of the note stays a
+      // place to type. Four strips rather than one ring, so each carries the move
+      // cursor and the caret's own cursor survives inside.
+      const grab = document.createElement('div');
+      grab.className = 'node-text-grab';
+      for (const edge of ['n', 'e', 's', 'w'] as const) {
+        const band = document.createElement('div');
+        band.className = `node-text-grab-band node-text-grab-band-${edge}`;
+        band.addEventListener('pointerdown', (e) => {
+          e.preventDefault();
+          this.beginNodeDrag(node, e);
+        });
+        grab.appendChild(band);
+      }
+      body.appendChild(grab);
     }
 
     this.mountNodePorts(el, node);
@@ -4301,6 +4767,27 @@ export class StudioApp {
     this.drawWires();
   }
 
+  /**
+   * Bring every frame's chrome up to date once the board stops moving. Restating
+   * a frame is also what a *finished* gesture wants, so anything that ends a zoom
+   * — the wheel, a project load — lands here.
+   */
+  private scheduleChromeSettle(): void {
+    if (this.chromeSettleTimer !== null) clearTimeout(this.chromeSettleTimer);
+    this.chromeSettleTimer = setTimeout(() => {
+      this.chromeSettleTimer = null;
+      this.settleContainerChrome();
+    }, CONTAINER_CHROME_SETTLE_MS);
+  }
+
+  private settleContainerChrome(): void {
+    if (this.chromeSettleTimer !== null) {
+      clearTimeout(this.chromeSettleTimer);
+      this.chromeSettleTimer = null;
+    }
+    for (const editor of this.editors.values()) editor.settleContainer();
+  }
+
   private drawWires(): void {
     const wrap = document.getElementById('boardWrap')!;
     const rect = wrap.getBoundingClientRect();
@@ -5167,6 +5654,16 @@ export class StudioApp {
     node.y = y;
     node.width = w;
     node.height = h;
+    if (node.type === 'patternFrame') {
+      // A frame is a window onto its pattern: resizing it by the top or left edge
+      // moves the frame over the work rather than dragging the work along.
+      if (r.origView && (x !== r.origX || y !== r.origY)) {
+        const view = containerViewShifted(r.origView, x - r.origX, y - r.origY);
+        node.viewX = view.viewX;
+        node.viewY = view.viewY;
+      }
+      this.syncContainer(node);
+    }
     this.layoutNodes();
     this.drawWires();
   }
@@ -5566,24 +6063,37 @@ export class StudioApp {
   /** Drop a 2D pattern on the board, centred on the point it was asked for. */
   private addPatternFrame(at?: { clientX: number; clientY: number }): void {
     const patternId = uid('pattern');
-    this.project.patterns.push({
+    const piece = rectPiece('Panel', 40, 50, { x: 5, y: 5 });
+    const pattern: PatternDocument = {
       id: patternId,
       name: `Pattern ${this.project.patterns.length + 1}`,
-      pieces: [rectPiece('Panel', 40, 50, { x: 5, y: 5 })],
+      pieces: [piece],
       seams: [],
-    });
-    const width = 400;
-    const height = 440;
+    };
+    this.project.patterns.push(pattern);
+
+    // A new frame sits at the canvas's drafting scale and is fitted around the
+    // panel it was made with, so the panel is the size it would be on the page.
+    const scale = canvasCmScale(this.project);
+    const bounds = piecesBoundsCm([piece])!;
+    const width = (bounds.max.x - bounds.min.x + CONTAINER_PADDING_CM * 2) * scale;
+    const height = (bounds.max.y - bounds.min.y + CONTAINER_PADDING_CM * 2) * scale;
     const anchor = this.boardPointFromClient(at?.clientX, at?.clientY);
-    const node = {
-      type: 'patternFrame' as const,
+    const node: PatternFrameNode = {
+      type: 'patternFrame',
       id: uid('node'),
       patternId,
       x: Math.round(anchor.x - width / 2),
       y: Math.round(anchor.y - height / 2),
       width,
       height,
-      zIndex: this.project.canvas.nodes.length + 1,
+      zIndex: topNodeZ(this.project.canvas.nodes) + 1,
+      cmScale: scale,
+      // The frame's corner sits one padding outside the panel, so the panel opens
+      // with the same breathing room on every side.
+      viewX: bounds.min.x - CONTAINER_PADDING_CM,
+      viewY: bounds.min.y - CONTAINER_PADDING_CM,
+      clip: true,
     };
     this.project.canvas.nodes.push(node);
     this.mountNode(node);

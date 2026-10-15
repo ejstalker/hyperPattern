@@ -100,6 +100,9 @@ export type ProjectManifestV3 = {
     panY: number;
     zoom: number;
     nodes: CanvasNodeManifest[];
+    /** Canvas pattern (v3 documents) — absent in older manifests. */
+    rootPatternId?: string;
+    draftScale?: number;
   };
   patterns: PatternDocument[];
   meshes: MeshDocumentManifest[];
