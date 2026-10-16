@@ -763,7 +763,7 @@ function indexToWorld(grid: FloatLevelSetGrid, p: Vec3): Vec3 {
 
 /**
  * Parse an OpenVDB (.vdb) ArrayBuffer and densify the best level-set grid
- * into patternCanvas's dense SdfVolumeData layout.
+ * into hyperPattern's dense SdfVolumeData layout.
  *
  * Supports sequential (hasGridOffsets=0) files and blosc-compressed float leaves.
  * The npm `openvdb` package cannot load these — it skips no-offset grids and

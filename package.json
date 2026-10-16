@@ -1,5 +1,5 @@
 {
-  "name": "patterncanvas",
+  "name": "hyperpattern",
   "version": "0.1.0",
   "description": "Open-canvas pattern drafting and cloth draping studio (WebGPU)",
   "type": "module",

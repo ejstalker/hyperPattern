@@ -1549,10 +1549,16 @@ optgroup {
   min-height: 8px;
 }
 
+/*
+ * Wide enough for a tool's shortcut to sit beside its icon, and one width for
+ * the whole rail: the utility buttons below the tools stay in the same column,
+ * the icons line up straight down it, and every flyout opens at the same
+ * distance from the edge.
+ */
 .pattern-toolbar button {
-  width: 28px;
+  width: 44px;
   height: 28px;
-  padding: 0;
+  padding: 0 6px 0 7px;
   border-radius: 4px;
   border: 1px solid var(--border);
   background: var(--panel);
@@ -1562,7 +1568,26 @@ optgroup {
   line-height: 1;
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
+}
+
+/* A tool button: icon on the left, its key on the right. */
+.pattern-toolbar-tools > button,
+.pattern-toolbar-tools > .pattern-tool-flyout > button {
+  justify-content: space-between;
+}
+
+/* The shortcut, small and quiet — the icon is what the eye goes to. */
+.pattern-tool-key {
+  font: 700 10px/1 var(--font);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.pattern-toolbar button.active .pattern-tool-key {
+  color: inherit;
+  opacity: 0.85;
 }
 
 .pattern-toolbar button:hover {
@@ -1944,14 +1969,14 @@ optgroup {
   text-overflow: ellipsis;
 }
 
-.pattern-knife-preview {
+.pattern-cut-preview {
   stroke: var(--accent);
   stroke-dasharray: 4 3;
   fill: none;
   pointer-events: none;
 }
 
-.pattern-knife-point {
+.pattern-cut-point {
   fill: var(--accent);
   stroke: var(--bg);
   pointer-events: none;
@@ -1959,7 +1984,7 @@ optgroup {
 
 /* The cut carried on to the outline beyond the clicks: faint, because it is
    machinery, not what the draughtsperson drew. */
-.pattern-knife-extension {
+.pattern-cut-extension {
   stroke: var(--accent);
   stroke-dasharray: 2 4;
   fill: none;
@@ -1969,7 +1994,7 @@ optgroup {
 
 /* Where the next click would carry the chain — not part of the cut yet, so it
    is dashed back to the last point that is. */
-.pattern-knife-rubber {
+.pattern-cut-rubber {
   stroke: var(--accent);
   stroke-dasharray: 2 3;
   opacity: 0.55;
@@ -1979,13 +2004,13 @@ optgroup {
 
 /* The loop cut: solid, because it is a cut that will be made, and the two
    contours it is blended from behind it, faint so they read as context. */
-.pattern-knife-loop {
+.pattern-cut-loop {
   stroke: var(--accent);
   fill: none;
   pointer-events: none;
 }
 
-.pattern-knife-rail {
+.pattern-cut-rail {
   stroke: #8ec8e8;
   stroke-dasharray: 2 4;
   fill: none;
@@ -1993,14 +2018,14 @@ optgroup {
   pointer-events: none;
 }
 
-.pattern-knife-hit {
+.pattern-cut-hit {
   fill: #c45c26;
   stroke: var(--bg);
   opacity: 0.7;
   pointer-events: none;
 }
 
-.pattern-knife-hit-ok {
+.pattern-cut-hit-ok {
   fill: #3f9e70;
   stroke: var(--bg);
   pointer-events: none;
@@ -3288,10 +3313,10 @@ optgroup {
 }
 
 /* The cut bar: same slot as the simplify bar — bottom middle, where the piece
-   being cut is — for every knife that cuts with a drag or a click. The chain's
+   being cut is — for every cut that cuts with a drag or a click. The chain's
    own controls come and go with the mode; the two toggles that say what becomes
    of the piece a cut separates stay put. */
-.pattern-knife-bar {
+.pattern-cut-bar {
   position: absolute;
   bottom: 12px;
   left: 50%;
@@ -3310,72 +3335,72 @@ optgroup {
   white-space: nowrap;
 }
 
-.pattern-knife-bar[hidden] {
+.pattern-cut-bar[hidden] {
   display: none !important;
 }
 
-.pattern-knife-title {
+.pattern-cut-title {
   color: var(--muted);
 }
 
-.pattern-knife-count {
+.pattern-cut-count {
   padding: 2px 6px;
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.07);
 }
 
-.pattern-knife-status {
+.pattern-cut-status {
   max-width: 32ch;
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--muted);
 }
 
-.pattern-knife-field,
-.pattern-knife-toggle {
+.pattern-cut-field,
+.pattern-cut-toggle {
   display: flex;
   align-items: center;
   gap: 5px;
 }
 
-.pattern-knife-toggle {
+.pattern-cut-toggle {
   cursor: pointer;
   user-select: none;
 }
 
-.pattern-knife-toggle input[type='checkbox'] {
+.pattern-cut-toggle input[type='checkbox'] {
   margin: 0;
   accent-color: var(--accent);
   cursor: pointer;
 }
 
-.pattern-knife-bar button {
+.pattern-cut-bar button {
   min-height: 24px;
   padding: 3px 7px;
   font-size: 11px;
 }
 
-.pattern-knife-bar [data-knife-done]:disabled {
+.pattern-cut-bar [data-cut-done]:disabled {
   opacity: 0.45;
   cursor: default;
 }
 
 /* The inset's distance, and any field that belongs to one mode only. */
-.pattern-knife-bar [hidden] {
+.pattern-cut-bar [hidden] {
   display: none !important;
 }
 
-.pattern-knife-readout {
+.pattern-cut-readout {
   color: var(--ink);
   font-variant-numeric: tabular-nums;
 }
 
-.pattern-knife-inset {
+.pattern-cut-inset {
   fill-rule: evenodd;
 }
 
-.pattern-knife-inset + circle,
-.pattern-knife-inset {
+.pattern-cut-inset + circle,
+.pattern-cut-inset {
   pointer-events: none;
 }
 
@@ -5705,7 +5730,7 @@ optgroup {
  * sitting inside this one.
  */
 .pattern-simplify-bar button,
-.pattern-knife-bar button,
+.pattern-cut-bar button,
 .pattern-join-bar button,
 .pattern-bridge-bar button,
 .pattern-measure-bar button {
@@ -5720,7 +5745,7 @@ optgroup {
 }
 
 .pattern-simplify-bar button:hover:not(:disabled),
-.pattern-knife-bar button:hover:not(:disabled),
+.pattern-cut-bar button:hover:not(:disabled),
 .pattern-join-bar button:hover:not(:disabled),
 .pattern-bridge-bar button:hover:not(:disabled),
 .pattern-measure-bar button:hover:not(:disabled) {
@@ -5729,7 +5754,7 @@ optgroup {
 }
 
 .pattern-simplify-bar button:disabled,
-.pattern-knife-bar button:disabled,
+.pattern-cut-bar button:disabled,
 .pattern-join-bar button:disabled,
 .pattern-bridge-bar button:disabled,
 .pattern-measure-bar button:disabled {
@@ -5739,7 +5764,7 @@ optgroup {
 
 /* The action each ribbon is really for carries an accent border. */
 .pattern-simplify-bar [data-simplify-done],
-.pattern-knife-bar [data-knife-done] {
+.pattern-cut-bar [data-cut-done] {
   border-color: var(--accent);
 }
 

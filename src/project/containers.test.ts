@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { PatternDocument, PatternFrameNode, ProjectDocument } from './types';
+import type { PatternDocument, PatternFrameNode, ProjectDocument, Vec2 } from './types';
 import { rectPiece } from './createDefault';
 import {
   CONTAINER_PADDING_CM,
@@ -13,6 +13,7 @@ import {
   fitContainerView,
   groupIntoContainer,
   movePiecesBetweenPatterns,
+  movePiecesBetweenSpaces,
   piecesBoundsCm,
   containerViewShifted,
   rootPattern,
@@ -336,5 +337,137 @@ describe('moving pieces between patterns', () => {
     expect(source.seams).toHaveLength(0);
     // The piece that stayed behind is untouched.
     expect(source.pieces[0]!.points[0]!.anchor).toEqual(stays.points[0]!.anchor);
+  });
+});
+
+describe('dragging work between the page and a container', () => {
+  function projectWithFrame(cmScale = DEFAULT_CANVAS_CM_SCALE) {
+    const project = projectWithCanvas();
+    const node: PatternFrameNode = {
+      type: 'patternFrame',
+      id: 'node_frame',
+      patternId: 'pattern_frame',
+      x: 0,
+      y: 0,
+      width: 130,
+      height: 130,
+      zIndex: 1,
+      cmScale,
+      viewX: 4,
+      viewY: 6,
+      clip: true,
+    };
+    project.canvas.nodes.push(node);
+    project.patterns.push(emptyPattern('pattern_frame', 'Frame'));
+    return { project, node };
+  }
+
+  /** Where a piece's outline sits on the canvas, as the canvas would draw it. */
+  function outlineOnCanvas(
+    project: ProjectDocument,
+    frame: PatternFrameNode | null,
+    piece: { points: readonly { anchor: Vec2 }[] }
+  ): Vec2[] {
+    return piece.points.map((pt) => {
+      const cm = pt.anchor;
+      return frame
+        ? containerCanvasAt(frame, cm.x, cm.y)
+        : canvasAtCm(project, cm.x, cm.y);
+    });
+  }
+
+  it('drops a panel into the frame without it moving, at one scale', () => {
+    const { project, node } = projectWithFrame();
+    const canvas = rootPattern(project);
+    const piece = rectPiece('Panel', 20, 30, { x: 0, y: 0 });
+    canvas.pieces.push(piece);
+    const before = outlineOnCanvas(project, null, piece);
+
+    // Let go at a point inside the panel, ten by twelve centimetres in.
+    const hand = canvasAtCm(project, 10, 12);
+    const outcome = movePiecesBetweenSpaces(project, null, node, [piece.id], hand);
+
+    expect(outcome.ok).toBe(true);
+    expect(canvas.pieces).toHaveLength(0);
+    expect(project.patterns.find((p) => p.id === 'pattern_frame')!.pieces).toEqual([piece]);
+    expect(outlineOnCanvas(project, node, piece)).toEqual(before);
+  });
+
+  it('drags a panel back out of the frame without it moving', () => {
+    const { project, node } = projectWithFrame();
+    const frame = project.patterns.find((p) => p.id === 'pattern_frame')!;
+    const piece = rectPiece('Panel', 20, 30, { x: 3, y: 2 });
+    frame.pieces.push(piece);
+    const before = outlineOnCanvas(project, node, piece);
+
+    const hand = containerCanvasAt(node, 12, 9);
+    const outcome = movePiecesBetweenSpaces(project, node, null, [piece.id], hand);
+
+    expect(outcome.ok).toBe(true);
+    expect(frame.pieces).toHaveLength(0);
+    expect(rootPattern(project).pieces).toEqual([piece]);
+    expect(outlineOnCanvas(project, null, piece)).toEqual(before);
+  });
+
+  it('keeps the work its own size in centimetres where the scales differ', () => {
+    // A frame migrated from the old pattern node: fitted, so it draws its
+    // centimetres at a scale of its own rather than the page's.
+    const { project, node } = projectWithFrame(4);
+    const canvas = rootPattern(project);
+    const piece = rectPiece('Panel', 20, 30, { x: 0, y: 0 });
+    canvas.pieces.push(piece);
+    const widthBefore = piecesBoundsCm([piece])!;
+
+    const hand = canvasAtCm(project, 10, 12);
+    const outcome = movePiecesBetweenSpaces(project, null, node, [piece.id], hand);
+
+    expect(outcome.ok).toBe(true);
+    const bounds = piecesBoundsCm([piece])!;
+    expect(bounds.max.x - bounds.min.x).toBeCloseTo(widthBefore.max.x - widthBefore.min.x, 10);
+    expect(bounds.max.y - bounds.min.y).toBeCloseTo(widthBefore.max.y - widthBefore.min.y, 10);
+    // The point the drag was holding is still under the hand: a rigid move, so
+    // the panel is where it was let go of rather than where it was picked up.
+    const handCmHere = canvasCmAt(project, hand.x, hand.y);
+    const handCmThere = containerCmAt(node, hand.x, hand.y);
+    expect(piece.points[0]!.anchor.x).toBeCloseTo(handCmThere.x - handCmHere.x, 10);
+    expect(piece.points[0]!.anchor.y).toBeCloseTo(handCmThere.y - handCmHere.y, 10);
+  });
+
+  it('says so rather than splitting a block', () => {
+    const { project, node } = projectWithFrame();
+    const canvas = rootPattern(project);
+    const piece = rectPiece('Block panel', 20, 20, { x: 0, y: 0 });
+    canvas.pieces.push(piece);
+    canvas.blocks = [
+      {
+        id: 'block_1',
+        definitionId: 'def',
+        personId: null,
+        personName: 'Test',
+        origin: { x: 0, y: 0 },
+        bindings: {},
+        pieces: [{ role: 'front', pieceId: piece.id }],
+      },
+    ];
+
+    const outcome = movePiecesBetweenSpaces(project, null, node, [piece.id], { x: 0, y: 0 });
+
+    expect(outcome.ok).toBe(false);
+    expect(canvas.pieces).toHaveLength(1);
+    expect(project.patterns.find((p) => p.id === 'pattern_frame')!.pieces).toHaveLength(0);
+  });
+
+  it('refuses a drop in the space the work is already in', () => {
+    const { project, node } = projectWithFrame();
+    const canvas = rootPattern(project);
+    const piece = rectPiece('Panel', 20, 20, { x: 0, y: 0 });
+    canvas.pieces.push(piece);
+
+    expect(movePiecesBetweenSpaces(project, null, null, [piece.id], { x: 0, y: 0 }).ok).toBe(false);
+    expect(movePiecesBetweenSpaces(project, node, node, [piece.id], { x: 0, y: 0 }).ok).toBe(false);
+    // Two frames on one pattern are still one space.
+    const twin = { ...node, id: 'node_twin' };
+    expect(movePiecesBetweenSpaces(project, node, twin, [piece.id], { x: 0, y: 0 }).ok).toBe(false);
+    expect(canvas.pieces).toHaveLength(1);
   });
 });

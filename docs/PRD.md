@@ -1,7 +1,7 @@
-# patternCanvas — Product Requirements Document
+# hyperPattern — Product Requirements Document
 
 **Status:** Draft v0.1  
-**Product:** patternCanvas  
+**Product:** hyperPattern  
 **Audience:** Indie makers, students, hobbyists, researchers  
 **Platform:** Browser-first (WebGPU)
 
@@ -9,7 +9,7 @@
 
 ## 1. Vision & problem
 
-patternCanvas is a browser studio for drafting garment patterns in real units, draping them with interactive cloth simulation, and arranging those studies on an open canvas—alongside images, notes, and snapshots—the way a designer’s table holds small experiments next to a larger piece.
+hyperPattern is a browser studio for drafting garment patterns in real units, draping them with interactive cloth simulation, and arranging those studies on an open canvas—alongside images, notes, and snapshots—the way a designer’s table holds small experiments next to a larger piece.
 
 It is **not** a Marvelous Designer or CLO competitor. Controls may feel familiar where that helps learning and experimentation, but the product optimizes for inspectable physics, remixable studies, and historical / experimental exploration rather than production fashion pipelines.
 

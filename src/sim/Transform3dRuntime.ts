@@ -683,7 +683,8 @@ export class Transform3dRuntime {
     this.canvas.tabIndex = 0;
     this.canvas.style.outline = 'none';
     this.canvas.addEventListener('keydown', (e) => {
-      if (e.key !== 'r' && e.key !== 'R') return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const key = e.key.toLowerCase();
       const t = e.target as HTMLElement | null;
       if (
         t &&
@@ -692,6 +693,15 @@ export class Transform3dRuntime {
       ) {
         return;
       }
+      // The gizmo's own two modes are one key each, the way every 3D package
+      // spells them: W to move, E to turn.
+      if (key === 'w' || key === 'e') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.setTransformMode(key === 'w' ? 'translate' : 'rotate');
+        return;
+      }
+      if (key !== 'r') return;
       if (!this.cloth || this.selectedPieceIds.size === 0) return;
       e.preventDefault();
       e.stopPropagation();
@@ -723,8 +733,8 @@ export class Transform3dRuntime {
       this.transformToggle.classList.toggle('is-rotate', rotating);
       this.transformToggle.textContent = rotating ? 'Rotate' : 'Move';
       this.transformToggle.title = rotating
-        ? 'Rotation mode — drag a gizmo axis to rotate the selection around the group pivot · R = 90° on local X'
-        : 'Move mode — drag the selection or a gizmo axis to translate · Shift-click to multi-select · R = 90° on local X';
+        ? 'Rotation mode (E) — drag a gizmo axis to rotate the selection around the group pivot · R = 90° on local X'
+        : 'Move mode (W) — drag the selection or a gizmo axis to translate · Shift-click to multi-select · R = 90° on local X';
       this.transformToggle.setAttribute('aria-pressed', String(rotating));
     }
     this.syncMoveGizmo();

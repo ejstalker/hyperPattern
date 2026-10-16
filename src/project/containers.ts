@@ -277,6 +277,86 @@ export function movePiecesBetweenPatterns(
   return moved;
 }
 
+/** The pattern a space draws: the page's own, or the frame's. */
+export function patternForSpace(
+  project: ProjectDocument,
+  frame: PatternFrameNode | null
+): PatternDocument | undefined {
+  if (!frame) return rootPattern(project);
+  return project.patterns.find((pattern) => pattern.id === frame.patternId);
+}
+
+/**
+ * The centimetre point a canvas point means in a space: the page's own
+ * centimetres for the page, the frame's for a container. Both are affine, so
+ * this also answers where a drag's own hand is in the space it is leaving.
+ */
+export function spaceCmAt(
+  project: ProjectDocument,
+  frame: PatternFrameNode | null,
+  x: number,
+  y: number
+): Vec2 {
+  return frame ? containerCmAt(frame, x, y) : canvasCmAt(project, x, y);
+}
+
+export type MovePiecesOutcome =
+  | { ok: true; pieces: PatternPiece[]; pieceCount: number }
+  | { ok: false; reason: string };
+
+/**
+ * Move work between the page and a container, or between two containers.
+ *
+ * The two spaces are named by their frame node, with `null` for the page itself.
+ * The run is translated so that the canvas point the drag let go of (`hand`)
+ * means the same place in the space it lands in. When the two draw centimetres
+ * at the same scale — the page and every frame made on it — that offset is the
+ * same for every point, so the work does not move at all: it simply changes
+ * hands. Where the scales differ the work keeps its centimetres and lands at
+ * the hand, which changes its size on screen and nothing else.
+ */
+export function movePiecesBetweenSpaces(
+  project: ProjectDocument,
+  from: PatternFrameNode | null,
+  to: PatternFrameNode | null,
+  pieceIds: readonly string[],
+  hand: Vec2
+): MovePiecesOutcome {
+  if ((from?.id ?? null) === (to?.id ?? null)) {
+    return { ok: false, reason: 'Those pieces are already there.' };
+  }
+  const source = patternForSpace(project, from);
+  const target = patternForSpace(project, to);
+  if (!source || !target) {
+    return { ok: false, reason: 'That container has no pattern to move work into.' };
+  }
+  // Two frames can name the same pattern; that is still one space.
+  if (source === target) return { ok: false, reason: 'Those pieces are already there.' };
+  const wanted = new Set(pieceIds);
+  const chosen = source.pieces.filter((piece) => wanted.has(piece.id));
+  if (chosen.length === 0) return { ok: false, reason: 'Those pieces are not here.' };
+
+  // Blocks are regenerated as a set, so a block can never be half in a
+  // container: a drag that would split one is refused, as grouping refuses it.
+  const blockOwned = (source.blocks ?? []).some((block) =>
+    block.pieces.some((entry) => wanted.has(entry.pieceId))
+  );
+  if (blockOwned) {
+    return { ok: false, reason: 'A block has to stay together — move it as a whole.' };
+  }
+
+  const here = spaceCmAt(project, from, hand.x, hand.y);
+  const there = spaceCmAt(project, to, hand.x, hand.y);
+  const pieces = movePiecesBetweenPatterns(
+    source,
+    target,
+    chosen.map((piece) => piece.id),
+    { x: there.x - here.x, y: there.y - here.y }
+  );
+  if (pieces.length === 0) return { ok: false, reason: 'Nothing to move.' };
+  return { ok: true, pieces, pieceCount: pieces.length };
+}
+
 export type GroupIntoContainerOutcome =
   | { ok: true; node: PatternFrameNode; pattern: PatternDocument; pieceCount: number }
   | { ok: false; reason: string };

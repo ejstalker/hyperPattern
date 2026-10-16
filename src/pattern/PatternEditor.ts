@@ -196,6 +196,18 @@ export type PatternEditorCallbacks = {
    * picks up whole panels and whole containers together.
    */
   onPanelMarquee?: (box: { x: number; y: number; w: number; h: number }) => void;
+  /**
+   * A drag of whole pieces finished, at the screen point it let go of.
+   *
+   * Whether that point means "inside a container" or "outside the frame this
+   * editor is showing" is the host's to answer — it is the one holding the
+   * frames — and a piece handed over belongs to another pattern from here on.
+   */
+  onPiecesDropped?: (drop: {
+    clientX: number;
+    clientY: number;
+    pieceIds: string[];
+  }) => void;
 };
 
 /**
@@ -304,14 +316,18 @@ function sameContainerShape(
   return CONTAINER_SHAPE_FIELDS.every((field) => a[field] === b[field]);
 }
 
-/** Figma-aligned vector tools inside a pattern frame. */
+/**
+ * Figma-aligned vector tools inside a pattern frame.
+ *
+ * A tool is one thing to pick up, and what it does is its *mode*: Add draws a
+ * pen stroke, a rectangle or a circle, Cut cuts along a line, a circle, a chain
+ * of clicks, an inset loop, a loop cut, or a dart. The modes live in the ribbon
+ * beside the canvas, where the work they change is.
+ */
 export type PatternTool =
   | 'move'
-  | 'pen'
-  | 'rect'
-  | 'circle'
-  | 'knife'
-  | 'dart'
+  | 'add'
+  | 'cut'
   | 'extrude'
   | 'sew'
   | 'join'
@@ -319,8 +335,11 @@ export type PatternTool =
   | 'ruler'
   | 'measure';
 
+/** What the Add tool is drawing: a pen stroke, a rectangle, or a circle. */
+export type AddMode = 'pen' | 'rect' | 'circle';
+
 /** The rail's menus: what each one offers, and what its rows stand for. */
-export type AddKind = 'pen' | 'rect' | 'circle' | 'block' | 'import';
+export type AddKind = AddMode | 'block' | 'import';
 
 /** A row in a rail menu: a tool, a mode, or a way into a sub-view. */
 type RailMenuEntry = {
@@ -343,7 +362,7 @@ type RailMenuView = {
   choose?: (id: string) => void;
 };
 
-type RailMenuKey = 'add' | 'modify' | 'remove' | 'sew';
+type RailMenuKey = 'add' | 'modify' | 'sew';
 
 type RailMenuSpec = {
   key: RailMenuKey;
@@ -357,6 +376,19 @@ type RailMenuSpec = {
   views: () => Record<string, RailMenuView>;
 };
 
+/**
+ * The rail's single-key shortcuts. `m` is the measure line rather than the
+ * ruler: the ruler's menu holds both, and the measuring tool is the one you
+ * reach for without looking.
+ */
+const TOOL_KEYS: Record<string, PatternTool> = {
+  v: 'move',
+  a: 'add',
+  c: 'cut',
+  s: 'sew',
+  m: 'measure',
+};
+
 /** Inline icons, in the rail's own 16px line-art style. */
 const ICONS = {
   add: `<path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M8 2.8 V13.2 M2.8 8 H13.2"/>`,
@@ -366,9 +398,6 @@ const ICONS = {
            <circle cx="13" cy="2.1" r="1.15" fill="currentColor"/>
            <rect x="1.8" y="3.3" width="2.4" height="2.4" fill="currentColor"/>`,
   // Scissors: material is cut away.
-  remove: `<path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M4.9 11.2 L13.4 3.5 M4.9 4.8 L13.4 12.5"/>
-           <circle cx="3.9" cy="12.1" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/>
-           <circle cx="3.9" cy="3.9" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/>`,
   sew: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 12.5 L12.5 3"/>
         <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="1.6 1.3" d="M2.8 8.2 L7.8 8.2"/>
         <circle cx="2.6" cy="8.2" r="1" fill="currentColor"/>
@@ -388,35 +417,40 @@ const ICONS = {
          <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M5.2 5.6 L7.4 8 L5.2 10.4 M10.8 5.6 L8.6 8 L10.8 10.4"/>`,
   bridge: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3.2 4 L3.2 12 M12.8 4 L12.8 12"/>
            <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M3.2 4 L12.8 4 M3.2 12 L12.8 12"/>`,
-  dart: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" d="M2.5 3.5 L8 13.5 L13.5 3.5"/>
-         <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M8 13.5 L8 5"/>`,
-  knife: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 13 L13 3"/>
+  cut: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 13 L13 3"/>
           <path fill="none" stroke="currentColor" stroke-width="1.2" d="M11.2 3.2 L13 3 L12.8 4.8"/>
           <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M4 8.5 L8.5 4"/>`,
 } as const;
 
 /** The tip the knives carry, per mode — the menu button borrows it. */
-const KNIFE_TIPS: Record<KnifeMode, string> = {
-  linear: 'Knife · Linear',
-  circle: 'Knife · Circle',
-  inset: 'Knife · Inset loop (hover inside a panel)',
-  curve: 'Knife · Curve — click points, then Done (or Enter) to cut',
-  loop: 'Knife · Loop cut, following the contours (hover an edge)',
-  'loop-straight': 'Knife · Loop cut, straight across (hover an edge)',
+const CUT_TIPS: Record<CutMode, string> = {
+  linear: 'Cut · Line — drag across a panel',
+  circle: 'Cut · Circle — drag out the radius',
+  inset: 'Cut · Inset — hover inside a panel to score a parallel loop',
+  curve: 'Cut · Curve — click points, then Done (or Enter) to cut',
+  loop: 'Cut · Loop — hover an edge to follow the contours',
+  'loop-straight': 'Cut · Loop straight — hover an edge to run straight across',
+  dart: 'Cut · Dart — click the outline to cut a dart into it',
 };
 
 /**
- * The knife's modes, in the order the settings ribbon shows them as toggles. The
- * labels are the rail menu's names, shortened only where the group heading
- * already says what they belong to.
+ * The cut's modes, in the order the settings ribbon shows them.
  */
-const KNIFE_MODES: ReadonlyArray<{ mode: KnifeMode; label: string }> = [
+const CUT_MODES: ReadonlyArray<{ mode: CutMode; label: string }> = [
   { mode: 'linear', label: 'Line' },
   { mode: 'circle', label: 'Circle' },
   { mode: 'inset', label: 'Inset' },
   { mode: 'curve', label: 'Curve' },
   { mode: 'loop', label: 'Loop' },
   { mode: 'loop-straight', label: 'Loop straight' },
+  { mode: 'dart', label: 'Dart' },
+];
+
+/** What the Add tool is drawing, in the order the ribbon shows the modes. */
+const ADD_MODES: ReadonlyArray<{ mode: AddMode; label: string; tip: string }> = [
+  { mode: 'pen', label: 'Pen', tip: 'Add · Pen — click points down, close on the first' },
+  { mode: 'rect', label: 'Rectangle', tip: 'Add · Rectangle — drag out a rectangular panel' },
+  { mode: 'circle', label: 'Circle', tip: 'Add · Circle — drag out a round piece' },
 ];
 
 /**
@@ -442,16 +476,24 @@ const MIN_ZOOM_PERCENT = Math.round((ZOOM_BASE_WIDTH / MAX_VIEW_WIDTH) * 100);
 const MAX_ZOOM_PERCENT = Math.round((ZOOM_BASE_WIDTH / MIN_VIEW_WIDTH) * 100);
 
 
-export type KnifeMode = 'linear' | 'circle' | 'curve' | 'inset' | 'loop' | 'loop-straight';
+export type CutMode =
+  | 'linear'
+  | 'circle'
+  | 'curve'
+  | 'inset'
+  | 'loop'
+  | 'loop-straight'
+  | 'dart';
 
-/** What the cut bar calls the knife in hand. */
-const KNIFE_BAR_TITLES: Record<KnifeMode, string> = {
+/** What the cut bar calls the cut in hand. */
+const CUT_BAR_TITLES: Record<CutMode, string> = {
   linear: 'Line cut',
   circle: 'Circle cut',
-  curve: 'Curve knife',
+  curve: 'Curve cut',
   inset: 'Inset cut',
   loop: 'Loop cut',
   'loop-straight': 'Loop cut',
+  dart: 'Dart',
 };
 export type SewMode = 'segment' | 'many';
 /** Join picks edge by edge, or a whole run across the outline. */
@@ -539,9 +581,15 @@ type DragKind =
   /** A measurement's readout being carried somewhere else. */
   | { type: 'measureMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'blockMove'; id: string; start: Vec2; origin: Vec2 }
-  | { type: 'knifeLine'; start: Vec2; current: Vec2; shift: boolean }
-  | { type: 'knifeCircle'; center: Vec2; radius: number; shift: boolean }
-  | { type: 'moveSelection'; start: Vec2; snapshots: PointSnapshot[] }
+  | { type: 'cutLine'; start: Vec2; current: Vec2; shift: boolean }
+  | { type: 'cutCircle'; center: Vec2; radius: number; shift: boolean }
+  | {
+      type: 'moveSelection';
+      start: Vec2;
+      snapshots: PointSnapshot[];
+      /** The pointer has actually moved: a press and release is a pick, not a drag. */
+      moved: boolean;
+    }
   | {
       type: 'rotateSelection';
       /** Pivot: the centre of the selection box. */
@@ -709,25 +757,30 @@ export class PatternEditor {
   private pattern: PatternDocument;
   private unit: UnitDisplay;
   private tool: PatternTool = 'move';
-  private knifeMode: KnifeMode = 'linear';
+  private cutMode: CutMode = 'linear';
   /**
-   * The loop knife's live cut: the pointer is on an edge, and this is what a
+   * What the Add tool draws. A rectangle is the shape a panel usually starts
+   * as, so that is what picking Add up gives you first.
+   */
+  private addMode: AddMode = 'rect';
+  /**
+   * The loop cut's live cut: the pointer is on an edge, and this is what a
    * click would cut. Hover-driven rather than dragged, so it lives outside
    * `drag`.
    */
-  private knifeLoop: { pieceId: string; edgeIndex: number; t: number; cut: LoopCut } | null =
+  private cutLoop: { pieceId: string; edgeIndex: number; t: number; cut: LoopCut } | null =
     null;
   /**
-   * Curve knife: the points clicked down so far and where the pointer is now.
+   * Curve cut: the points clicked down so far and where the pointer is now.
    * The cut is the chain through them, carried out to the outline at both ends,
    * so a cut started inside a panel still runs edge to edge.
    */
-  private knifeChain: Vec2[] = [];
-  private knifeChainHover: Vec2 | null = null;
+  private cutChain: Vec2[] = [];
+  private cutChainHover: Vec2 | null = null;
   /** Why the last Done was refused, until the chain changes again. */
-  private knifeChainRefusal: string | null = null;
+  private cutChainRefusal: string | null = null;
   /** How the clicks are joined: a curve through them, or straight edges. */
-  private knifeChainFit: CutterChainFit = 'smooth';
+  private cutChainFit: CutterChainFit = 'smooth';
   /**
    * Sew what the cut separates back together along the cut — cutting a piece to
    * keep its cloth, not to separate it. For a cut that leaves two halves that
@@ -735,28 +788,28 @@ export class PatternEditor {
    * means sewing the piece that was cut out back into the opening it came from.
    * Sticky, because it is a way of working.
    */
-  private knifeSew = false;
+  private cutSew = false;
   /**
    * Leave the piece that was cut out behind: the opening is a hole and nothing
    * else. Only an inset or a circle can cut one out, so only they offer it.
    */
-  private knifeHole = false;
+  private cutHole = false;
   /**
    * Why the last drag cut was refused, shown in the cut bar until the next one.
    * A drag has no chain to leave a mark on, so the bar is where it says so.
    */
-  private knifeNotice: string | null = null;
+  private cutNotice: string | null = null;
   /**
    * The inset the pointer is asking for: which panel, the loop it would cut, how
    * much of the size it keeps, and how far in it runs at its tightest.
    */
-  private knifeInset: {
+  private cutInset: {
     pieceId: string;
     loop: BezierPoint[];
     scale: number;
     gap: number;
   } | null = null;
-  private knifeBar: HTMLElement;
+  private cutBar: HTMLElement;
   private sewMode: SewMode = 'segment';
   private sewBar: HTMLElement;
   private joinMode: JoinMode = 'segment';
@@ -903,6 +956,7 @@ export class PatternEditor {
   private selectedRulerId: string | null = null;
   private hoverRulerId: string | null = null;
   private rulerBtn!: HTMLButtonElement;
+  private cutBtn!: HTMLButtonElement;
   private rulerMenu!: HTMLElement;
   private rulerSearchInput!: HTMLInputElement;
   private rulerTree!: HTMLElement;
@@ -992,12 +1046,14 @@ export class PatternEditor {
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
             <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M3.6 1.9 L3.6 12.5 L6.5 9.8 L8.4 14.1 L10.5 13.1 L8.6 8.9 L12.7 8.9 Z"/>
           </svg>
+          <span class="pattern-tool-key" aria-hidden="true">V</span>
         </button>
         <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="add">
           <button type="button" data-rail-menu="add" data-tip="Add · pen, rectangle, circle, blocks, SVG" aria-label="Add" aria-haspopup="true" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
               ${ICONS.add}
             </svg>
+            <span class="pattern-tool-key" aria-hidden="true">A</span>
           </button>
           <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="add"></div>
         </div>
@@ -1009,19 +1065,18 @@ export class PatternEditor {
           </button>
           <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="modify"></div>
         </div>
-        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="remove">
-          <button type="button" data-rail-menu="remove" data-tip="Remove · knife and dart" aria-label="Remove" aria-haspopup="true" aria-expanded="false">
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              ${ICONS.remove}
-            </svg>
-          </button>
-          <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="remove"></div>
-        </div>
+        <button type="button" data-tool="cut" data-tip="Cut · line, circle, inset, curve, loop or dart — pick the mode in the canvas ribbon" aria-label="Cut">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            ${ICONS.cut}
+          </svg>
+          <span class="pattern-tool-key" aria-hidden="true">C</span>
+        </button>
         <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="sew">
           <button type="button" data-rail-menu="sew" data-tip="Sew · Segment" aria-label="Sew" aria-haspopup="true" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
               ${ICONS.sew}
             </svg>
+            <span class="pattern-tool-key" aria-hidden="true">S</span>
           </button>
           <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="sew"></div>
         </div>
@@ -1033,6 +1088,7 @@ export class PatternEditor {
                 <path fill="none" stroke="currentColor" stroke-width="1.1" d="M4 5.4v2M6.6 5.4v1.3M9.2 5.4v2M11.8 5.4v1.3"/>
               </g>
             </svg>
+            <span class="pattern-tool-key" aria-hidden="true">M</span>
           </button>
           <div class="pattern-tool-flyout-menu pattern-ruler-menu" hidden role="menu">
             <div class="pattern-ruler-menu-tools" role="group" aria-label="Ruler or measure">
@@ -1155,6 +1211,7 @@ export class PatternEditor {
     this.xrayBtn = this.toolbar.querySelector('button[data-opt="xray"]') as HTMLButtonElement;
     this.avatarToggleBtn = this.toolbar.querySelector('button[data-opt="avatar"]') as HTMLButtonElement;
     this.rulerBtn = this.toolbar.querySelector('button[data-tool="ruler"]') as HTMLButtonElement;
+    this.cutBtn = this.toolbar.querySelector('button[data-tool="cut"]') as HTMLButtonElement;
     this.rulerMenu = this.toolbar.querySelector(
       '[data-flyout="ruler"] .pattern-tool-flyout-menu'
     ) as HTMLElement;
@@ -1256,8 +1313,9 @@ export class PatternEditor {
     this.toolSettings.className = 'pattern-tool-settings';
     this.toolSettings.hidden = true;
     // One set per tool, so the ribbon carries whichever the tool in hand needs.
-    // The knife's modes live here rather than in the rail menu: picking the mode
-    // *is* the knife's setting, and it belongs beside the canvas you cut on.
+    // A tool with modes shows them here rather than in its rail menu: picking a
+    // mode *is* the setting, and it belongs beside the canvas it changes — how
+    // Cut cuts, what Add draws.
     this.toolSettings.innerHTML = `
       <div class="pattern-settings-set" data-settings-for="join">
         <span class="pattern-settings-title">Join</span>
@@ -1275,12 +1333,21 @@ export class PatternEditor {
           <span class="pattern-settings-unit">cm</span>
         </label>
       </div>
-      <div class="pattern-settings-set" data-settings-for="knife" hidden>
-        <span class="pattern-settings-title">Knife</span>
-        <div class="pattern-settings-group" role="group" aria-label="Knife mode">
-          ${KNIFE_MODES.map(
+      <div class="pattern-settings-set" data-settings-for="add" hidden>
+        <span class="pattern-settings-title">Add</span>
+        <div class="pattern-settings-group" role="group" aria-label="Add mode">
+          ${ADD_MODES.map(
             (entry) =>
-              `<button type="button" data-knife-mode="${entry.mode}" title="${KNIFE_TIPS[entry.mode]}">${entry.label}</button>`
+              `<button type="button" data-add-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
+          ).join('')}
+        </div>
+      </div>
+      <div class="pattern-settings-set" data-settings-for="cut" hidden>
+        <span class="pattern-settings-title">Cut</span>
+        <div class="pattern-settings-group" role="group" aria-label="Cut mode">
+          ${CUT_MODES.map(
+            (entry) =>
+              `<button type="button" data-cut-mode="${entry.mode}" title="${CUT_TIPS[entry.mode]}">${entry.label}</button>`
           ).join('')}
         </div>
       </div>
@@ -1358,9 +1425,13 @@ export class PatternEditor {
       this.redraw();
     });
     this.sealOverlay(this.toolSettings);
-    this.toolSettings.querySelectorAll('button[data-knife-mode]').forEach((el) => {
+    this.toolSettings.querySelectorAll('button[data-add-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
-      btn.addEventListener('click', () => this.setKnifeMode(btn.dataset.knifeMode as KnifeMode));
+      btn.addEventListener('click', () => this.setAddMode(btn.dataset.addMode as AddMode));
+    });
+    this.toolSettings.querySelectorAll('button[data-cut-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', () => this.setCutMode(btn.dataset.cutMode as CutMode));
     });
     this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
@@ -1706,63 +1777,63 @@ export class PatternEditor {
       this.redraw();
     });
 
-    // The cut bar: what the knife in hand is set to, along the bottom of the
+    // The cut bar: what the cut in hand is set to, along the bottom of the
     // viewport where the eye already is while dragging or clicking a cut out.
     // Every cut mode shares it, so the two things a cut can do with what it
     // separates — weld it back, or throw it away — are in the same place
-    // whichever knife is in hand; the chain's own controls join them in Curve.
-    this.knifeBar = document.createElement('div');
-    this.knifeBar.className = 'pattern-knife-bar';
-    this.knifeBar.hidden = true;
-    this.knifeBar.innerHTML = `
-      <span class="pattern-knife-title" data-knife-title></span>
-      <span class="pattern-knife-count" data-knife-count></span>
-      <span class="pattern-knife-status" data-knife-status></span>
-      <label class="pattern-knife-field" data-knife-fit-field title="How the clicked points are joined up">
+    // whichever cut is in hand; the chain's own controls join them in Curve.
+    this.cutBar = document.createElement('div');
+    this.cutBar.className = 'pattern-cut-bar';
+    this.cutBar.hidden = true;
+    this.cutBar.innerHTML = `
+      <span class="pattern-cut-title" data-cut-title></span>
+      <span class="pattern-cut-count" data-cut-count></span>
+      <span class="pattern-cut-status" data-cut-status></span>
+      <label class="pattern-cut-field" data-cut-fit-field title="How the clicked points are joined up">
         <span>Fit</span>
-        <select data-knife-fit aria-label="Chain fit">
+        <select data-cut-fit aria-label="Chain fit">
           <option value="smooth">Smooth</option>
           <option value="straight">Straight</option>
         </select>
       </label>
-      <span class="pattern-knife-readout" data-knife-readout></span>
-      <label class="pattern-knife-toggle" data-knife-sew-field>
-        <input type="checkbox" data-knife-sew /> <span data-knife-sew-label>Sew pieces</span>
+      <span class="pattern-cut-readout" data-cut-readout></span>
+      <label class="pattern-cut-toggle" data-cut-sew-field>
+        <input type="checkbox" data-cut-sew /> <span data-cut-sew-label>Sew pieces</span>
       </label>
-      <label class="pattern-knife-toggle" data-knife-hole-field>
-        <input type="checkbox" data-knife-hole /> <span>Hole</span>
+      <label class="pattern-cut-toggle" data-cut-hole-field>
+        <input type="checkbox" data-cut-hole /> <span>Hole</span>
       </label>
-      <button type="button" data-knife-done>Done</button>
-      <button type="button" data-knife-cancel aria-label="Cancel the curve knife">Cancel</button>
+      <button type="button" data-cut-done>Done</button>
+      <button type="button" data-cut-cancel aria-label="Cancel the curve cut">Cancel</button>
     `;
-    this.viewport.appendChild(this.knifeBar);
-    this.sealOverlay(this.knifeBar);
-    const knifeFit = this.knifeBar.querySelector('select[data-knife-fit]') as HTMLSelectElement;
-    knifeFit.addEventListener('change', () => {
-      this.knifeChainFit = knifeFit.value === 'straight' ? 'straight' : 'smooth';
+    this.viewport.appendChild(this.cutBar);
+    this.sealOverlay(this.cutBar);
+    const cutFit = this.cutBar.querySelector('select[data-cut-fit]') as HTMLSelectElement;
+    cutFit.addEventListener('change', () => {
+      this.cutChainFit = cutFit.value === 'straight' ? 'straight' : 'smooth';
       this.redraw();
     });
-    const knifeSew = this.knifeBar.querySelector('input[data-knife-sew]') as HTMLInputElement;
-    knifeSew.addEventListener('change', () => {
-      this.knifeSew = knifeSew.checked;
+    const cutSew = this.cutBar.querySelector('input[data-cut-sew]') as HTMLInputElement;
+    cutSew.addEventListener('change', () => {
+      this.cutSew = cutSew.checked;
       this.redraw();
     });
-    const knifeHole = this.knifeBar.querySelector('input[data-knife-hole]') as HTMLInputElement;
-    knifeHole.addEventListener('change', () => {
-      this.knifeHole = knifeHole.checked;
+    const cutHole = this.cutBar.querySelector('input[data-cut-hole]') as HTMLInputElement;
+    cutHole.addEventListener('change', () => {
+      this.cutHole = cutHole.checked;
       // A hole and a piece sewn into it are the two things the same cut-out can
       // become, so picking one lets go of the other.
-      if (this.knifeHole && this.knifeSew) {
-        this.knifeSew = false;
-        this.syncKnifeBar();
+      if (this.cutHole && this.cutSew) {
+        this.cutSew = false;
+        this.syncCutBar();
       }
       this.redraw();
     });
-    this.knifeBar.querySelector('[data-knife-done]')?.addEventListener('click', () => {
-      this.commitKnifeChain();
+    this.cutBar.querySelector('[data-cut-done]')?.addEventListener('click', () => {
+      this.commitCutChain();
     });
-    this.knifeBar.querySelector('[data-knife-cancel]')?.addEventListener('click', () => {
-      this.cancelKnifeChain();
+    this.cutBar.querySelector('[data-cut-cancel]')?.addEventListener('click', () => {
+      this.cancelCutChain();
     });
 
     this.xrayBar = document.createElement('div');
@@ -1943,17 +2014,17 @@ export class PatternEditor {
   };
 
   private onDocKeyDown = (e: KeyboardEvent): void => {
-    // Enter takes the curve knife's chain, the way it would take a dialog's
+    // Enter takes the curve cut's chain, the way it would take a dialog's
     // default — unless the pointer is in a control that wants the key itself.
     if (
       e.key === 'Enter' &&
-      this.tool === 'knife' &&
-      this.knifeMode === 'curve' &&
-      this.knifeChain.length >= 2 &&
+      this.tool === 'cut' &&
+      this.cutMode === 'curve' &&
+      this.cutChain.length >= 2 &&
       !isTextEntry(e.target)
     ) {
       e.preventDefault();
-      this.commitKnifeChain();
+      this.commitCutChain();
       return;
     }
     if (e.key === 'Escape') {
@@ -1990,8 +2061,8 @@ export class PatternEditor {
         this.hoverEdge = null;
         this.redraw();
       }
-      if (this.tool === 'knife' && this.knifeChain.length > 0) {
-        this.cancelKnifeChain();
+      if (this.tool === 'cut' && this.cutChain.length > 0) {
+        this.cancelCutChain();
       }
       if (this.simplify) {
         this.cancelSimplify();
@@ -2044,6 +2115,7 @@ export class PatternEditor {
       }
       return;
     }
+    if (this.handleToolKey(e)) return;
     if (e.key !== 'Delete' && e.key !== 'Backspace') return;
 
     const ae = document.activeElement as HTMLElement | null;
@@ -2065,6 +2137,39 @@ export class PatternEditor {
     this.hideContextMenu();
     this.handleDeleteKey();
   };
+
+  /**
+   * Single-key tool shortcuts, the way a vector editor's rail works: **V** move,
+   * **A** add, **C** cut, **S** sew, **M** measure.
+   *
+   * They belong to the editor the keyboard is in — the one holding focus — since
+   * a board can have a page and any number of containers open at once, each with
+   * its own tool in hand. A modified key is never a tool key, so ⌘/Ctrl+V, ⌘/Ctrl+S
+   * and the rest still mean what they always meant.
+   */
+  private handleToolKey(e: KeyboardEvent): boolean {
+    if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return false;
+    if (e.key.length !== 1) return false;
+    const tool = TOOL_KEYS[e.key.toLowerCase()];
+    if (!tool) return false;
+    if (isTextEntry(e.target)) return false;
+    const active = document.activeElement;
+    if (!this.root.isConnected) return false;
+    if (active !== this.root && !this.root.contains(active)) return false;
+    e.preventDefault();
+    e.stopPropagation();
+    // Taking a tool up is walking back to the canvas: whatever popover was in
+    // the way closes, the way Escape would close it.
+    this.hideRailMenu();
+    this.hideZoomMenu();
+    this.hideContextMenu();
+    // Add and Cut come up in whatever mode they are set to: the mode is a
+    // setting, and the ribbon beside the canvas is where it is changed.
+    if (tool === 'add') this.setAddMode(this.addMode);
+    else if (tool === 'cut') this.setCutMode(this.cutMode);
+    else this.setTool(tool);
+    return true;
+  }
 
   setUnit(unit: UnitDisplay): void {
     this.unit = unit;
@@ -2175,7 +2280,7 @@ export class PatternEditor {
 
   /**
    * What to draw right now. Any tool but the move tool is a reason to see
-   * everything: a knife, a ruler, a pen and a sewing run all work from the
+   * everything: a cut, a ruler, a pen and a sewing run all work from the
    * geometry and its marks, and a press with one of them in hand is meant to land
    * on the pattern — so picking one up brings the whole drawing back.
    */
@@ -2297,7 +2402,7 @@ export class PatternEditor {
 
   setTool(tool: PatternTool): void {
     this.tool = tool;
-    if (tool !== 'pen') this.penStrokeId = null;
+    if (tool !== 'add') this.penStrokeId = null;
     if (tool !== 'extrude') this.extrudeHover = null;
     if (tool !== 'sew') {
       this.pendingSeam = null;
@@ -2312,10 +2417,10 @@ export class PatternEditor {
       this.hoverEdge = null;
       this.clearBridge();
     }
-    if (tool !== 'knife') {
-      this.knifeLoop = null;
-      this.knifeInset = null;
-      this.clearKnifeDraft();
+    if (tool !== 'cut') {
+      this.cutLoop = null;
+      this.cutInset = null;
+      this.clearCutDraft();
     }
     // Changing tools is walking away from anything in hand: a simplify preview
     // belongs to the tool it was started from.
@@ -2345,7 +2450,7 @@ export class PatternEditor {
       this.hoverRulerId = null;
       this.syncRulerBar();
     }
-    this.syncKnifeToolbar();
+    this.syncCutToolbar();
     this.syncSewToolbar();
     this.syncJoinToolbar();
     this.syncBridgeToolbar();
@@ -2361,22 +2466,9 @@ export class PatternEditor {
 
   /** Cursor the active tool uses when nothing is under the pointer. */
   private baseCursor(): string {
-    const tool = this.tool;
-    if (
-      tool === 'pen' ||
-      tool === 'dart' ||
-      tool === 'extrude' ||
-      tool === 'sew' ||
-      tool === 'bridge' ||
-      tool === 'rect' ||
-      tool === 'circle' ||
-      tool === 'knife' ||
-      tool === 'ruler' ||
-      tool === 'measure'
-    ) {
-      return 'crosshair';
-    }
-    return 'default';
+    // Everything but Move works on the pattern rather than on what is already
+    // picked, so it all reads as a crosshair.
+    return this.tool === 'move' ? 'default' : 'crosshair';
   }
 
   /**
@@ -2406,25 +2498,53 @@ export class PatternEditor {
     this.syncRailMenus();
   }
 
-  private setKnifeMode(mode: KnifeMode): void {
-    this.knifeMode = mode;
-    this.knifeNotice = null;
-    this.clearKnifeDraft();
-    this.syncKnifeToolbar();
+  /**
+   * Pick a mode of the tool in hand, and take that tool up: choosing Line from
+   * the Add menu or the ribbon is one click, not two.
+   */
+  private setAddMode(mode: AddMode): void {
+    this.addMode = mode;
+    // A pen stroke belongs to the mode that started it.
+    this.penStrokeId = null;
+    if (this.tool !== 'add') {
+      this.setTool('add');
+      return;
+    }
+    this.syncToolSettings();
+    this.syncRailMenus();
     this.redraw();
   }
 
-  private clearKnifeDraft(): void {
-    this.knifeChain = [];
-    this.knifeChainHover = null;
-    this.knifeChainRefusal = null;
-    this.knifeInset = null;
+  private setCutMode(mode: CutMode): void {
+    this.cutMode = mode;
+    this.cutNotice = null;
+    this.clearCutDraft();
+    if (this.tool !== 'cut') {
+      this.setTool('cut');
+      return;
+    }
+    this.syncCutToolbar();
+    this.redraw();
   }
 
-  /** The Remove menu enters the tool; the ribbon carries which knife it is. */
-  private syncKnifeToolbar(): void {
+  /** What the Add tool is drawing, as the rail and the ribbon name it. */
+  private addModeLabel(): string {
+    return ADD_MODES.find((entry) => entry.mode === this.addMode)?.label ?? 'Rectangle';
+  }
+
+  private clearCutDraft(): void {
+    this.cutChain = [];
+    this.cutChainHover = null;
+    this.cutChainRefusal = null;
+    this.cutInset = null;
+  }
+
+  /** The rail button carries the mode's name; the ribbon carries the mode. */
+  private syncCutToolbar(): void {
     this.syncRailMenus();
     this.syncToolSettings();
+    const btn = this.cutBtn;
+    if (btn) btn.dataset.tip = CUT_TIPS[this.cutMode];
   }
 
   private ensureTipEl(): HTMLDivElement {
@@ -3139,14 +3259,14 @@ export class PatternEditor {
       this.drawShapePreview(this.drag);
     }
 
-    if (this.drag?.type === 'knifeLine' || this.drag?.type === 'knifeCircle') {
-      this.drawKnifePreview(this.drag);
-    } else if (this.tool === 'knife' && this.knifeMode === 'curve') {
-      this.drawKnifeChainDraft();
-    } else if (this.isLoopKnife() && this.knifeLoop) {
-      this.drawLoopCut(this.knifeLoop);
-    } else if (this.knifeMode === 'inset' && this.knifeInset) {
-      this.drawInsetLoop(this.knifeInset);
+    if (this.drag?.type === 'cutLine' || this.drag?.type === 'cutCircle') {
+      this.drawCutPreview(this.drag);
+    } else if (this.tool === 'cut' && this.cutMode === 'curve') {
+      this.drawCutChainDraft();
+    } else if (this.isLoopCut() && this.cutLoop) {
+      this.drawLoopCut(this.cutLoop);
+    } else if (this.cutMode === 'inset' && this.cutInset) {
+      this.drawInsetLoop(this.cutInset);
     }
 
     if (this.tool === 'join' && this.joinPreview.piece) {
@@ -3161,7 +3281,7 @@ export class PatternEditor {
     this.updateAllowanceBar();
     this.updateRulerReadout();
     this.updateBlockReadouts();
-    this.syncKnifeBar();
+    this.syncCutBar();
     this.syncJoinBar();
     this.syncZoomControl();
     this.syncMeasureBar();
@@ -3424,10 +3544,10 @@ export class PatternEditor {
     this.endHistoryGesture();
   }
 
-  private knifeCutterFromDrag(
-    drag: Extract<DragKind, { type: 'knifeLine' | 'knifeCircle' }>
+  private cutterFromDrag(
+    drag: Extract<DragKind, { type: 'cutLine' | 'cutCircle' }>
   ): CutterPath | null {
-    if (drag.type === 'knifeLine') {
+    if (drag.type === 'cutLine') {
       let b = drag.current;
       if (drag.shift) {
         const d = snapAngleDegrees(b.x - drag.start.x, b.y - drag.start.y, 30);
@@ -3444,10 +3564,10 @@ export class PatternEditor {
     return { kind: 'circle', center: drag.center, radius: r };
   }
 
-  private drawKnifePreview(
-    drag: Extract<DragKind, { type: 'knifeLine' | 'knifeCircle' }>
+  private drawCutPreview(
+    drag: Extract<DragKind, { type: 'cutLine' | 'cutCircle' }>
   ): void {
-    const cutter = this.knifeCutterFromDrag(drag);
+    const cutter = this.cutterFromDrag(drag);
     if (!cutter) return;
     this.strokeCutter(cutter, true);
   }
@@ -3468,7 +3588,7 @@ export class PatternEditor {
           'd',
           rail.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
         );
-        path.setAttribute('class', 'pattern-knife-rail');
+        path.setAttribute('class', 'pattern-cut-rail');
         path.setAttribute('stroke-width', String(this.px(1)));
         path.setAttribute('pointer-events', 'none');
         this.svg.appendChild(path);
@@ -3482,7 +3602,7 @@ export class PatternEditor {
         'd',
         samples.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
       );
-      path.setAttribute('class', 'pattern-knife-loop');
+      path.setAttribute('class', 'pattern-cut-loop');
       path.setAttribute('stroke-width', String(this.px(1.75)));
       path.setAttribute('pointer-events', 'none');
       this.svg.appendChild(path);
@@ -3495,7 +3615,7 @@ export class PatternEditor {
       c.setAttribute('r', String(this.px(3.5)));
       c.setAttribute(
         'class',
-        cut.valid ? 'pattern-knife-hit-ok' : 'pattern-knife-hit'
+        cut.valid ? 'pattern-cut-hit-ok' : 'pattern-cut-hit'
       );
       c.setAttribute('pointer-events', 'none');
       this.svg.appendChild(c);
@@ -3519,8 +3639,8 @@ export class PatternEditor {
       else d += ` C ${c0.x} ${c0.y}, ${c1.x} ${c1.y}, ${b.anchor.x} ${b.anchor.y}`;
     }
     path.setAttribute('d', `${d} Z`);
-    path.setAttribute('class', 'pattern-knife-inset');
-    path.setAttribute('fill', this.knifeHole ? 'rgba(196,92,38,0.10)' : 'rgba(196,92,38,0.05)');
+    path.setAttribute('class', 'pattern-cut-inset');
+    path.setAttribute('fill', this.cutHole ? 'rgba(196,92,38,0.10)' : 'rgba(196,92,38,0.05)');
     path.setAttribute('stroke-width', String(this.px(1.75)));
     path.setAttribute('pointer-events', 'none');
     this.svg.appendChild(path);
@@ -3529,13 +3649,13 @@ export class PatternEditor {
       c.setAttribute('cx', String(pt.anchor.x));
       c.setAttribute('cy', String(pt.anchor.y));
       c.setAttribute('r', String(this.px(2.5)));
-      c.setAttribute('class', 'pattern-knife-hit-ok');
+      c.setAttribute('class', 'pattern-cut-hit-ok');
       c.setAttribute('pointer-events', 'none');
       this.svg.appendChild(c);
     }
   }
 
-  // ── Curve knife ──────────────────────────────────────────────────────────
+  // ── Curve cut ──────────────────────────────────────────────────────────
   //
   // Click points down like the pen, and the chain through them is the cut: it is
   // carried out to the outline at both ends, so a cut started in the middle of a
@@ -3551,8 +3671,8 @@ export class PatternEditor {
    * fixed distance: a line that sails past the panel it is cutting would sit over
    * whatever is behind it, and the cut would look like it belonged there.
    */
-  private knifeChainCutter(piece: PatternPiece): CutterPath | null {
-    if (this.knifeChain.length < 2) return null;
+  private chainCutter(piece: PatternPiece): CutterPath | null {
+    if (this.cutChain.length < 2) return null;
     const box = anchorsBounds(piece.points);
     const reach = Math.max(box.maxX - box.minX, box.maxY - box.minY) * 2 + 1;
     const poly = pieceToPolyline(piece.points, true);
@@ -3578,17 +3698,17 @@ export class PatternEditor {
       return { x: from.x + dir.x * distance, y: from.y + dir.y * distance };
     };
 
-    const anchors = [...this.knifeChain];
+    const anchors = [...this.cutChain];
     const before = carried(anchors[0]!, anchors[1]!);
     const after = carried(anchors[anchors.length - 1]!, anchors[anchors.length - 2]!);
     if (before) anchors.unshift(before);
     if (after) anchors.push(after);
-    return cutterPathThrough(anchors, this.knifeChainFit);
+    return cutterPathThrough(anchors, this.cutChainFit);
   }
 
   /** The piece a chain cut is for: the one the chain is drawn through. */
   private pieceForChain(points: readonly Vec2[]): PatternPiece | null {
-    const under = pieceUnderChain(this.pattern.pieces, points, this.knifeChainFit);
+    const under = pieceUnderChain(this.pattern.pieces, points, this.cutChainFit);
     if (under) return under;
     const active = this.activePiece();
     return active?.closed && active.points.length >= 3 ? active : null;
@@ -3600,11 +3720,11 @@ export class PatternEditor {
    * two can never disagree — and the commit takes the piece from here rather than
    * working it out again from the carried-on line.
    */
-  private knifeChainCut(): { cutter: CutterPath; piece: PatternPiece; hits: BoundaryHit[] } | null {
-    if (this.knifeChain.length < 2) return null;
-    const piece = this.pieceForChain(this.knifeChain);
+  private chainCut(): { cutter: CutterPath; piece: PatternPiece; hits: BoundaryHit[] } | null {
+    if (this.cutChain.length < 2) return null;
+    const piece = this.pieceForChain(this.cutChain);
     if (!piece) return null;
-    const cutter = this.knifeChainCutter(piece);
+    const cutter = this.chainCutter(piece);
     if (!cutter) return null;
     return { cutter, piece, hits: findBoundaryHits(piece, cutter) };
   }
@@ -3614,54 +3734,54 @@ export class PatternEditor {
    * sides. One crossing, or a line that only clips a corner, leaves nothing to
    * separate.
    */
-  private knifeChainCutOk(cut: { cutter: CutterPath; piece: PatternPiece; hits: BoundaryHit[] }): boolean {
+  private chainCutValid(cut: { cutter: CutterPath; piece: PatternPiece; hits: BoundaryHit[] }): boolean {
     return !!cutterCrossings(cut.piece, cut.cutter, cut.hits);
   }
 
-  private drawKnifeChainDraft(): void {
-    if (this.knifeChain.length === 0) return;
-    const cut = this.knifeChainCut();
+  private drawCutChainDraft(): void {
+    if (this.cutChain.length === 0) return;
+    const cut = this.chainCut();
 
     // Faint first, under the drawn chain: where the cut carries on to the
     // outline at both ends, which is what lets a cut started inside the panel
     // finish edge to edge.
-    if (cut) this.strokeSampledPath(cut.cutter, 'pattern-knife-extension');
-    const drawn = cutterPathThrough(this.knifeChain, this.knifeChainFit);
-    if (drawn) this.strokeSampledPath(drawn, 'pattern-knife-preview');
+    if (cut) this.strokeSampledPath(cut.cutter, 'pattern-cut-extension');
+    const drawn = cutterPathThrough(this.cutChain, this.cutChainFit);
+    if (drawn) this.strokeSampledPath(drawn, 'pattern-cut-preview');
 
-    for (const point of this.knifeChain) {
+    for (const point of this.cutChain) {
       const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
       c.setAttribute('cx', String(point.x));
       c.setAttribute('cy', String(point.y));
       c.setAttribute('r', String(this.px(3.5)));
-      c.setAttribute('class', 'pattern-knife-point');
+      c.setAttribute('class', 'pattern-cut-point');
       c.setAttribute('pointer-events', 'none');
       this.svg.appendChild(c);
     }
 
     // The rubber band: where the next click would carry the chain. Dashed, and
     // not part of the cut — what is drawn solid is what Done would do.
-    if (this.knifeChainHover) {
-      const last = this.knifeChain[this.knifeChain.length - 1]!;
+    if (this.cutChainHover) {
+      const last = this.cutChain[this.cutChain.length - 1]!;
       const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
       line.setAttribute('x1', String(last.x));
       line.setAttribute('y1', String(last.y));
-      line.setAttribute('x2', String(this.knifeChainHover.x));
-      line.setAttribute('y2', String(this.knifeChainHover.y));
-      line.setAttribute('class', 'pattern-knife-rubber');
+      line.setAttribute('x2', String(this.cutChainHover.x));
+      line.setAttribute('y2', String(this.cutChainHover.y));
+      line.setAttribute('class', 'pattern-cut-rubber');
       line.setAttribute('stroke-width', String(this.px(1.25)));
       line.setAttribute('pointer-events', 'none');
       this.svg.appendChild(line);
     }
 
     if (!cut) return;
-    const ok = this.knifeChainCutOk(cut);
+    const ok = this.chainCutValid(cut);
     for (const hit of cut.hits) {
       const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
       c.setAttribute('cx', String(hit.point.x));
       c.setAttribute('cy', String(hit.point.y));
       c.setAttribute('r', String(this.px(3.5)));
-      c.setAttribute('class', ok ? 'pattern-knife-hit-ok' : 'pattern-knife-hit');
+      c.setAttribute('class', ok ? 'pattern-cut-hit-ok' : 'pattern-cut-hit');
       c.setAttribute('pointer-events', 'none');
       this.svg.appendChild(c);
     }
@@ -3683,52 +3803,52 @@ export class PatternEditor {
   }
 
   /**
-   * Bottom bar: what the knife in hand is set to, and what the cut in hand
+   * Bottom bar: what the cut in hand is set to, and what the cut in hand
    * would do. Every cut mode shares it — the chain's own controls (count, fit,
    * Done, Cancel) come and go with the mode, the toggles stay put — and it is
    * kept in step from `redraw`, so the status line never lags the preview.
    */
-  private syncKnifeBar(): void {
-    if (!this.knifeBar) return;
+  private syncCutBar(): void {
+    if (!this.cutBar) return;
     // One bar at the bottom of the viewport at a time: a simplify preview is the
     // more modal of the two, so it takes the slot while it is up.
-    const cutModes: KnifeMode[] = ['linear', 'circle', 'curve', 'inset'];
-    const active = this.tool === 'knife' && cutModes.includes(this.knifeMode) && !this.simplify;
-    this.knifeBar.hidden = !active;
+    const cutModes: CutMode[] = ['linear', 'circle', 'curve', 'inset'];
+    const active = this.tool === 'cut' && cutModes.includes(this.cutMode) && !this.simplify;
+    this.cutBar.hidden = !active;
     if (!active) return;
 
-    const chain = this.knifeMode === 'curve';
-    const cutOut = this.knifeMode === 'inset' || this.knifeMode === 'circle';
-    const title = this.knifeBar.querySelector('[data-knife-title]') as HTMLElement;
-    title.textContent = KNIFE_BAR_TITLES[this.knifeMode];
+    const chain = this.cutMode === 'curve';
+    const cutOut = this.cutMode === 'inset' || this.cutMode === 'circle';
+    const title = this.cutBar.querySelector('[data-cut-title]') as HTMLElement;
+    title.textContent = CUT_BAR_TITLES[this.cutMode];
 
     const show = (selector: string, on: boolean): void => {
-      const el = this.knifeBar.querySelector(selector) as HTMLElement | null;
+      const el = this.cutBar.querySelector(selector) as HTMLElement | null;
       if (el) el.hidden = !on;
     };
-    show('[data-knife-fit-field]', chain);
-    show('[data-knife-done]', chain);
-    show('[data-knife-cancel]', chain);
+    show('[data-cut-fit-field]', chain);
+    show('[data-cut-done]', chain);
+    show('[data-cut-cancel]', chain);
     // A hole and a loose cut-out are the same cut; a cut that leaves two halves
     // has neither to offer.
-    show('[data-knife-hole-field]', cutOut);
+    show('[data-cut-hole-field]', cutOut);
 
-    const sewField = this.knifeBar.querySelector('[data-knife-sew-field]') as HTMLElement;
+    const sewField = this.cutBar.querySelector('[data-cut-sew-field]') as HTMLElement;
     sewField.title = chain
       ? 'Weld the two halves back together along the cut'
       : cutOut
         ? 'Sew the piece that was cut out back into the opening it came from'
         : 'Sew the two halves back together along the cut';
-    const holeField = this.knifeBar.querySelector('[data-knife-hole-field]') as HTMLElement;
+    const holeField = this.cutBar.querySelector('[data-cut-hole-field]') as HTMLElement;
     holeField.title = 'Leave the opening as a hole: the piece cut out of it is dropped';
 
     // The inverse of the chain: the drag cutters say it in one line, and the
     // inset says how far in the loop sits.
-    const readout = this.knifeBar.querySelector('[data-knife-readout]') as HTMLElement;
-    if (this.knifeMode === 'inset') {
+    const readout = this.cutBar.querySelector('[data-cut-readout]') as HTMLElement;
+    if (this.cutMode === 'inset') {
       readout.hidden = false;
-      readout.textContent = this.knifeInset
-        ? `Inset ${Math.round(this.knifeInset.scale * 100)}% · ${formatLength(this.knifeInset.gap, this.unit, 1)} deep`
+      readout.textContent = this.cutInset
+        ? `Inset ${Math.round(this.cutInset.scale * 100)}% · ${formatLength(this.cutInset.gap, this.unit, 1)} deep`
         : 'Move the pointer in from an edge';
       readout.title =
         'The copy is this much of the panel, and that far in from its edge at the tightest';
@@ -3736,17 +3856,17 @@ export class PatternEditor {
       readout.hidden = true;
     }
 
-    const count = this.knifeBar.querySelector('[data-knife-count]') as HTMLElement;
-    const status = this.knifeBar.querySelector('[data-knife-status]') as HTMLElement;
+    const count = this.cutBar.querySelector('[data-cut-count]') as HTMLElement;
+    const status = this.cutBar.querySelector('[data-cut-status]') as HTMLElement;
     if (chain) {
-      const count_ = this.knifeChain.length;
+      const count_ = this.cutChain.length;
       count.hidden = false;
       count.textContent = `${count_} ${count_ === 1 ? 'point' : 'points'}`;
-      const cut = this.knifeChainCut();
-      const ok = !!cut && this.knifeChainCutOk(cut);
-      if (this.knifeChainRefusal) {
-        status.textContent = this.knifeChainRefusal;
-        status.title = this.knifeChainRefusal;
+      const cut = this.chainCut();
+      const ok = !!cut && this.chainCutValid(cut);
+      if (this.cutChainRefusal) {
+        status.textContent = this.cutChainRefusal;
+        status.title = this.cutChainRefusal;
       } else if (count_ < 2) {
         status.textContent = 'Click points along the cut';
         status.title = '';
@@ -3760,66 +3880,66 @@ export class PatternEditor {
         status.textContent = `Cuts ${cut.piece.name} in two`;
         status.title = `The cut crosses ${cut.piece.name} twice`;
       }
-      const done = this.knifeBar.querySelector('[data-knife-done]') as HTMLButtonElement;
+      const done = this.cutBar.querySelector('[data-cut-done]') as HTMLButtonElement;
       done.disabled = !ok;
     } else if (cutOut) {
       count.hidden = true;
-      const under = this.knifeInset?.pieceId
-        ? this.pattern.pieces.find((p) => p.id === this.knifeInset!.pieceId)
+      const under = this.cutInset?.pieceId
+        ? this.pattern.pieces.find((p) => p.id === this.cutInset!.pieceId)
         : null;
-      if (this.knifeMode === 'circle') {
-        status.textContent = this.knifeHole
+      if (this.cutMode === 'circle') {
+        status.textContent = this.cutHole
           ? 'A circle inside the panel is cut out as a hole'
           : 'Drag: across the panel to cut it in two, or inside it to cut a hole';
         status.title = '';
-      } else if (under && this.knifeInset) {
-        status.textContent = this.knifeHole
+      } else if (under && this.cutInset) {
+        status.textContent = this.cutHole
           ? `Leaves a hole in ${under.name}`
-          : this.knifeSew
+          : this.cutSew
             ? `Cuts a loop out of ${under.name} and sews it back in`
             : `Cuts a loop out of ${under.name}, keeping the piece`;
         status.title = '';
       } else {
-        status.textContent = this.knifeNotice ?? 'Hover inside a panel to size the loop';
+        status.textContent = this.cutNotice ?? 'Hover inside a panel to size the loop';
         status.title = '';
       }
     } else {
       count.hidden = true;
-      status.textContent = this.knifeNotice ?? (this.knifeMode === 'linear' ? 'Drag a line across the panel to cut it' : '');
+      status.textContent = this.cutNotice ?? (this.cutMode === 'linear' ? 'Drag a line across the panel to cut it' : '');
       status.title = '';
     }
 
-    const fit = this.knifeBar.querySelector('select[data-knife-fit]') as HTMLSelectElement;
-    fit.value = this.knifeChainFit;
-    const sew = this.knifeBar.querySelector('input[data-knife-sew]') as HTMLInputElement;
-    sew.checked = this.knifeSew;
-    const hole = this.knifeBar.querySelector('input[data-knife-hole]') as HTMLInputElement;
-    hole.checked = this.knifeHole;
+    const fit = this.cutBar.querySelector('select[data-cut-fit]') as HTMLSelectElement;
+    fit.value = this.cutChainFit;
+    const sew = this.cutBar.querySelector('input[data-cut-sew]') as HTMLInputElement;
+    sew.checked = this.cutSew;
+    const hole = this.cutBar.querySelector('input[data-cut-hole]') as HTMLInputElement;
+    hole.checked = this.cutHole;
   }
 
   /** Commit the chain as a cut, and stand the draft down. */
-  private commitKnifeChain(): void {
-    const cut = this.knifeChainCut();
-    if (!cut || !this.knifeChainCutOk(cut)) return;
-    const refusal = this.commitKnife(cut.cutter, this.knifeSew, cut.piece);
+  private commitCutChain(): void {
+    const cut = this.chainCut();
+    if (!cut || !this.chainCutValid(cut)) return;
+    const refusal = this.commitCut(cut.cutter, this.cutSew, cut.piece);
     if (refusal) {
       // The cut looked good in the preview but the slicer would not take it:
       // keep the chain, say why, and let the next click or Cancel decide.
-      this.knifeChainRefusal = refusal;
-      this.syncKnifeBar();
+      this.cutChainRefusal = refusal;
+      this.syncCutBar();
       this.redraw();
       return;
     }
-    this.clearKnifeDraft();
-    this.syncKnifeBar();
+    this.clearCutDraft();
+    this.syncCutBar();
     this.redraw();
   }
 
   /** Throw the draft away — Escape, Cancel, or the tool going out of hand. */
-  private cancelKnifeChain(): void {
-    if (this.knifeChain.length === 0 && !this.knifeChainHover) return;
-    this.clearKnifeDraft();
-    this.syncKnifeBar();
+  private cancelCutChain(): void {
+    if (this.cutChain.length === 0 && !this.cutChainHover) return;
+    this.clearCutDraft();
+    this.syncCutBar();
     this.redraw();
   }
 
@@ -3827,7 +3947,7 @@ export class PatternEditor {
    * Where a click lands: snapped to an outline point or edge it is close to, so a
    * cut can be started exactly on a corner or run out along an edge.
    */
-  private snapKnifePoint(p: Vec2): Vec2 {
+  private snapCutPoint(p: Vec2): Vec2 {
     // A snap radius that shrinks with the zoom but never grows past a couple of
     // centimetres: a click meant for the middle of a panel must not be dragged
     // onto its outline just because the board is zoomed out.
@@ -3853,7 +3973,7 @@ export class PatternEditor {
   }
 
   private strokeCutter(cutter: CutterPath, showHits: boolean): void {
-    const piece = showHits ? this.pieceForKnife(cutter) : null;
+    const piece = showHits ? this.pieceForCut(cutter) : null;
     const hits = piece ? findBoundaryHits(piece, cutter) : [];
 
     // For linear cuts, draw through the hit span so opposite-side crossings are obvious.
@@ -3877,7 +3997,7 @@ export class PatternEditor {
     for (let i = 1; i < pts.length; i++) d += ` L ${pts[i]!.x} ${pts[i]!.y}`;
     if (cutter.kind === 'circle') d += ' Z';
     path.setAttribute('d', d);
-    path.setAttribute('class', 'pattern-knife-preview');
+    path.setAttribute('class', 'pattern-cut-preview');
     path.setAttribute('fill', cutter.kind === 'circle' ? 'rgba(196,92,38,0.06)' : 'none');
     path.setAttribute('stroke-width', String(this.px(1.75)));
     path.setAttribute('pointer-events', 'none');
@@ -3892,13 +4012,13 @@ export class PatternEditor {
       c.setAttribute('cx', String(h.point.x));
       c.setAttribute('cy', String(h.point.y));
       c.setAttribute('r', String(this.px(3.5)));
-      c.setAttribute('class', validPair ? 'pattern-knife-hit-ok' : 'pattern-knife-hit');
+      c.setAttribute('class', validPair ? 'pattern-cut-hit-ok' : 'pattern-cut-hit');
       c.setAttribute('pointer-events', 'none');
       this.svg.appendChild(c);
     }
   }
 
-  private pieceForKnife(cutter: CutterPath): PatternPiece | null {
+  private pieceForCut(cutter: CutterPath): PatternPiece | null {
     const closed = this.pattern.pieces.filter((p) => p.closed && p.points.length >= 3);
 
     // A line is for the piece the drag itself runs through — the piece between
@@ -3934,7 +4054,7 @@ export class PatternEditor {
     // Otherwise go by where the cut sits. A chain has to be probed part way
     // along: its first point is a boundary hit, and a point on the outline is
     // inside no piece.
-    const probe = this.knifeProbePoint(cutter);
+    const probe = this.cutProbePoint(cutter);
     for (const piece of closed) {
       if (pointInPiece(probe, piece)) return piece;
     }
@@ -3946,7 +4066,7 @@ export class PatternEditor {
   }
 
   /** A point on the cut which is meant to be inside the piece it cuts. */
-  private knifeProbePoint(cutter: CutterPath): Vec2 {
+  private cutProbePoint(cutter: CutterPath): Vec2 {
     if (cutter.kind === 'circle') return cutter.center;
     if (cutter.kind === 'path') {
       const samples = sampleCutterPath(cutter, 8);
@@ -4002,7 +4122,7 @@ export class PatternEditor {
     if (cutOut.holes && cutOut.holes.length === 0) delete cutOut.holes;
 
     const seams: SeamBinding[] = [];
-    if (this.knifeSew && !this.knifeHole) {
+    if (this.cutSew && !this.cutHole) {
       const n = holeRing.length;
       for (let i = 0; i < n; i++) {
         seams.push({
@@ -4026,18 +4146,18 @@ export class PatternEditor {
       }
     }
 
-    this.pattern.pieces.splice(idx, 1, outer, ...(this.knifeHole ? [] : [cutOut]));
+    this.pattern.pieces.splice(idx, 1, outer, ...(this.cutHole ? [] : [cutOut]));
     this.pattern.seams = [...this.pattern.seams, ...seams];
     this.pattern.pieceSuccessors = recordPieceSuccessors(
       this.pattern.pieceSuccessors,
       piece.id,
-      this.knifeHole ? [outer.id] : [outer.id, cutOut.id]
+      this.cutHole ? [outer.id] : [outer.id, cutOut.id]
     );
-    const selected = this.knifeHole ? outer : cutOut;
+    const selected = this.cutHole ? outer : cutOut;
     this.selectedPieceId = selected.id;
     this.selectEntirePiece(selected);
-    this.clearKnifeDraft();
-    this.syncKnifeToolbar();
+    this.clearCutDraft();
+    this.syncCutToolbar();
     this.cbs.onChange();
     this.endHistoryGesture();
     return null;
@@ -4051,34 +4171,34 @@ export class PatternEditor {
    * that comes out of it.
    */
   private commitDragCut(cutter: CutterPath): void {
-    const piece = this.pieceForKnife(cutter);
+    const piece = this.pieceForCut(cutter);
     if (!piece) {
-      this.knifeNotice = 'No panel under the cut';
+      this.cutNotice = 'No panel under the cut';
       return;
     }
     if (piece.holes && piece.holes.length > 0) {
-      this.knifeNotice = 'Panels with a hole cannot be cut — cut the panel first, then punch the hole';
+      this.cutNotice = 'Panels with a hole cannot be cut — cut the panel first, then punch the hole';
       return;
     }
     if (cutter.kind === 'circle') {
       const hits = findBoundaryHits(piece, cutter);
       const ring = ringFromCircle(cutter, () => uid('pt'));
       if (hits.length === 0 && loopFitsOnCloth(piece, ring)) {
-        this.knifeNotice = this.commitLoopCut(piece, ring, 'cut-out');
+        this.cutNotice = this.commitLoopCut(piece, ring, 'cut-out');
         return;
       }
       if (hits.length < 2) {
-        this.knifeNotice = 'A circle cuts a panel it crosses twice, or one it sits inside';
+        this.cutNotice = 'A circle cuts a panel it crosses twice, or one it sits inside';
         return;
       }
     }
-    this.knifeNotice = this.commitKnife(cutter, this.knifeSew, piece);
+    this.cutNotice = this.commitCut(cutter, this.cutSew, piece);
   }
 
-  private commitKnife(
+  private commitCut(
     cutter: CutterPath,
     sewSplit = false,
-    piece: PatternPiece | null = this.pieceForKnife(cutter)
+    piece: PatternPiece | null = this.pieceForCut(cutter)
   ): string | null {
     if (!piece) return 'No panel under the cut';
     // A ring is not something the slicer can split: it cuts closed outlines, and
@@ -4118,7 +4238,7 @@ export class PatternEditor {
         const toPointId = child.pointMap.get(ref.toPointId);
         if (!fromPointId || !toPointId) continue;
         // An untouched outline edge remains adjacent on exactly one child.
-        // A knife-crossed edge has a new cut point between its old endpoints,
+        // A cut-crossed edge has a new cut point between its old endpoints,
         // so it intentionally fails this test and its seam is removed.
         if (edgeIndexForPointIds(child.piece, fromPointId, toPointId) === null) continue;
         return {
@@ -4152,8 +4272,8 @@ export class PatternEditor {
       : remappedSeams;
     this.selectedPieceId = a.id;
     this.selectEntirePiece(a);
-    this.clearKnifeDraft();
-    this.syncKnifeToolbar();
+    this.clearCutDraft();
+    this.syncCutToolbar();
     this.cbs.onChange();
     this.endHistoryGesture();
     return null;
@@ -4603,7 +4723,8 @@ export class PatternEditor {
     }
 
     const showHandles =
-      this.tool === 'pen' || (this.tool === 'move' && this.selectedIds.size === 1);
+      (this.tool === 'add' && this.addMode === 'pen') ||
+      (this.tool === 'move' && this.selectedIds.size === 1);
 
     const pointR = this.px(5);
     const pointSw = this.px(1.5);
@@ -4681,7 +4802,9 @@ export class PatternEditor {
     // Board CSS scale breaks getScreenCTM(); map via getBoundingClientRect + viewBox (xMidYMid meet).
     const rect = this.svg.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1) return { x: 0, y: 0 };
-    const vb = this.viewBox;
+    // The box the SVG is actually drawing — which for a locked container is the
+    // frame, not the editor's own pan/zoom behind it.
+    const vb = this.effectiveViewBox();
     const scale = Math.min(rect.width / vb.w, rect.height / vb.h);
     const mappedW = vb.w * scale;
     const mappedH = vb.h * scale;
@@ -4997,11 +5120,11 @@ export class PatternEditor {
     e.preventDefault();
     this.root.focus({ preventScroll: true });
 
-    // A knife chain in progress owns the right-click: it throws it away rather
+    // A cut chain in progress owns the right-click: it throws it away rather
     // than opening a menu about whatever happens to be underneath.
-    if (this.tool === 'knife' && this.knifeMode === 'curve' && this.knifeChain.length > 0) {
+    if (this.tool === 'cut' && this.cutMode === 'curve' && this.cutChain.length > 0) {
       e.stopPropagation();
-      this.cancelKnifeChain();
+      this.cancelCutChain();
       return;
     }
 
@@ -5296,7 +5419,7 @@ export class PatternEditor {
     const state = this.simplify;
     this.simplify = null;
     this.simplifyBar.hidden = true;
-    this.syncKnifeBar();
+    this.syncCutBar();
     if (!state) return;
     const piece = this.pattern.pieces.find((p) => p.id === state.pieceId);
     if (piece) {
@@ -6299,10 +6422,10 @@ export class PatternEditor {
 
   /**
    * The rail's menus: the pen, the shapes and the library behind Add; extrude,
-   * join and bridge behind Modify; the knife and the dart behind Remove; the two
-   * seams behind Sew. Each is one button with a popup beside it, and a row that
-   * opens a sub-view (the library, the knife's modes) hands the same popup over
-   * rather than opening a second one.
+   * join and bridge behind Modify; the two seams behind Sew. Each is one button
+   * with a popup beside it, and a row that opens a sub-view (the block library)
+   * hands the same popup over rather than opening a second one. A menu's mode
+   * rows set the mode *and* take the tool up, so picking one is one click.
    */
   private railMenus(): RailMenuSpec[] {
     return [
@@ -6311,18 +6434,10 @@ export class PatternEditor {
         label: 'Add',
         tip: 'Add · pen, rectangle, circle, blocks, SVG',
         icon: ICONS.add,
-        toolTip: () => {
-          const names: Partial<Record<PatternTool, string>> = {
-            pen: 'Pen',
-            rect: 'Rectangle',
-            circle: 'Circle',
-          };
-          const name = names[this.tool];
-          return name ? `Add · ${name}` : null;
-        },
+        toolTip: () => (this.tool === 'add' ? `Add · ${this.addModeLabel()}` : null),
         views: () => ({
           tools: {
-            active: () => (this.tool === 'pen' || this.tool === 'rect' || this.tool === 'circle' ? this.tool : null),
+            active: () => (this.tool === 'add' ? this.addMode : null),
             choose: (id) => {
               if (id === 'import') {
                 // A one-shot action rather than a tool: it hands over to the
@@ -6330,7 +6445,7 @@ export class PatternEditor {
                 this.svgFileInput.click();
                 return;
               }
-              this.setTool(id as PatternTool);
+              this.setAddMode(id as AddMode);
             },
             entries: [
               {
@@ -6427,45 +6542,6 @@ export class PatternEditor {
             entries: [
               { id: 'segment', name: 'One edge each', desc: 'Two pieces, one edge onto one edge' },
               { id: 'many', name: 'Edge runs (many)', desc: 'Runs of whole edges, many to many' },
-            ],
-          },
-        }),
-      },
-      {
-        key: 'remove',
-        label: 'Remove',
-        tip: 'Remove · knife and dart',
-        icon: ICONS.remove,
-        toolTip: () => {
-          if (this.tool === 'dart') return 'Remove · Dart';
-          if (this.tool === 'knife') return `Remove · ${KNIFE_TIPS[this.knifeMode]}`;
-          return null;
-        },
-        views: () => ({
-          tools: {
-            active: () => (this.tool === 'dart' || this.tool === 'knife' ? this.tool : null),
-            choose: (id) => {
-              if (id === 'dart') this.setTool('dart');
-              // The knife comes up in whatever mode the ribbon is set to: the
-              // mode is a setting, not a way in.
-              if (id === 'knife') {
-                this.setTool('knife');
-                this.syncToolSettings();
-              }
-            },
-            entries: [
-              {
-                id: 'dart',
-                name: 'Dart',
-                desc: 'Cut a dart into the outline',
-                icon: ICONS.dart,
-              },
-              {
-                id: 'knife',
-                name: 'Knife',
-                desc: `Cut a piece — pick the mode in the canvas ribbon (${KNIFE_MODES.find((entry) => entry.mode === this.knifeMode)?.label ?? 'Line'})`,
-                icon: ICONS.knife,
-              },
             ],
           },
         }),
@@ -8107,6 +8183,7 @@ export class PatternEditor {
           type: 'moveSelection',
           start: p,
           snapshots: this.snapshotSelection(),
+          moved: false,
         };
         this.svg.setPointerCapture(e.pointerId);
         e.preventDefault();
@@ -8215,6 +8292,7 @@ export class PatternEditor {
           type: 'moveSelection',
           start: p,
           snapshots: this.snapshotSelection(),
+          moved: false,
         };
         this.svg.setPointerCapture(e.pointerId);
         e.preventDefault();
@@ -8223,20 +8301,15 @@ export class PatternEditor {
       }
     }
 
-    if (this.tool === 'pen') {
-      this.onPenDown(e, p);
-      return;
-    }
-
-    if (this.tool === 'extrude') {
-      this.onExtrudeDown(e, p);
-      return;
-    }
-
-    if (this.tool === 'rect' || this.tool === 'circle') {
+    if (this.tool === 'add') {
+      // The pen draws a piece click by click; the shapes are dragged out.
+      if (this.addMode === 'pen') {
+        this.onPenDown(e, p);
+        return;
+      }
       this.drag = {
         type: 'drawShape',
-        shape: this.tool,
+        shape: this.addMode,
         start: p,
         current: p,
         lockAspect: e.shiftKey,
@@ -8247,13 +8320,17 @@ export class PatternEditor {
       return;
     }
 
-    if (this.tool === 'knife') {
-      this.onKnifeDown(e, p);
+    if (this.tool === 'extrude') {
+      this.onExtrudeDown(e, p);
       return;
     }
 
-    if (this.tool === 'dart') {
-      this.onDartDown(p);
+    if (this.tool === 'cut') {
+      if (this.cutMode === 'dart') {
+        this.onDartDown(p);
+        return;
+      }
+      this.onCutDown(e, p);
       return;
     }
 
@@ -8320,6 +8397,7 @@ export class PatternEditor {
         type: 'moveSelection',
         start: p,
         snapshots: this.snapshotSelection(),
+        moved: false,
       };
       this.svg.setPointerCapture(e.pointerId);
       e.preventDefault();
@@ -8373,6 +8451,7 @@ export class PatternEditor {
           type: 'moveSelection',
           start: p,
           snapshots: this.snapshotSelection(),
+          moved: false,
         };
         this.svg.setPointerCapture(e.pointerId);
         this.redraw();
@@ -8387,6 +8466,7 @@ export class PatternEditor {
         type: 'moveSelection',
         start: p,
         snapshots: this.snapshotSelection(),
+        moved: false,
       };
       this.svg.setPointerCapture(e.pointerId);
       this.redraw();
@@ -8451,9 +8531,9 @@ export class PatternEditor {
    * skipped: it is rebuilt from its variables, so a new edge there would not
    * survive the next regeneration.
    */
-  /** Loop knife modes cut from a hovered edge rather than from a drag. */
-  private isLoopKnife(): boolean {
-    return this.tool === 'knife' && (this.knifeMode === 'loop' || this.knifeMode === 'loop-straight');
+  /** Loop cut modes cut from a hovered edge rather than from a drag. */
+  private isLoopCut(): boolean {
+    return this.tool === 'cut' && (this.cutMode === 'loop' || this.cutMode === 'loop-straight');
   }
 
   /**
@@ -8472,7 +8552,7 @@ export class PatternEditor {
     const cut = loopCutAt(hit.piece, {
       edgeIndex: hit.edgeIndex,
       t: hit.t,
-      follow: this.knifeMode === 'loop',
+      follow: this.cutMode === 'loop',
     });
     if (!cut) return null;
     return { pieceId: hit.piece.id, edgeIndex: hit.edgeIndex, t: hit.t, cut };
@@ -9043,12 +9123,12 @@ export class PatternEditor {
 
   /** True while the tool in hand has settings of its own, which own the popover. */
   private hasToolSettings(): boolean {
-    return this.tool === 'join' || this.tool === 'knife';
+    return this.tool === 'join' || this.tool === 'cut' || this.tool === 'add';
   }
 
   /**
    * Keep the settings ribbon up to date: it shows the set belonging to the tool
-   * in hand — what the join is set to, or which knife is in hand.
+   * in hand — what the join is set to, which cut is in hand, or what Add draws.
    */
   private syncToolSettings(): void {
     if (!this.toolSettings) return;
@@ -9063,9 +9143,13 @@ export class PatternEditor {
       set.hidden = set.dataset.settingsFor !== this.tool;
     }
 
-    this.toolSettings.querySelectorAll('button[data-knife-mode]').forEach((el) => {
+    this.toolSettings.querySelectorAll('button[data-add-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
-      btn.classList.toggle('is-active', btn.dataset.knifeMode === this.knifeMode);
+      btn.classList.toggle('is-active', btn.dataset.addMode === this.addMode);
+    });
+    this.toolSettings.querySelectorAll('button[data-cut-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.classList.toggle('is-active', btn.dataset.cutMode === this.cutMode);
     });
     this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
@@ -10263,46 +10347,46 @@ export class PatternEditor {
 
     // Inset: the loop the pointer is asking for is worked out from how far in
     // from an edge it is, so every move redraws it.
-    if (this.tool === 'knife' && this.knifeMode === 'inset' && !this.drag) {
+    if (this.tool === 'cut' && this.cutMode === 'inset' && !this.drag) {
       const next = this.insetAtPointer(this.svgPoint(e), e.shiftKey);
       const changed =
-        !!next !== !!this.knifeInset ||
+        !!next !== !!this.cutInset ||
         (!!next &&
-          !!this.knifeInset &&
-          (next.pieceId !== this.knifeInset!.pieceId ||
-            Math.abs(next.scale - this.knifeInset!.scale) > 1e-4));
+          !!this.cutInset &&
+          (next.pieceId !== this.cutInset!.pieceId ||
+            Math.abs(next.scale - this.cutInset!.scale) > 1e-4));
       if (changed) {
-        this.knifeInset = next;
+        this.cutInset = next;
         this.redraw();
       }
       return;
     }
 
-    // Loop knife: the cut is worked out from where the pointer is on the
+    // Loop cut: the cut is worked out from where the pointer is on the
     // outline, so every move redraws it.
-    if (this.isLoopKnife() && !this.drag) {
+    if (this.isLoopCut() && !this.drag) {
       const next = this.loopCutAtPointer(this.svgPoint(e));
       const changed =
-        !!next !== !!this.knifeLoop ||
+        !!next !== !!this.cutLoop ||
         (!!next &&
-          !!this.knifeLoop &&
-          (next.edgeIndex !== this.knifeLoop.edgeIndex ||
-            next.pieceId !== this.knifeLoop.pieceId ||
-            Math.abs(next.t - this.knifeLoop.t) > 1e-4));
+          !!this.cutLoop &&
+          (next.edgeIndex !== this.cutLoop.edgeIndex ||
+            next.pieceId !== this.cutLoop.pieceId ||
+            Math.abs(next.t - this.cutLoop.t) > 1e-4));
       if (changed) {
-        this.knifeLoop = next;
+        this.cutLoop = next;
         this.redraw();
       }
       return;
     }
 
-    // Curve knife: the rubber band follows the pointer, so the next click's
+    // Curve cut: the rubber band follows the pointer, so the next click's
     // segment can be aimed.
-    if (this.tool === 'knife' && this.knifeMode === 'curve' && !this.drag) {
+    if (this.tool === 'cut' && this.cutMode === 'curve' && !this.drag) {
       const p = this.svgPoint(e);
-      const last = this.knifeChainHover;
+      const last = this.cutChainHover;
       if (!last || dist(last, p) > 1e-4) {
-        this.knifeChainHover = this.knifeChain.length > 0 ? p : null;
+        this.cutChainHover = this.cutChain.length > 0 ? p : null;
         this.redraw();
       }
       return;
@@ -10495,21 +10579,21 @@ export class PatternEditor {
       return;
     }
 
-    if (this.drag.type === 'knifeLine') {
+    if (this.drag.type === 'cutLine') {
       // The far end snaps to a point or edge too, so a cut can be run from one
       // corner to another. Shift is an instruction about the angle rather than
       // the place, so it keeps the end where the pointer is and the preview
       // shows the locked line instead.
-      this.drag.current = e.shiftKey ? p : this.snapKnifePoint(p);
+      this.drag.current = e.shiftKey ? p : this.snapCutPoint(p);
       this.drag.shift = e.shiftKey;
       this.redraw();
       return;
     }
 
-    if (this.drag.type === 'knifeCircle') {
+    if (this.drag.type === 'cutCircle') {
       // The drag is the radius, measured from the press, and never moves the
       // centre — so the circle grows under the pointer instead of following it.
-      // Shift quantises the radius (see knifeCutterFromDrag).
+      // Shift quantises the radius (see cutterFromDrag).
       this.drag.radius = dist(this.drag.center, p);
       this.drag.shift = e.shiftKey;
       this.redraw();
@@ -10523,7 +10607,10 @@ export class PatternEditor {
       // Armed here, on the first movement, rather than on pointerdown: picking a
       // piece up and letting go without dragging it is a selection, and it
       // should not leave an empty step on the undo stack.
-      if (rawDx !== 0 || rawDy !== 0) this.markBeforeChange();
+      if (rawDx !== 0 || rawDy !== 0) {
+        this.markBeforeChange();
+        d.moved = true;
+      }
       // Shift locks the drag to the axis it is already moving along, so a point
       // can be moved purely horizontally or vertically.
       const constrainAxis = axisLockFromDelta(rawDx, rawDy, e.shiftKey);
@@ -10695,58 +10782,89 @@ export class PatternEditor {
       return;
     }
 
-    if (finished.type === 'knifeLine' || finished.type === 'knifeCircle') {
-      const cutter = this.knifeCutterFromDrag(finished);
+    if (finished.type === 'cutLine' || finished.type === 'cutCircle') {
+      const cutter = this.cutterFromDrag(finished);
       if (cutter) this.commitDragCut(cutter);
-      this.syncKnifeBar();
+      this.syncCutBar();
       this.redraw();
       return;
+    }
+
+    if (finished.type === 'moveSelection' && finished.moved) {
+      this.reportDroppedPieces(e.clientX, e.clientY);
     }
 
     this.endHistoryGesture();
     this.redraw();
   }
 
-  private onKnifeDown(e: PointerEvent, p: Vec2): void {
-    if (this.isLoopKnife()) {
+  /**
+   * Tell the host where a finished drag put what it was carrying, so whole
+   * panels can be handed over to the container they were dropped in, or back to
+   * the canvas they were dragged out of.
+   *
+   * Only whole pieces are offered — a drag that moved part of a panel (a point,
+   * a curve handle) edits that panel and leaves it where it is.
+   */
+  private reportDroppedPieces(clientX: number, clientY: number): void {
+    if (!this.cbs.onPiecesDropped) return;
+    const pieceIds = this.whollySelectedPieces();
+    if (pieceIds.length === 0) return;
+    this.cbs.onPiecesDropped({ clientX, clientY, pieceIds });
+  }
+
+  /** The pieces picked in full — empty when a pick is only part of a piece. */
+  private whollySelectedPieces(): string[] {
+    const ids: string[] = [];
+    for (const piece of this.pattern.pieces) {
+      const points = pieceRings(piece).flat();
+      if (!points.some((pt) => this.selectedIds.has(pt.id))) continue;
+      if (points.some((pt) => !this.selectedIds.has(pt.id))) return [];
+      ids.push(piece.id);
+    }
+    return ids;
+  }
+
+  private onCutDown(e: PointerEvent, p: Vec2): void {
+    if (this.isLoopCut()) {
       // Hover already decided the cut; a click commits it. An invalid cut (one
       // that would leave the piece, or a sliver) simply does not commit.
-      const hover = this.knifeLoop ?? this.loopCutAtPointer(p);
+      const hover = this.cutLoop ?? this.loopCutAtPointer(p);
       if (hover?.cut.valid) {
         const cut = loopCutCutter(hover.cut);
         const piece =
           this.pattern.pieces.find((entry) => entry.id === hover.pieceId) ??
-          this.pieceForKnife(cut);
-        this.commitKnife(cut, false, piece);
+          this.pieceForCut(cut);
+        this.commitCut(cut, false, piece);
       }
-      this.knifeLoop = null;
+      this.cutLoop = null;
       this.redraw();
       return;
     }
 
-    if (this.knifeMode === 'inset') {
+    if (this.cutMode === 'inset') {
       // The hover has already decided the loop: a click cuts it out.
-      const hover = this.knifeInset ?? this.insetAtPointer(p, e.shiftKey);
+      const hover = this.cutInset ?? this.insetAtPointer(p, e.shiftKey);
       const piece = hover ? this.pattern.pieces.find((entry) => entry.id === hover.pieceId) : null;
       if (hover && piece) {
-        this.knifeNotice = this.commitLoopCut(piece, hover.loop, 'inset');
+        this.cutNotice = this.commitLoopCut(piece, hover.loop, 'inset');
       } else {
-        this.knifeNotice = 'Hover inside a panel to size the loop';
+        this.cutNotice = 'Hover inside a panel to size the loop';
       }
-      this.knifeInset = null;
-      this.syncKnifeBar();
+      this.cutInset = null;
+      this.syncCutBar();
       this.redraw();
       return;
     }
 
-    if (this.knifeMode === 'linear') {
+    if (this.cutMode === 'linear') {
       this.drag = {
-        type: 'knifeLine',
+        type: 'cutLine',
         // The cut starts where the press landed, snapped to a point or edge the
-        // way every other knife click is: a cut aimed at a corner starts *on*
+        // way every other cut click is: a cut aimed at a corner starts *on*
         // the corner rather than a few pixels from it.
-        start: this.snapKnifePoint(p),
-        current: this.snapKnifePoint(p),
+        start: this.snapCutPoint(p),
+        current: this.snapCutPoint(p),
         shift: e.shiftKey,
       };
       this.svg.setPointerCapture(e.pointerId);
@@ -10755,12 +10873,12 @@ export class PatternEditor {
       return;
     }
 
-    if (this.knifeMode === 'circle') {
+    if (this.cutMode === 'circle') {
       // Press sets the centre and the drag sets the radius: the circle is not
       // dragged around by its rim, so it lands centred on the spot it was aimed
       // at however far it is dragged out.
       this.drag = {
-        type: 'knifeCircle',
+        type: 'cutCircle',
         center: p,
         radius: 0,
         shift: e.shiftKey,
@@ -10773,10 +10891,10 @@ export class PatternEditor {
 
     // Curve: click points down, like the pen. The chain is the cut; the bar
     // commits or cancels it.
-    this.knifeChain.push(this.snapKnifePoint(p));
-    this.knifeChainHover = null;
-    this.knifeChainRefusal = null;
-    this.syncKnifeBar();
+    this.cutChain.push(this.snapCutPoint(p));
+    this.cutChainHover = null;
+    this.cutChainRefusal = null;
+    this.syncCutBar();
     this.redraw();
   }
 

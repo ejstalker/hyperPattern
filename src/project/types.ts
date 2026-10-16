@@ -1,4 +1,4 @@
-/** patternCanvas project document model (canonical cm). */
+/** hyperPattern project document model (canonical cm). */
 
 export type UnitDisplay = 'cm' | 'in';
 

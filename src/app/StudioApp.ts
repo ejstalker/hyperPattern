@@ -69,6 +69,8 @@ import {
   containerClips,
   containerView,
   groupIntoContainer,
+  movePiecesBetweenSpaces,
+  patternForSpace,
   piecesBoundsCm,
   containerViewShifted,
   rootPattern,
@@ -2049,6 +2051,7 @@ export class StudioApp {
       getMeasurementLibrary: () => cachedMeasurementLibrary(),
       onGroupIntoContainer: (pieceIds) => this.groupCanvasPiecesIntoContainer(pieceIds),
       onPanelMarquee: (box) => this.selectContainersInCanvasRect(box),
+      onPiecesDropped: (drop) => this.handOverDroppedPieces(null, drop),
     });
     this.canvasSurface = host;
     this.syncCanvasSurfaceView();
@@ -2110,6 +2113,83 @@ export class StudioApp {
     this.setStatus(
       `Moved ${outcome.pieceCount} piece${outcome.pieceCount === 1 ? '' : 's'} into a container`
     );
+  }
+
+  /**
+   * A finished drag of whole pieces: if it let go somewhere else — over a
+   * container while dragging on the page, or past the frame while dragging
+   * inside one — the work changes hands and lands where it was dropped.
+   *
+   * `frame` is the container the drag started in, `null` on the page itself.
+   * The pieces have already been moved by the drag, so a handover is one more
+   * translation on top of it, in the same undo step.
+   */
+  private handOverDroppedPieces(
+    frame: PatternFrameNode | null,
+    drop: { clientX: number; clientY: number; pieceIds: string[] }
+  ): void {
+    // An expanded container is not on the board: it has no frame to be dragged
+    // out of, and the point its own zoom puts the drop at means nothing to the
+    // canvas behind it.
+    if (frame && frame.id === this.expandedNodeId) return;
+    const target = this.frameAtClient(drop.clientX, drop.clientY);
+    if ((target?.id ?? null) === (frame?.id ?? null)) return;
+    const hand = this.boardPointFromClient(drop.clientX, drop.clientY);
+    const outcome = movePiecesBetweenSpaces(this.project, frame, target, drop.pieceIds, hand);
+    if (!outcome.ok) {
+      this.setStatus(outcome.reason);
+      return;
+    }
+    // Both sides have to catch up: the work left one pattern and arrived in the
+    // other, each drawn by its own editor and each read by its own meshes.
+    for (const space of [frame, target]) {
+      this.editorForSpace(space)?.refresh();
+      const pattern = patternForSpace(this.project, space);
+      if (pattern) this.invalidateMeshesForPattern(pattern.id);
+    }
+    this.markDirty();
+    const count = outcome.pieceCount;
+    const pieces = `${count} piece${count === 1 ? '' : 's'}`;
+    this.setStatus(
+      target
+        ? `Moved ${pieces} into Container · ${this.containerName(target)}`
+        : `Moved ${pieces} out to the canvas`
+    );
+  }
+
+  /** The editor drawing a space — the page's own, or a frame's. */
+  private editorForSpace(frame: PatternFrameNode | null): PatternEditor | undefined {
+    return frame
+      ? this.editors.get(frame.id)
+      : (this.canvasEditor ?? undefined);
+  }
+
+  /** The container's name, as its own frame titles it. */
+  private containerName(node: PatternFrameNode): string {
+    return this.project.patterns.find((p) => p.id === node.patternId)?.name ?? 'Container';
+  }
+
+  /** The container frame under a screen point, top of the stack first. */
+  private frameAtClient(clientX: number, clientY: number): PatternFrameNode | null {
+    let best: PatternFrameNode | null = null;
+    let bestZ = -Infinity;
+    for (const node of this.project.canvas.nodes) {
+      if (node.type !== 'patternFrame') continue;
+      // A node opened full screen has left the board for the overlay, where its
+      // box is the whole window rather than anything the canvas knows about.
+      if (node.id === this.expandedNodeId) continue;
+      const el = this.findNodeEl(node.id);
+      if (!el) continue;
+      const rect = el.getBoundingClientRect();
+      if (clientX < rect.left || clientX > rect.right) continue;
+      if (clientY < rect.top || clientY > rect.bottom) continue;
+      const z = this.nodeZIndex(node);
+      if (z >= bestZ) {
+        best = node;
+        bestZ = z;
+      }
+    }
+    return best;
   }
 
   /**
@@ -3663,6 +3743,8 @@ export class StudioApp {
         getMeasurementLibrary: () => cachedMeasurementLibrary(),
         // Picked pieces drive the split view's 3D half.
         onSelectionChange: (pieceIds) => this.syncSplitSelectionFrom2d(pieceIds),
+        // Dragged out past the frame, the work belongs to the canvas again.
+        onPiecesDropped: (drop) => this.handOverDroppedPieces(node, drop),
       });
       this.editors.set(node.id, editor);
       this.syncContainer(node, el);
@@ -5374,7 +5456,7 @@ export class StudioApp {
         <h3>${pattern.name}</h3>
         <label>Name <input id="patName" value="${pattern.name}" /></label>
         <button type="button" id="addPt">Add point</button>
-        <p class="muted">Tools: Move · Add (pen, rect, circle, blocks, SVG) · Modify (extrude, join, bridge) · Remove (knife, dart) · Sew · Ruler. Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.</p>
+        <p class="muted">Tools: <b>V</b> Move · <b>A</b> Add (pen, rectangle, circle, blocks, SVG) · Modify (extrude, join, bridge) · <b>C</b> Cut (line, circle, inset, curve, loop, dart) · <b>S</b> Sew · <b>M</b> Ruler &amp; measure. Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.</p>
         ${this.deleteButtonHtml()}
       `;
       this.inspector.querySelector('#patName')?.addEventListener('change', (e) => {
