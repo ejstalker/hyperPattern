@@ -640,6 +640,13 @@ export class XpbdGpuEngine implements ClothSimulator {
         for (let it = 0; it < this.iterations; it++) this.dispatchStrainLimit(pass);
       }
 
+      // The fabric's own passes — stretch, bend, the strain limiter — reopen a
+      // closed seam every substep, because the gathered side has to travel as it
+      // folds. Give the stitch the same number of passes they get, after they
+      // have had theirs, so what is left is the fabric's resistance rather than
+      // the solver running out of turns.
+      for (let it = 0; it < this.iterations; it++) this.dispatchAttach(pass, seamProgress, h);
+
       {
         const uData = new ArrayBuffer(16);
         const f = new Float32Array(uData);
@@ -834,16 +841,26 @@ export class XpbdGpuEngine implements ClothSimulator {
 
   private dispatchAttach(pass: GPUComputePassEncoder, seamProgress: number, h: number): void {
     if (this.nAttach === 0) return;
-    // Softer while wrapping; a bit firmer once nearly closed.
+    // One kernel, two jobs, and they want different budgets. While the seam is
+    // still wrapping, one pass may close only a fraction of this substep's
+    // travel budget: that — not a global velocity cap — is what stops a seam
+    // slamming through the body, and it is why long, thin pieces are no longer
+    // speed-starved on the way over. (Same threshold `encodeStep` calls
+    // "wrapping".)
     const t = Math.min(1, Math.max(0, seamProgress));
-    const underRelax = 0.12 + 0.18 * t;
-    // Limit how much gap one solve may close (≈ travel budget for this substep).
-    // This — not a global velocity cap — is what stops the seam slamming through
-    // the body, so long/thin pieces are no longer speed-starved while wrapping.
-    const maxClose = Math.max(
-      this.topo.avgEdgeLength * 0.08,
-      this.maxSpeed * h / Math.max(1, this.iterations)
-    );
+    const closed = t >= 0.999;
+    // Once it is closed the stitch gets the whole budget and full strength. It
+    // has to: the fabric's passes push a gathered pair apart between solves, so
+    // a seam that may only recover a sliver per pass settles where the two
+    // balance — which is a centimetre of daylight under a gathered skirt,
+    // instead of the fabric resting against the stitch.
+    const underRelax = closed ? 1 : 0.12 + 0.18 * t;
+    const maxClose = closed
+      ? Math.max(this.topo.avgEdgeLength * 0.08, this.maxSpeed * h)
+      : Math.max(
+          this.topo.avgEdgeLength * 0.08,
+          this.maxSpeed * h / Math.max(1, this.iterations)
+        );
     const uData = new ArrayBuffer(32);
     const f = new Float32Array(uData);
     const u32 = new Uint32Array(uData);
