@@ -5456,7 +5456,7 @@ export class StudioApp {
         <h3>${pattern.name}</h3>
         <label>Name <input id="patName" value="${pattern.name}" /></label>
         <button type="button" id="addPt">Add point</button>
-        <p class="muted">Tools: <b>V</b> Move · <b>A</b> Add (pen, rectangle, circle, blocks, SVG) · Modify (extrude, join, bridge) · <b>C</b> Cut (line, circle, inset, curve, loop, dart) · <b>S</b> Sew · <b>M</b> Ruler &amp; measure. Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.</p>
+        <p class="muted">Tools: <b>V</b> Move · <b>A</b> Add (pen, rectangle, circle, block, SVG) · <b>M</b> Modify (extrude, join, bridge) · <b>C</b> Cut (line, circle, inset, curve, loop, dart) · <b>S</b> Sew (1:1, many : many) · <b>R</b> Ruler (ruler, measure line). Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.</p>
         ${this.deleteButtonHtml()}
       `;
       this.inspector.querySelector('#patName')?.addEventListener('change', (e) => {

@@ -1195,6 +1195,110 @@ optgroup {
   color: var(--ink);
 }
 
+/*
+ * A dropdown on the ribbon: the Add tool's block library and SVG import sit
+ * beside its modes and open their own popover under themselves, the way a
+ * toolbar's menus do. The popover rides over the canvas, so it needs a layer
+ * above the drawing and the bars.
+ */
+.pattern-settings-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.pattern-settings-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pattern-settings-open:hover,
+.pattern-settings-open[aria-expanded='true'] {
+  border-color: var(--accent-2);
+  color: var(--ink);
+}
+
+/* With a dropdown open the ribbon rides over the panels in the same corner, so
+   its popover is not painted under them. */
+.pattern-tool-settings.is-menu-open {
+  z-index: 6;
+}
+
+.pattern-settings-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 200px;
+  max-width: 300px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.pattern-settings-popover[hidden] {
+  display: none !important;
+}
+
+/* Its rows read as a list, whether they come from the block library or are the
+   SVG import's own. */
+.pattern-settings-popover button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  height: auto;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  white-space: normal;
+  cursor: pointer;
+}
+
+.pattern-settings-popover button:hover {
+  border-color: var(--border);
+  background: var(--panel);
+}
+
+.pattern-settings-popover .pattern-block-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pattern-settings-row-name {
+  font: 600 11px var(--mono);
+}
+
+.pattern-settings-row-desc {
+  color: var(--muted);
+  font: 10.5px/1.4 var(--mono);
+}
+
+/* The segmented rows and the fields set `display` of their own, which would
+   beat the `hidden` attribute the ribbon hides a mode's extra settings with. */
+.pattern-settings-group[hidden],
+.pattern-settings-field[hidden] {
+  display: none !important;
+}
+
 .pattern-settings-group button.is-active {
   background: var(--accent);
   color: #fff;
@@ -1397,16 +1501,6 @@ optgroup {
   border-color: var(--border);
 }
 
-/* Hold-open measurement picker under the ruler tool. */
-.pattern-tool-flyout-wide .pattern-tool-flyout-menu {
-  width: 272px;
-  min-width: 0;
-  max-height: min(62vh, 440px);
-  padding: 0;
-  gap: 0;
-  overflow: hidden;
-}
-
 .pattern-ruler-menu-search {
   flex-shrink: 0;
   padding: 6px;
@@ -1471,11 +1565,14 @@ optgroup {
   opacity: 0.7;
 }
 
-/* The extra `.pattern-toolbar` matters: the rail's own
-   `.pattern-toolbar button { width: 28px; height: 28px; padding: 0 }` sits
-   further down this file and would otherwise squash every picker row. */
-.pattern-toolbar .pattern-ruler-item {
+/* The extra `.pattern-tool-settings` matters: the ribbon's generic
+   `.pattern-settings-popover button` sets its own layout, which the picker's
+   rows — a label and a value on one line — would otherwise lose to. */
+.pattern-tool-settings .pattern-ruler-item {
   display: flex;
+  /* The popover's own rows stack their parts; a picker row is a label and a
+     value on one line. */
+  flex-direction: row;
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
@@ -1498,24 +1595,24 @@ optgroup {
   font-size: 10px;
 }
 
-.pattern-toolbar .pattern-ruler-item:hover:not(:disabled) {
+.pattern-tool-settings .pattern-ruler-item:hover:not(:disabled) {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
 }
 
-.pattern-toolbar .pattern-ruler-item:hover:not(:disabled) .pattern-ruler-item-value,
-.pattern-toolbar .pattern-ruler-item:hover:not(:disabled) mark {
+.pattern-tool-settings .pattern-ruler-item:hover:not(:disabled) .pattern-ruler-item-value,
+.pattern-tool-settings .pattern-ruler-item:hover:not(:disabled) mark {
   color: #fff;
 }
 
 /* A field this person has not been measured for: visible, not selectable. */
-.pattern-toolbar .pattern-ruler-item:disabled {
+.pattern-tool-settings .pattern-ruler-item:disabled {
   opacity: 0.4;
   cursor: default;
 }
 
-.pattern-toolbar .pattern-ruler-item:disabled:hover {
+.pattern-tool-settings .pattern-ruler-item:disabled:hover {
   background: transparent;
   border-color: var(--border);
   color: var(--ink);
@@ -2556,23 +2653,6 @@ optgroup {
   border-color: var(--border);
 }
 
-/* The two rows that put a ruler or a measure line in hand, above the picker. */
-.pattern-ruler-menu-tools {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 4px 4px 0;
-}
-
-.pattern-toolbar .pattern-ruler-menu-tools .pattern-ruler-item.is-tool {
-  font-family: var(--font);
-  font-size: 12px;
-}
-
-.pattern-toolbar .pattern-ruler-menu-tools .pattern-ruler-item.is-tool .pattern-ruler-item-value {
-  font-family: var(--font);
-}
-
 /* ── Rulers ─────────────────────────────────────────────────────────────────
    Drafting reference lines pinned over the pattern. They carry their person
    and measurement as text, so they read as a physical ruler left on the table
@@ -2672,13 +2752,15 @@ optgroup {
  * exclusive by selection.
  * ------------------------------------------------------------------------- */
 .pattern-block-bar {
-  top: var(--node-top-inset, 8px);
+  /* Under the tool ribbon when one is up — see `--ribbon-height`, which the
+     editor keeps at the ribbon's own height (0 when there is none). */
+  top: calc(var(--node-top-inset, 8px) + var(--ribbon-height, 0px));
   left: 8px;
   flex-direction: column;
   align-items: stretch;
   gap: 6px;
   width: 348px;
-  max-height: calc(100% - var(--node-top-inset, 8px) - 8px);
+  max-height: calc(100% - var(--node-top-inset, 8px) - var(--ribbon-height, 0px) - 8px);
   padding: 7px 8px;
   box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
 }
@@ -2929,14 +3011,6 @@ optgroup {
   padding-top: 5px;
 }
 
-/* The placement menu in the tool rail. */
-.pattern-tool-flyout-wide .pattern-block-menu {
-  width: 268px;
-  min-width: 0;
-  padding: 5px;
-  gap: 3px;
-}
-
 .pattern-block-menu-hint,
 .pattern-block-menu-empty {
   padding: 4px 6px 6px;
@@ -2968,102 +3042,18 @@ optgroup {
   color: #fff;
 }
 
-/* The rail menus — Add, Modify, Remove, Sew: one button in the rail, one
-   popup beside it, and a row per tool. A row that opens a sub-view (the block
-   library, a tool's modes) hands the same popup over. */
-.pattern-rail-menu {
+/*
+ * The ruler's measurement picker: a dropdown of the ribbon rather than a popup
+ * beside the rail, so it wears the ribbon popover's chrome and scrolls its own
+ * list — a person's chart is longer than the canvas is tall.
+ */
+.pattern-settings-popover.pattern-ruler-menu {
   width: 268px;
   min-width: 0;
-  padding: 5px;
-  gap: 3px;
-}
-
-/* The icon column takes its width out of the text, so the popup is a touch
-   wider than the other wide flyouts — descriptions stay on one line. */
-.pattern-tool-flyout-wide .pattern-tool-flyout-menu.pattern-rail-menu {
-  width: 284px;
-}
-
-.pattern-toolbar .pattern-rail-menu button[data-menu-item],
-.pattern-toolbar .pattern-rail-menu .pattern-menu-back {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  width: 100%;
-  height: auto;
-  padding: 6px 8px;
-  white-space: normal;
-  /* Buttons centre their text by default; these rows read as a list. */
-  text-align: left;
-}
-
-/* Rows that carry an icon put it in its own column, level with the name. */
-.pattern-toolbar .pattern-rail-menu button[data-menu-item].has-icon {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  align-items: center;
-  column-gap: 8px;
-  row-gap: 0;
-}
-
-.pattern-menu-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  color: var(--muted);
-}
-
-.pattern-menu-icon svg {
-  display: block;
-}
-
-.pattern-menu-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-/* The block library shares the Add popup, so its rows read as a list too. */
-.pattern-rail-menu .pattern-block-menu button {
-  text-align: left;
-}
-
-.pattern-menu-name {
-  font: 600 11px var(--mono);
-}
-
-.pattern-menu-desc {
-  color: var(--muted);
-  font: 10.5px/1.4 var(--mono);
-}
-
-.pattern-toolbar .pattern-rail-menu button[data-menu-item]:hover .pattern-menu-icon,
-.pattern-toolbar .pattern-rail-menu button[data-menu-item].is-active .pattern-menu-icon,
-.pattern-toolbar .pattern-rail-menu button[data-menu-item]:hover .pattern-menu-desc {
-  color: #fff;
-}
-
-.pattern-toolbar .pattern-rail-menu .pattern-menu-back {
-  flex-direction: row;
-  align-items: center;
-  padding: 4px 8px;
-  color: var(--muted);
-}
-
-/* The block library lives inside the Add menu rather than beside it, so it
-   drops the popup chrome it wears when it stands on its own. */
-.pattern-rail-menu .pattern-block-menu {
-  position: static;
-  width: auto;
-  min-width: 0;
+  max-height: min(62vh, 440px);
   padding: 0;
-  border: 0;
-  background: none;
-  box-shadow: none;
+  gap: 0;
+  overflow: hidden;
 }
 
 .pattern-ruler-bar-label {
@@ -3223,35 +3213,7 @@ optgroup {
   pointer-events: none;
 }
 
-.pattern-sew-bar {
-  position: absolute;
-  top: var(--node-top-inset, 8px);
-  left: 50%;
-  z-index: 8;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  transform: translateX(-50%);
-  padding: 5px 6px 5px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: rgba(35, 31, 27, 0.94);
-  color: var(--text);
-  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
-  font: 11px var(--mono);
-  white-space: nowrap;
-}
-
-.pattern-sew-bar[hidden] {
-  display: none !important;
-}
-
-.pattern-sew-bar button {
-  min-height: 24px;
-  padding: 3px 7px;
-  font-size: 11px;
-}
-
+/* The many-to-many run's own button carries the seam colour, like the fuse's. */
 .pattern-sew-bar [data-sew-next] {
   border-color: var(--seam);
 }
@@ -5657,11 +5619,12 @@ optgroup {
   letter-spacing: 0.06em;
 }
 
-/* Join bar: where the two ends of a fuse are read, bottom centre with the other
-   tool bars. */
+/* Tool bars: what the tool in hand is set to and what it will do next, along the
+   bottom middle, where the eye already is while dragging on the work. */
 .pattern-join-bar,
 .pattern-bridge-bar,
-.pattern-measure-bar {
+.pattern-measure-bar,
+.pattern-sew-bar {
   position: absolute;
   bottom: 12px;
   left: 50%;
@@ -5682,17 +5645,20 @@ optgroup {
 
 .pattern-join-bar[hidden],
 .pattern-bridge-bar[hidden],
-.pattern-measure-bar[hidden] {
+.pattern-measure-bar[hidden],
+.pattern-sew-bar[hidden] {
   display: none !important;
 }
 
 .pattern-join-title,
-.pattern-bridge-title {
+.pattern-bridge-title,
+.pattern-sew-title {
   color: var(--muted);
 }
 
 .pattern-join-bar [data-join-instruction],
-.pattern-bridge-bar [data-bridge-instruction] {
+.pattern-bridge-bar [data-bridge-instruction],
+.pattern-sew-bar [data-sew-instruction] {
   max-width: 46ch;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5705,7 +5671,8 @@ optgroup {
 
 .pattern-join-bar button,
 .pattern-bridge-bar button,
-.pattern-measure-bar button {
+.pattern-measure-bar button,
+.pattern-sew-bar button {
   min-height: 24px;
   padding: 3px 7px;
   font-size: 11px;
@@ -5713,12 +5680,14 @@ optgroup {
 
 .pattern-join-bar button[hidden],
 .pattern-bridge-bar button[hidden],
-.pattern-measure-bar button[hidden] {
+.pattern-measure-bar button[hidden],
+.pattern-sew-bar button[hidden] {
   display: none !important;
 }
 
 .pattern-join-bar button:disabled,
-.pattern-bridge-bar button:disabled {
+.pattern-bridge-bar button:disabled,
+.pattern-sew-bar button:disabled {
   opacity: 0.45;
   cursor: default;
 }

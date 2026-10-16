@@ -328,65 +328,42 @@ export type PatternTool =
   | 'move'
   | 'add'
   | 'cut'
-  | 'extrude'
+  | 'modify'
   | 'sew'
-  | 'join'
-  | 'bridge'
-  | 'ruler'
-  | 'measure';
+  | 'ruler';
 
 /** What the Add tool is drawing: a pen stroke, a rectangle, or a circle. */
 export type AddMode = 'pen' | 'rect' | 'circle';
 
-/** The rail's menus: what each one offers, and what its rows stand for. */
-export type AddKind = AddMode | 'block' | 'import';
-
-/** A row in a rail menu: a tool, a mode, or a way into a sub-view. */
-type RailMenuEntry = {
-  id: string;
-  name: string;
-  desc: string;
-  icon?: string;
-  /** Opens this sub-view instead of choosing. */
-  view?: string;
-};
-
-/** One screenful of a rail menu. */
-type RailMenuView = {
-  entries?: RailMenuEntry[];
-  /** Views that build their own rows (the block library) write into `host`. */
-  render?: (host: HTMLElement) => void;
-  /** Which row reads as the current choice. */
-  active?: () => string | null;
-  /** What picking a row does. The menu has already closed by then. */
-  choose?: (id: string) => void;
-};
-
-type RailMenuKey = 'add' | 'modify' | 'sew';
-
-type RailMenuSpec = {
-  key: RailMenuKey;
-  label: string;
-  /** Tip while nothing from this menu is in hand. */
-  tip: string;
-  /** Tip naming the tool in hand, or null when none of its tools is up. */
-  toolTip: () => string | null;
-  icon: string;
-  /** Built on open, so the rows carry the current tool and mode. */
-  views: () => Record<string, RailMenuView>;
-};
+/** What the Modify tool is doing, and what its ribbon and bar show. */
+export type ModifyMode = 'extrude' | 'join' | 'bridge';
 
 /**
- * The rail's single-key shortcuts. `m` is the measure line rather than the
+ * What the Ruler tool is in hand as: a real rule laid over the work, or a
+ * measurement read off the pattern. The measuring half is what the tool opens
+ * as — it is the one you reach for without looking.
+ */
+export type RulerMode = 'ruler' | 'measure';
+
+/**
+ * A dropdown on the canvas ribbon: the options a tool carries that are not
+ * modes — the block library and the SVG import beside Add's shapes, the
+ * measurement library beside the ruler's two tools.
+ */
+type SettingsMenuKey = 'block' | 'svg' | 'measurement';
+
+/**
+ * The rail's single-key shortcuts. `r` is the measure *line* rather than the
  * ruler: the ruler's menu holds both, and the measuring tool is the one you
  * reach for without looking.
  */
 const TOOL_KEYS: Record<string, PatternTool> = {
   v: 'move',
   a: 'add',
+  m: 'modify',
   c: 'cut',
   s: 'sew',
-  m: 'measure',
+  r: 'ruler',
 };
 
 /** Inline icons, in the rail's own 16px line-art style. */
@@ -402,27 +379,12 @@ const ICONS = {
         <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="1.6 1.3" d="M2.8 8.2 L7.8 8.2"/>
         <circle cx="2.6" cy="8.2" r="1" fill="currentColor"/>
         <circle cx="8.2" cy="8.2" r="1" fill="currentColor"/>`,
-  pen: `<path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M10.3 2.4 L13.6 5.7 L8.9 11.4 L4.1 12.6 L4.9 7.8 Z"/>
-        <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" d="M4.9 7.8 L8.9 11.4"/>`,
-  rect: `<rect x="3" y="3.5" width="10" height="9" rx="0.5" fill="none" stroke="currentColor" stroke-width="1.4"/>`,
-  circle: `<circle cx="8" cy="8" r="5" fill="none" stroke="currentColor" stroke-width="1.4"/>`,
-  block: `<path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M2.6 5.6 L8 2.9 L13.4 5.6 L13.4 10.6 L8 13.3 L2.6 10.6 Z"/>
-          <circle cx="8" cy="8" r="1.5" fill="currentColor"/>`,
-  import: `<path fill="none" stroke="currentColor" stroke-width="1.3" d="M3.5 3.5h9v9h-9z"/>
-           <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M8 6.2v4.2M6.1 8.8 L8 11 L9.9 8.8"/>`,
-  extrude: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M2.5 11.5 L9.5 11.5"/>
-            <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M6 4.5 L13.5 4.5"/>
-            <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.6 1.2" d="M2.5 11.5 L6 4.5 M9.5 11.5 L13.5 4.5"/>`,
-  join: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M2.5 4 L2.5 12 M13.5 4 L13.5 12"/>
-         <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M5.2 5.6 L7.4 8 L5.2 10.4 M10.8 5.6 L8.6 8 L10.8 10.4"/>`,
-  bridge: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3.2 4 L3.2 12 M12.8 4 L12.8 12"/>
-           <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M3.2 4 L12.8 4 M3.2 12 L12.8 12"/>`,
-  cut: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 13 L13 3"/>
-          <path fill="none" stroke="currentColor" stroke-width="1.2" d="M11.2 3.2 L13 3 L12.8 4.8"/>
-          <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M4 8.5 L8.5 4"/>`,
+  scissors: `<path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M4.9 11.2 L13.4 3.5 M4.9 4.8 L13.4 12.5"/>
+           <circle cx="3.9" cy="12.1" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/>
+           <circle cx="3.9" cy="3.9" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/>`,
 } as const;
 
-/** The tip the knives carry, per mode — the menu button borrows it. */
+/** What each cutter is called on the ribbon, and the tip it carries. */
 const CUT_TIPS: Record<CutMode, string> = {
   linear: 'Cut · Line — drag across a panel',
   circle: 'Cut · Circle — drag out the radius',
@@ -444,6 +406,25 @@ const CUT_MODES: ReadonlyArray<{ mode: CutMode; label: string }> = [
   { mode: 'loop', label: 'Loop' },
   { mode: 'loop-straight', label: 'Loop straight' },
   { mode: 'dart', label: 'Dart' },
+];
+
+/** One edge onto one edge, or runs of edges onto runs of edges. */
+const EDGE_PAIR_MODES: ReadonlyArray<{ mode: JoinMode; label: string; tip: string }> = [
+  { mode: 'segment', label: '1:1', tip: 'One edge on each piece' },
+  { mode: 'many', label: 'Many : many', tip: 'Runs of whole edges, many to many' },
+];
+
+/** The Ruler tool's modes, in the order the ribbon and its menu show them. */
+const RULER_MODES: ReadonlyArray<{ mode: RulerMode; label: string; tip: string }> = [
+  { mode: 'ruler', label: 'Ruler', tip: 'Ruler · a real rule laid over the work' },
+  { mode: 'measure', label: 'Measure line', tip: 'Ruler · Measure line — read the pattern' },
+];
+
+/** The Modify tool's modes, in the order the ribbon shows them. */
+const MODIFY_MODES: ReadonlyArray<{ mode: ModifyMode; label: string; tip: string }> = [
+  { mode: 'extrude', label: 'Extrude', tip: 'Modify · Extrude — drag away from an edge to grow a parallel copy' },
+  { mode: 'join', label: 'Join', tip: 'Modify · Join — fuse two pieces along picked edges' },
+  { mode: 'bridge', label: 'Bridge', tip: 'Modify · Bridge — fill between picked edges without moving them' },
 ];
 
 /** What the Add tool is drawing, in the order the ribbon shows the modes. */
@@ -758,6 +739,10 @@ export class PatternEditor {
   private unit: UnitDisplay;
   private tool: PatternTool = 'move';
   private cutMode: CutMode = 'linear';
+  /** Which of Modify's jobs is in hand: extrude, join, or bridge. */
+  private modifyMode: ModifyMode = 'extrude';
+  /** Which half of the Ruler tool is in hand. */
+  private rulerMode: RulerMode = 'measure';
   /**
    * What the Add tool draws. A rectangle is the shape a panel usually starts
    * as, so that is what picking Add up gives you first.
@@ -957,10 +942,11 @@ export class PatternEditor {
   private hoverRulerId: string | null = null;
   private rulerBtn!: HTMLButtonElement;
   private cutBtn!: HTMLButtonElement;
-  private rulerMenu!: HTMLElement;
+  private settingsMenuOpen: SettingsMenuKey | null = null;
+  private settingsMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
+
   private rulerSearchInput!: HTMLInputElement;
   private rulerTree!: HTMLElement;
-  private rulerMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
   /**
    * A measurement chosen from the hold-open menu, waiting for the next drag.
    * Lets you lay out several rulers of the same body dimension in a row.
@@ -1011,9 +997,6 @@ export class PatternEditor {
   private collapsedBlockGroups = new Set<string>();
   private hoverVarId: string | null = null;  private hoverDriven: Set<string> | null = null;
   /** One button and popup per rail menu, and the view each is showing. */
-  private railMenuSpecs = new Map<RailMenuKey, RailMenuSpec>();
-  private railMenuView = new Map<RailMenuKey, string>();
-  private railMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
   private blockBar!: HTMLElement;
   private blockPersonSelect!: HTMLSelectElement;
   private blockSourceNote!: HTMLElement;
@@ -1042,73 +1025,48 @@ export class PatternEditor {
     this.toolbar.className = 'pattern-toolbar';
     this.toolbar.innerHTML = `
       <div class="pattern-toolbar-tools">
+        <!-- Every tool button is the same: clicking it takes its tool up, the
+             mode it is set to and all, so it does exactly what its key does.
+             The modes themselves live on the ribbon beside the canvas. -->
         <button type="button" data-tool="move" data-tip="Move · ⌘/Ctrl-click an edge to drop a point, a panel to pick it" aria-label="Move">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
             <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M3.6 1.9 L3.6 12.5 L6.5 9.8 L8.4 14.1 L10.5 13.1 L8.6 8.9 L12.7 8.9 Z"/>
           </svg>
           <span class="pattern-tool-key" aria-hidden="true">V</span>
         </button>
-        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="add">
-          <button type="button" data-rail-menu="add" data-tip="Add · pen, rectangle, circle, blocks, SVG" aria-label="Add" aria-haspopup="true" aria-expanded="false">
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              ${ICONS.add}
-            </svg>
-            <span class="pattern-tool-key" aria-hidden="true">A</span>
-          </button>
-          <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="add"></div>
-        </div>
-        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="modify">
-          <button type="button" data-rail-menu="modify" data-tip="Modify · extrude, join and bridge" aria-label="Modify" aria-haspopup="true" aria-expanded="false">
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              ${ICONS.modify}
-            </svg>
-          </button>
-          <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="modify"></div>
-        </div>
+        <button type="button" data-tool="add" aria-label="Add">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            ${ICONS.add}
+          </svg>
+          <span class="pattern-tool-key" aria-hidden="true">A</span>
+        </button>
+        <button type="button" data-tool="modify" aria-label="Modify">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            ${ICONS.modify}
+          </svg>
+          <span class="pattern-tool-key" aria-hidden="true">M</span>
+        </button>
         <button type="button" data-tool="cut" data-tip="Cut · line, circle, inset, curve, loop or dart — pick the mode in the canvas ribbon" aria-label="Cut">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            ${ICONS.cut}
+            ${ICONS.scissors}
           </svg>
           <span class="pattern-tool-key" aria-hidden="true">C</span>
         </button>
-        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="sew">
-          <button type="button" data-rail-menu="sew" data-tip="Sew · Segment" aria-label="Sew" aria-haspopup="true" aria-expanded="false">
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              ${ICONS.sew}
-            </svg>
-            <span class="pattern-tool-key" aria-hidden="true">S</span>
-          </button>
-          <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="sew"></div>
-        </div>
-        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="ruler">
-          <button type="button" data-tool="ruler" data-tip="Ruler &amp; measure · click for either" aria-label="Ruler and measure" aria-haspopup="true" aria-expanded="false">
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              <g transform="rotate(-45 8 8)">
-                <rect x="1.2" y="5.4" width="13.6" height="5.2" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.3"/>
-                <path fill="none" stroke="currentColor" stroke-width="1.1" d="M4 5.4v2M6.6 5.4v1.3M9.2 5.4v2M11.8 5.4v1.3"/>
-              </g>
-            </svg>
-            <span class="pattern-tool-key" aria-hidden="true">M</span>
-          </button>
-          <div class="pattern-tool-flyout-menu pattern-ruler-menu" hidden role="menu">
-            <div class="pattern-ruler-menu-tools" role="group" aria-label="Ruler or measure">
-              <button type="button" class="pattern-ruler-item is-tool" data-ruler-tool="ruler" role="menuitem">
-                <span class="pattern-ruler-item-label">Ruler</span>
-                <span class="pattern-ruler-item-value">a real rule over the work</span>
-              </button>
-              <button type="button" class="pattern-ruler-item is-tool" data-ruler-tool="measure" role="menuitem">
-                <span class="pattern-ruler-item-label">Measure line</span>
-                <span class="pattern-ruler-item-value">read the pattern</span>
-              </button>
-            </div>
-            <div class="pattern-ruler-menu-divider"></div>
-            <div class="pattern-ruler-menu-search">
-              <input type="search" data-ruler-search autocomplete="off" spellcheck="false"
-                placeholder="Search people or measurements…" aria-label="Search people and measurements" />
-            </div>
-            <div class="pattern-ruler-menu-tree" data-ruler-tree role="tree"></div>
-          </div>
-        </div>
+        <button type="button" data-tool="sew" aria-label="Sew">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            ${ICONS.sew}
+          </svg>
+          <span class="pattern-tool-key" aria-hidden="true">S</span>
+        </button>
+        <button type="button" data-tool="ruler" aria-label="Ruler">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <g transform="rotate(-45 8 8)">
+              <rect x="1.2" y="5.4" width="13.6" height="5.2" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.3"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.1" d="M4 5.4v2M6.6 5.4v1.3M9.2 5.4v2M11.8 5.4v1.3"/>
+            </g>
+          </svg>
+          <span class="pattern-tool-key" aria-hidden="true">R</span>
+        </button>
       </div>
       <div class="pattern-toolbar-spacer" aria-hidden="true"></div>
       <div class="pattern-tool-flyout pattern-zoom-flyout">
@@ -1212,24 +1170,6 @@ export class PatternEditor {
     this.avatarToggleBtn = this.toolbar.querySelector('button[data-opt="avatar"]') as HTMLButtonElement;
     this.rulerBtn = this.toolbar.querySelector('button[data-tool="ruler"]') as HTMLButtonElement;
     this.cutBtn = this.toolbar.querySelector('button[data-tool="cut"]') as HTMLButtonElement;
-    this.rulerMenu = this.toolbar.querySelector(
-      '[data-flyout="ruler"] .pattern-tool-flyout-menu'
-    ) as HTMLElement;
-    this.bindRailMenus();
-    this.rulerSearchInput = this.toolbar.querySelector(
-      'input[data-ruler-search]'
-    ) as HTMLInputElement;
-    this.rulerTree = this.toolbar.querySelector('[data-ruler-tree]') as HTMLElement;
-    this.bindRulerMenu();
-    this.rulerSearchInput.addEventListener('input', () => this.renderRulerMenu());
-    this.rulerTree.addEventListener('click', (e) => {
-      const item = (e.target as HTMLElement).closest(
-        'button[data-measure-id]'
-      ) as HTMLButtonElement | null;
-      if (!item || item.disabled) return;
-      e.preventDefault();
-      this.chooseRulerMeasurement(item.dataset.personId ?? '', item.dataset.measureId ?? '');
-    });
     this.toolbar.addEventListener('click', (e) => {
       const hiconBtn = (e.target as HTMLElement).closest(
         'button[data-opt="hicon"]'
@@ -1276,9 +1216,13 @@ export class PatternEditor {
       }
       const btn = (e.target as HTMLElement).closest('button[data-tool]') as HTMLButtonElement | null;
       if (!btn) return;
-      // The ruler's button is handled by its own press/click binding.
-      if (btn.dataset.tool === 'ruler') return;
-      this.setTool(btn.dataset.tool as PatternTool);
+      // A rail button does what its key does: it takes its tool up in whatever
+      // mode it is set to. The modes themselves are on the ribbon.
+      const railTool = btn.dataset.tool as PatternTool;
+      if (railTool === 'add') this.setAddMode(this.addMode);
+      else if (railTool === 'modify') this.setModifyMode(this.modifyMode);
+      else if (railTool === 'ruler') this.setRulerMode(this.rulerMode);
+      else this.setTool(railTool);
     });
 
     const main = document.createElement('div');
@@ -1317,28 +1261,55 @@ export class PatternEditor {
     // mode *is* the setting, and it belongs beside the canvas it changes — how
     // Cut cuts, what Add draws.
     this.toolSettings.innerHTML = `
-      <div class="pattern-settings-set" data-settings-for="join">
-        <span class="pattern-settings-title">Join</span>
-        <div class="pattern-settings-group" role="group" aria-label="Edges to pick">
-          <button type="button" data-join-mode="segment" title="One edge on each piece">1:1</button>
-          <button type="button" data-join-mode="many" title="Runs of whole edges, many to many">Many : many</button>
-        </div>
-        <div class="pattern-settings-group" role="group" aria-label="How the moving piece is brought over">
-          <button type="button" data-join-fit="match" title="Move, turn and scale the piece as it is: the edges match if they land within the tolerance, and what is left between them is filled in">Move &amp; scale</button>
-          <button type="button" data-join-fit="warp" title="Bend, stretch and turn the piece until its edges lie exactly on the other's">Warp</button>
-        </div>
-        <label class="pattern-settings-field" title="Move & scale: how far apart the picked edges may sit and still count as matched">
-          <span>Tolerance</span>
-          <input type="number" data-join-tolerance min="0" max="100" step="0.1" value="0.5" aria-label="Join match tolerance" />
-          <span class="pattern-settings-unit">cm</span>
-        </label>
-      </div>
       <div class="pattern-settings-set" data-settings-for="add" hidden>
         <span class="pattern-settings-title">Add</span>
         <div class="pattern-settings-group" role="group" aria-label="Add mode">
           ${ADD_MODES.map(
             (entry) =>
               `<button type="button" data-add-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
+          ).join('')}
+        </div>
+        <div class="pattern-settings-menu">
+          <button type="button" class="pattern-settings-open" data-menu-open="block" title="Draft a piece from the block library" aria-haspopup="true" aria-expanded="false">Block… <span aria-hidden="true">▾</span></button>
+          <div class="pattern-settings-popover pattern-block-menu-host" data-menu-popover="block" hidden role="menu"></div>
+        </div>
+        <div class="pattern-settings-menu">
+          <button type="button" class="pattern-settings-open" data-menu-open="svg" title="Bring an SVG in as pattern pieces" aria-haspopup="true" aria-expanded="false">SVG… <span aria-hidden="true">▾</span></button>
+          <div class="pattern-settings-popover" data-menu-popover="svg" hidden role="menu">
+            <button type="button" class="pattern-settings-row" data-add-import role="menuitem">
+              <span class="pattern-settings-row-name">Import SVG…</span>
+              <span class="pattern-settings-row-desc">Bring an SVG in as pattern pieces</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="pattern-settings-set" data-settings-for="modify" hidden>
+        <span class="pattern-settings-title">Modify</span>
+        <div class="pattern-settings-group" role="group" aria-label="Modify mode">
+          ${MODIFY_MODES.map(
+            (entry) =>
+              `<button type="button" data-modify-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
+          ).join('')}
+        </div>
+        <div class="pattern-settings-group" data-settings-extra="join" role="group" aria-label="Edges to pick">
+          ${EDGE_PAIR_MODES.map(
+            (entry) =>
+              `<button type="button" data-join-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
+          ).join('')}
+        </div>
+        <div class="pattern-settings-group" data-settings-extra="join" role="group" aria-label="How the moving piece is brought over">
+          <button type="button" data-join-fit="match" title="Move, turn and scale the piece as it is: the edges match if they land within the tolerance, and what is left between them is filled in">Move &amp; scale</button>
+          <button type="button" data-join-fit="warp" title="Bend, stretch and turn the piece until its edges lie exactly on the other's">Warp</button>
+        </div>
+        <label class="pattern-settings-field" data-settings-extra="join" title="Move & scale: how far apart the picked edges may sit and still count as matched">
+          <span>Tolerance</span>
+          <input type="number" data-join-tolerance min="0" max="100" step="0.1" value="0.5" aria-label="Join match tolerance" />
+          <span class="pattern-settings-unit">cm</span>
+        </label>
+        <div class="pattern-settings-group" data-settings-extra="bridge" role="group" aria-label="Edges to pick">
+          ${EDGE_PAIR_MODES.map(
+            (entry) =>
+              `<button type="button" data-bridge-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
           ).join('')}
         </div>
       </div>
@@ -1348,6 +1319,37 @@ export class PatternEditor {
           ${CUT_MODES.map(
             (entry) =>
               `<button type="button" data-cut-mode="${entry.mode}" title="${CUT_TIPS[entry.mode]}">${entry.label}</button>`
+          ).join('')}
+        </div>
+      </div>
+      <div class="pattern-settings-set" data-settings-for="ruler" hidden>
+        <span class="pattern-settings-title">Ruler</span>
+        <div class="pattern-settings-group" role="group" aria-label="Ruler mode">
+          ${RULER_MODES.map(
+            (entry) =>
+              `<button type="button" data-ruler-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
+          ).join('')}
+        </div>
+        <!-- What the rail's ruler popup used to hold: the library of body
+             measurements a rule can be laid out at, so the tool that picks one
+             is the one that shows them. -->
+        <div class="pattern-settings-menu">
+          <button type="button" class="pattern-settings-open" data-menu-open="measurement" title="Lay the rule out at a body measurement, or at a free length" aria-haspopup="true" aria-expanded="false">Measurement… <span aria-hidden="true">▾</span></button>
+          <div class="pattern-settings-popover pattern-ruler-menu" data-menu-popover="measurement" hidden role="menu">
+            <div class="pattern-ruler-menu-search">
+              <input type="search" data-ruler-search autocomplete="off" spellcheck="false"
+                placeholder="Search people or measurements…" aria-label="Search people and measurements" />
+            </div>
+            <div class="pattern-ruler-menu-tree" data-ruler-tree role="tree"></div>
+          </div>
+        </div>
+      </div>
+      <div class="pattern-settings-set" data-settings-for="sew" hidden>
+        <span class="pattern-settings-title">Sew</span>
+        <div class="pattern-settings-group" role="group" aria-label="Sew mode">
+          ${EDGE_PAIR_MODES.map(
+            (entry) =>
+              `<button type="button" data-sew-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
           ).join('')}
         </div>
       </div>
@@ -1425,17 +1427,66 @@ export class PatternEditor {
       this.redraw();
     });
     this.sealOverlay(this.toolSettings);
+    // The ruler's measurement picker is a dropdown of the ribbon, beside its two
+    // tools: the library it lists is the one the tool is set to read.
+    this.rulerSearchInput = this.toolSettings.querySelector(
+      'input[data-ruler-search]'
+    ) as HTMLInputElement;
+    this.rulerTree = this.toolSettings.querySelector('[data-ruler-tree]') as HTMLElement;
+    this.rulerSearchInput.addEventListener('input', () => this.renderRulerMenu());
+    this.rulerTree.addEventListener('click', (e) => {
+      const item = (e.target as HTMLElement).closest(
+        'button[data-measure-id]'
+      ) as HTMLButtonElement | null;
+      if (!item || item.disabled) return;
+      e.preventDefault();
+      this.chooseRulerMeasurement(item.dataset.personId ?? '', item.dataset.measureId ?? '');
+    });
     this.toolSettings.querySelectorAll('button[data-add-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
       btn.addEventListener('click', () => this.setAddMode(btn.dataset.addMode as AddMode));
+    });
+    this.toolSettings.querySelectorAll('button[data-modify-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', () => this.setModifyMode(btn.dataset.modifyMode as ModifyMode));
+    });
+    this.toolSettings.querySelectorAll('button[data-sew-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', () => this.setSewMode(btn.dataset.sewMode as SewMode));
+    });
+    this.toolSettings.querySelectorAll('button[data-ruler-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', () => this.setRulerMode(btn.dataset.rulerMode as RulerMode));
     });
     this.toolSettings.querySelectorAll('button[data-cut-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
       btn.addEventListener('click', () => this.setCutMode(btn.dataset.cutMode as CutMode));
     });
+    // Every dropdown on the ribbon: Add's block library and SVG import beside
+    // its shapes, the measurement library beside the ruler's two tools.
+    this.toolSettings.querySelectorAll('button[data-menu-open]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleSettingsMenu(btn.dataset.menuOpen as SettingsMenuKey);
+      });
+    });
+    this.toolSettings.querySelector('[data-add-import]')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      this.hideSettingsMenus();
+      // A one-shot action rather than a mode: it hands over to the file picker
+      // and leaves the shape in hand alone.
+      this.svgFileInput.click();
+    });
+    this.bindSettingsMenuDismiss();
     this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
       btn.addEventListener('click', () => this.setJoinMode(btn.dataset.joinMode as JoinMode));
+    });
+    this.toolSettings.querySelectorAll('button[data-bridge-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', () => this.setBridgeMode(btn.dataset.bridgeMode as JoinMode));
     });
     this.toolSettings.querySelectorAll('button[data-join-fit]').forEach((el) => {
       const btn = el as HTMLButtonElement;
@@ -1632,6 +1683,7 @@ export class PatternEditor {
     this.sewBar.className = 'pattern-sew-bar';
     this.sewBar.hidden = true;
     this.sewBar.innerHTML = `
+      <span class="pattern-sew-title">Sew</span>
       <span data-sew-instruction></span>
       <button type="button" data-sew-reverse title="Reverse the order of the edges selected for this side">Reverse order</button>
       <button type="button" data-sew-next></button>
@@ -2086,8 +2138,8 @@ export class PatternEditor {
       }
       this.setRulerSelection(null);
       this.setSelectedBlock(null);
-      this.hideRulerMenu();
-      this.hideRailMenu();
+      this.hideSettingsMenus();
+      this.hideSettingsMenus();
       this.hideContextMenu();
       return;
     }
@@ -2096,7 +2148,7 @@ export class PatternEditor {
       this.advanceMultiSew();
       return;
     }
-    if (e.key === 'Enter' && this.tool === 'join' && !isTextEntry(e.target)) {
+    if (e.key === 'Enter' && this.isModify('join') && !isTextEntry(e.target)) {
       e.preventDefault();
       // Many mode: Enter is the Confirm edges button, then the commit.
       if (this.joinMode === 'many' && this.joinPhase === 'move' && this.joinMove.length > 0) {
@@ -2106,7 +2158,7 @@ export class PatternEditor {
       }
       return;
     }
-    if (e.key === 'Enter' && this.tool === 'bridge' && !isTextEntry(e.target)) {
+    if (e.key === 'Enter' && this.isModify('bridge') && !isTextEntry(e.target)) {
       e.preventDefault();
       if (this.bridgeMode === 'many' && this.bridgePhase === 'first' && this.bridgeFirst.length > 0) {
         this.toggleBridgeSide();
@@ -2140,7 +2192,7 @@ export class PatternEditor {
 
   /**
    * Single-key tool shortcuts, the way a vector editor's rail works: **V** move,
-   * **A** add, **C** cut, **S** sew, **M** measure.
+   * **A** add, **M** modify, **C** cut, **S** sew, **R** measure.
    *
    * They belong to the editor the keyboard is in — the one holding focus — since
    * a board can have a page and any number of containers open at once, each with
@@ -2160,13 +2212,15 @@ export class PatternEditor {
     e.stopPropagation();
     // Taking a tool up is walking back to the canvas: whatever popover was in
     // the way closes, the way Escape would close it.
-    this.hideRailMenu();
     this.hideZoomMenu();
+    this.hideSettingsMenus();
     this.hideContextMenu();
-    // Add and Cut come up in whatever mode they are set to: the mode is a
-    // setting, and the ribbon beside the canvas is where it is changed.
+    // Add, Modify, Cut and Ruler come up in whatever mode they are set to: the
+    // mode is a setting, and the ribbon beside the canvas is where it is changed.
     if (tool === 'add') this.setAddMode(this.addMode);
     else if (tool === 'cut') this.setCutMode(this.cutMode);
+    else if (tool === 'modify') this.setModifyMode(this.modifyMode);
+    else if (tool === 'ruler') this.setRulerMode(this.rulerMode);
     else this.setTool(tool);
     return true;
   }
@@ -2402,18 +2456,23 @@ export class PatternEditor {
 
   setTool(tool: PatternTool): void {
     this.tool = tool;
-    if (tool !== 'add') this.penStrokeId = null;
-    if (tool !== 'extrude') this.extrudeHover = null;
+    if (tool !== 'add') {
+      this.penStrokeId = null;
+      this.hideSettingsMenus();
+    }
     if (tool !== 'sew') {
       this.pendingSeam = null;
       this.hoverEdge = null;
       this.clearMultiSew();
     }
-    if (tool !== 'join') {
+    // Modify's three jobs each keep a draft of their own, and none of them
+    // survives walking away from it.
+    if (tool !== 'modify' || this.modifyMode !== 'extrude') this.extrudeHover = null;
+    if (tool !== 'modify' || this.modifyMode !== 'join') {
       this.hoverEdge = null;
       this.clearJoin();
     }
-    if (tool !== 'bridge') {
+    if (tool !== 'modify' || this.modifyMode !== 'bridge') {
       this.hoverEdge = null;
       this.clearBridge();
     }
@@ -2425,27 +2484,22 @@ export class PatternEditor {
     // Changing tools is walking away from anything in hand: a simplify preview
     // belongs to the tool it was started from.
     if (this.simplify) this.cancelSimplify();
-    if (tool !== 'ruler' && tool !== 'measure') {
-      this.hideRulerMenu();
-    }
     if (tool !== 'ruler') {
-      // A measurement armed for the ruler tool is meaningless elsewhere.
+      this.hideSettingsMenus();
+      // A measurement armed for the ruler is meaningless elsewhere.
       this.rulerArmed = null;
     }
-    if (tool !== 'measure') {
+    if (!this.isRuler('measure')) {
       // The measurement itself is document data and stays; this only drops the
       // session that was still adding to it.
-      this.measureDraftId = null;
-      this.measureChainTail = null;
-      this.measureHoverId = null;
-      this.measureSelection.clear();
+      this.dropMeasureSession();
     }
     if (!this.measureInteractive()) this.measureHoverId = null;
     this.syncRulerToolbar();
     this.syncMeasureBar();
     // Rulers and measurements are only interactive under the tools that work on
     // them; drop the inspector rather than leaving an invisible selection behind.
-    if (tool !== 'ruler' && tool !== 'move' && tool !== 'measure') {
+    if (tool !== 'ruler' && tool !== 'move') {
       this.selectedRulerId = null;
       this.hoverRulerId = null;
       this.syncRulerBar();
@@ -2457,9 +2511,7 @@ export class PatternEditor {
     for (const btn of Array.from(this.toolbar.querySelectorAll('button[data-tool]'))) {
       btn.classList.toggle('active', (btn as HTMLElement).dataset.tool === tool);
     }
-    // The ruler button fronts two tools, so it stays lit for both.
-    this.rulerBtn.classList.toggle('active', tool === 'ruler' || tool === 'measure');
-    this.syncRailMenus();
+    this.syncToolRail();
     this.applyCursor(null);
     this.redraw();
   }
@@ -2483,6 +2535,8 @@ export class PatternEditor {
   }
 
   private setSewMode(mode: SewMode): void {
+    // Choosing a mode puts away any dropdown opened from it.
+    this.hideSettingsMenus();
     if (this.sewMode !== mode) {
       this.pendingSeam = null;
       this.clearMultiSew();
@@ -2492,17 +2546,75 @@ export class PatternEditor {
     this.redraw();
   }
 
-  /** The Sew menu carries the mode, so this just keeps the bar and rail current. */
+  /** The ribbon carries the mode, so this keeps it, the bar and the rail current. */
   private syncSewToolbar(): void {
     this.syncSewBar();
-    this.syncRailMenus();
+    this.syncToolRail();
+    this.syncToolSettings();
   }
 
   /**
-   * Pick a mode of the tool in hand, and take that tool up: choosing Line from
-   * the Add menu or the ribbon is one click, not two.
+   * The ribbon's dropdowns, beside the modes of the tool that owns them. One at
+   * a time, closed by anything else being clicked or by the key that would take
+   * another tool up.
    */
+  private toggleSettingsMenu(which: SettingsMenuKey): void {
+    const open = this.settingsMenuOpen === which ? null : which;
+    this.hideSettingsMenus();
+    if (!open) return;
+    const popover = this.settingsPopover(open);
+    if (!popover) return;
+    if (open === 'block') {
+      // Built fresh each time it opens: the library it lists is the one loaded
+      // now.
+      popover.innerHTML = '';
+      this.renderBlockMenu(popover);
+    }
+    if (open === 'measurement') {
+      this.renderRulerMenu();
+      // Focus so you can type straight away; selecting means a new query
+      // replaces the old one instead of appending to it.
+      this.rulerSearchInput.focus();
+      this.rulerSearchInput.select();
+    }
+    popover.hidden = false;
+    this.settingsMenuOpen = open;
+    this.settingsMenuBtn(open)?.setAttribute('aria-expanded', 'true');
+    // Its popover floats over the panels below the ribbon, so the ribbon has to
+    // come up over them while one is open — they share the same corner.
+    this.toolSettings.classList.add('is-menu-open');
+  }
+
+  private hideSettingsMenus(): void {
+    if (!this.settingsMenuOpen) return;
+    this.settingsPopover(this.settingsMenuOpen)!.hidden = true;
+    this.settingsMenuBtn(this.settingsMenuOpen)?.setAttribute('aria-expanded', 'false');
+    this.settingsMenuOpen = null;
+    this.toolSettings.classList.remove('is-menu-open');
+  }
+
+  private settingsPopover(which: SettingsMenuKey): HTMLElement | null {
+    return this.toolSettings.querySelector(`[data-menu-popover="${which}"]`);
+  }
+
+  private settingsMenuBtn(which: SettingsMenuKey): HTMLButtonElement | null {
+    return this.toolSettings.querySelector(`button[data-menu-open="${which}"]`);
+  }
+
+  /** A click anywhere else, or a keystroke that is not in the popover, closes it. */
+  private bindSettingsMenuDismiss(): void {
+    if (this.settingsMenuDocPointerDown) return;
+    this.settingsMenuDocPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (this.toolSettings.contains(target)) return;
+      this.hideSettingsMenus();
+    };
+    document.addEventListener('pointerdown', this.settingsMenuDocPointerDown, true);
+  }
+
   private setAddMode(mode: AddMode): void {
+    // Choosing a mode puts away any dropdown opened from it.
+    this.hideSettingsMenus();
     this.addMode = mode;
     // A pen stroke belongs to the mode that started it.
     this.penStrokeId = null;
@@ -2511,11 +2623,84 @@ export class PatternEditor {
       return;
     }
     this.syncToolSettings();
-    this.syncRailMenus();
+    this.syncToolRail();
     this.redraw();
   }
 
+  /**
+   * Pick a mode of the Modify tool and take it up — Extrude, Join or Bridge —
+   * the way Add and Cut work.
+   */
+  private setModifyMode(mode: ModifyMode): void {
+    // Choosing a mode puts away any dropdown opened from it.
+    this.hideSettingsMenus();
+    if (mode !== this.modifyMode) {
+      // A draft belongs to the mode that started it, hover included.
+      this.hoverEdge = null;
+      this.extrudeHover = null;
+      this.clearJoin();
+      this.clearBridge();
+    }
+    this.modifyMode = mode;
+    if (this.tool !== 'modify') {
+      this.setTool('modify');
+      return;
+    }
+    this.syncModifyToolbar();
+    this.redraw();
+  }
+
+  /** True while the Modify tool is the one in hand and it is on `mode`. */
+  private isModify(mode: ModifyMode): boolean {
+    return this.tool === 'modify' && this.modifyMode === mode;
+  }
+
+  /**
+   * Pick a mode of the Ruler tool and take it up — the rule, or the measure
+   * line — the way Add, Modify and Cut work.
+   */
+  private setRulerMode(mode: RulerMode): void {
+    // The measurement picker belongs to the ruler it arms.
+    this.hideSettingsMenus();
+    if (mode !== this.rulerMode) {
+      // A session belongs to the mode that started it: the measure line's draft
+      // to the measure line, an armed body measurement to the ruler.
+      if (this.rulerMode === 'measure') this.dropMeasureSession();
+      else this.rulerArmed = null;
+    }
+    this.rulerMode = mode;
+    if (this.tool !== 'ruler') {
+      this.setTool('ruler');
+      return;
+    }
+    this.syncRulerToolbar();
+    this.syncMeasureBar();
+    this.redraw();
+  }
+
+  /** True while the Ruler tool is the one in hand and it is on `mode`. */
+  private isRuler(mode: RulerMode): boolean {
+    return this.tool === 'ruler' && this.rulerMode === mode;
+  }
+
+  /** Drop the measurement being built — document data it made stays put. */
+  private dropMeasureSession(): void {
+    this.measureDraftId = null;
+    this.measureChainTail = null;
+    this.measureHoverId = null;
+    this.measureSelection.clear();
+  }
+
+  /** The bar and the settings ribbon belong to the same hand. */
+  private syncModifyToolbar(): void {
+    this.syncJoinBar();
+    this.syncBridgeBar();
+    this.syncToolRail();
+  }
+
   private setCutMode(mode: CutMode): void {
+    // Choosing a mode puts away any dropdown opened from it.
+    this.hideSettingsMenus();
     this.cutMode = mode;
     this.cutNotice = null;
     this.clearCutDraft();
@@ -2527,11 +2712,6 @@ export class PatternEditor {
     this.redraw();
   }
 
-  /** What the Add tool is drawing, as the rail and the ribbon name it. */
-  private addModeLabel(): string {
-    return ADD_MODES.find((entry) => entry.mode === this.addMode)?.label ?? 'Rectangle';
-  }
-
   private clearCutDraft(): void {
     this.cutChain = [];
     this.cutChainHover = null;
@@ -2541,7 +2721,7 @@ export class PatternEditor {
 
   /** The rail button carries the mode's name; the ribbon carries the mode. */
   private syncCutToolbar(): void {
-    this.syncRailMenus();
+    this.syncToolRail();
     this.syncToolSettings();
     const btn = this.cutBtn;
     if (btn) btn.dataset.tip = CUT_TIPS[this.cutMode];
@@ -2585,7 +2765,10 @@ export class PatternEditor {
   }
 
   private bindToolbarTips(): void {
-    this.toolbar.querySelectorAll('button[data-tip]').forEach((btn) => {
+    // Every rail button, not only the ones with a tip written into the markup:
+    // the tools' tips name the mode they are set to, so they are written by
+    // `syncToolRail` as the mode changes. A button with no tip shows nothing.
+    this.toolbar.querySelectorAll('button[data-tip], button[data-tool]').forEach((btn) => {
       const el = btn as HTMLElement;
       el.addEventListener('mouseenter', () => this.showToolbarTip(el));
       el.addEventListener('mouseleave', () => this.hideToolbarTip());
@@ -3269,11 +3452,11 @@ export class PatternEditor {
       this.drawInsetLoop(this.cutInset);
     }
 
-    if (this.tool === 'join' && this.joinPreview.piece) {
+    if (this.isModify('join') && this.joinPreview.piece) {
       this.drawJoinPreview(this.joinPreview.piece);
     }
 
-    if (this.tool === 'bridge' && this.bridgePreview.piece) {
+    if (this.isModify('bridge') && this.bridgePreview.piece) {
       this.drawBridgePreview(this.bridgePreview.piece);
     }
 
@@ -5508,57 +5691,6 @@ export class PatternEditor {
   // measurement either rebinds the selected ruler or arms the tool for the next
   // one you drag out.
 
-  private bindRulerMenu(): void {
-    this.rulerBtn.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      this.hideToolbarTip();
-      // One press, one menu: the two tools are rows in it, so a click no longer
-      // has to guess whether you wanted the rule or the picker.
-      if (this.rulerMenu.hidden) this.showRulerMenu();
-      else this.hideRulerMenu();
-    });
-    // The rows that put a tool in hand.
-    this.rulerMenu.addEventListener('click', (e) => {
-      const row = (e.target as HTMLElement).closest(
-        'button[data-ruler-tool]'
-      ) as HTMLButtonElement | null;
-      if (!row) return;
-      e.preventDefault();
-      e.stopPropagation();
-      this.hideRulerMenu();
-      this.setTool(row.dataset.rulerTool === 'measure' ? 'measure' : 'ruler');
-    });
-  }
-
-  private showRulerMenu(): void {
-    this.rulerMenu.hidden = false;
-    this.rulerBtn.setAttribute('aria-expanded', 'true');
-    this.renderRulerMenu();
-    if (!this.rulerMenuDocPointerDown) {
-      this.rulerMenuDocPointerDown = (e: PointerEvent) => {
-        const t = e.target as Node;
-        if (this.rulerMenu.contains(t) || this.rulerBtn.contains(t)) return;
-        this.hideRulerMenu();
-      };
-      document.addEventListener('pointerdown', this.rulerMenuDocPointerDown, true);
-    }
-    // Focus so you can type straight away; selecting means a new query replaces
-    // the old one instead of appending to it.
-    this.rulerSearchInput.focus();
-    this.rulerSearchInput.select();
-  }
-
-  private hideRulerMenu(): void {
-    this.rulerMenu.hidden = true;
-    this.rulerBtn.setAttribute('aria-expanded', 'false');
-    if (this.rulerMenuDocPointerDown) {
-      document.removeEventListener('pointerdown', this.rulerMenuDocPointerDown, true);
-      this.rulerMenuDocPointerDown = null;
-    }
-  }
-
   /** Wrap every literal occurrence of the query tokens in `<mark>`. */
   private highlightText(text: string, tokens: string[]): DocumentFragment {
     const frag = document.createDocumentFragment();
@@ -5682,8 +5814,8 @@ export class PatternEditor {
 
   /** Apply a picked measurement to the selected ruler, or arm the tool with it. */
   private chooseRulerMeasurement(personId: string, fieldId: string): void {
-    this.hideRulerMenu();
-    this.setTool('ruler');
+    this.hideSettingsMenus();
+    this.setRulerMode('ruler');
 
     const ruler = this.selectedRuler();
     if (!personId || !fieldId) {
@@ -5733,11 +5865,13 @@ export class PatternEditor {
     const armed = this.rulerArmed;
     const field = armed ? measurementField(armed.fieldId) : null;
     const tip =
-      this.tool === 'measure'
-        ? 'Measure · click points and edges to add them, or drag a line across'
+      this.isRuler('measure')
+        ? 'Ruler · Measure line — click points and edges to add them, or drag a line across'
         : armed
           ? `Ruler · ${armed.personName} ${field?.label ?? armed.fieldId} — drag to place`
-          : 'Ruler & measure · click for either';
+          : this.tool === 'ruler'
+            ? 'Ruler · a real rule laid over the work'
+            : 'Ruler · ruler or measure line';
     this.rulerBtn.dataset.tip = tip;
     this.rulerBtn.setAttribute('aria-label', tip);
     this.rulerBtn.classList.toggle('is-armed', !!armed);
@@ -5774,9 +5908,9 @@ export class PatternEditor {
     return this.measures().find((measure) => measure.id === id) ?? null;
   }
 
-  /** Both the measure tool and Move can carry, hover and delete a readout. */
+  /** Both the measure line and Move can carry, hover and delete a readout. */
   private measureInteractive(): boolean {
-    return this.tool === 'measure' || this.tool === 'move';
+    return this.isRuler('measure') || this.tool === 'move';
   }
 
   /**
@@ -5906,7 +6040,7 @@ export class PatternEditor {
       // Shift gathers readouts up for a total instead of taking hold of one, so
       // several measurements can be summed without disturbing them. Only the
       // measure tool gathers: the bar that totals them belongs to it.
-      if (e.shiftKey && this.tool === 'measure') {
+      if (e.shiftKey && this.isRuler('measure')) {
         this.toggleMeasureSelected(hit.id);
         e.preventDefault();
         return;
@@ -6072,7 +6206,7 @@ export class PatternEditor {
   /** The measurement the measure bar is talking about, if the tool is in hand. */
   private syncMeasureBar(): void {
     if (!this.measureBar) return;
-    const active = this.tool === 'measure';
+    const active = this.isRuler('measure');
     this.measureBar.hidden = !active;
     if (!active) return;
     const readout = this.measureBar.querySelector('[data-measure-readout]') as HTMLElement;
@@ -6421,316 +6555,38 @@ export class PatternEditor {
   // — Placement —
 
   /**
-   * The rail's menus: the pen, the shapes and the library behind Add; extrude,
-   * join and bridge behind Modify; the two seams behind Sew. Each is one button
-   * with a popup beside it, and a row that opens a sub-view (the block library)
-   * hands the same popup over rather than opening a second one. A menu's mode
-   * rows set the mode *and* take the tool up, so picking one is one click.
+   * The rail buttons carry the tool in hand, and the tip that names what it is
+   * set to. Only the two whose tip depends on their mode need it written here —
+   * Add rests on nothing, and Cut's is written where its cutter is chosen.
    */
-  private railMenus(): RailMenuSpec[] {
-    return [
-      {
-        key: 'add',
-        label: 'Add',
-        tip: 'Add · pen, rectangle, circle, blocks, SVG',
-        icon: ICONS.add,
-        toolTip: () => (this.tool === 'add' ? `Add · ${this.addModeLabel()}` : null),
-        views: () => ({
-          tools: {
-            active: () => (this.tool === 'add' ? this.addMode : null),
-            choose: (id) => {
-              if (id === 'import') {
-                // A one-shot action rather than a tool: it hands over to the
-                // file picker and leaves whatever tool was in hand alone.
-                this.svgFileInput.click();
-                return;
-              }
-              this.setAddMode(id as AddMode);
-            },
-            entries: [
-              {
-                id: 'pen',
-                name: 'Pen',
-                desc: 'Click points down, close on the first',
-                icon: ICONS.pen,
-              },
-              {
-                id: 'rect',
-                name: 'Rectangle',
-                desc: 'Drag out a rectangular panel',
-                icon: ICONS.rect,
-              },
-              {
-                id: 'circle',
-                name: 'Circle',
-                desc: 'Drag out a round piece',
-                icon: ICONS.circle,
-              },
-              {
-                id: 'block',
-                name: 'Block…',
-                desc: 'Draft a piece from the block library',
-                icon: ICONS.block,
-                view: 'blocks',
-              },
-              {
-                id: 'import',
-                name: 'Import SVG…',
-                desc: 'Bring an SVG in as pattern pieces',
-                icon: ICONS.import,
-              },
-            ],
-          },
-          blocks: { render: (host) => this.renderBlockMenu(host) },
-        }),
-      },
-      {
-        key: 'modify',
-        label: 'Modify',
-        tip: 'Modify · extrude, join and bridge',
-        icon: ICONS.modify,
-        toolTip: () => {
-          if (this.tool === 'extrude') return 'Modify · Extrude edge';
-          if (this.tool === 'join') {
-            return this.joinMode === 'many' ? 'Modify · Join · Edge runs' : 'Modify · Join · One edge each';
-          }
-          if (this.tool === 'bridge') {
-            return this.bridgeMode === 'many'
-              ? 'Modify · Bridge · Edge runs'
-              : 'Modify · Bridge · One edge each';
-          }
-          return null;
-        },
-        views: () => ({
-          tools: {
-            active: () =>
-              this.tool === 'extrude' || this.tool === 'join' || this.tool === 'bridge' ? this.tool : null,
-            choose: (id) => {
-              // A fuse's settings (one edge or a run, warped or matched) live in
-              // the tool settings popover, so the row simply starts the tool.
-              if (id === 'extrude' || id === 'join') this.setTool(id as PatternTool);
-            },
-            entries: [
-              {
-                id: 'extrude',
-                name: 'Extrude edge…',
-                desc: 'Drag away from an edge to grow a parallel copy',
-                icon: ICONS.extrude,
-              },
-              {
-                id: 'join',
-                name: 'Join…',
-                desc: 'Fuse two pieces along picked edges',
-                icon: ICONS.join,
-              },
-              {
-                id: 'bridge',
-                name: 'Bridge…',
-                desc: 'Fill between picked edges without moving them',
-                icon: ICONS.bridge,
-                view: 'bridge',
-              },
-            ],
-          },
-          bridge: {
-            // The mode rows say what the bridge is set to, whether or not it is up yet.
-            active: () => this.bridgeMode,
-            choose: (id) => {
-              this.setBridgeMode(id as JoinMode);
-              this.setTool('bridge');
-            },
-            entries: [
-              { id: 'segment', name: 'One edge each', desc: 'Two pieces, one edge onto one edge' },
-              { id: 'many', name: 'Edge runs (many)', desc: 'Runs of whole edges, many to many' },
-            ],
-          },
-        }),
-      },
-      {
-        key: 'sew',
-        label: 'Sew',
-        tip: 'Sew · Segment',
-        icon: ICONS.sew,
-        toolTip: () =>
-          this.tool === 'sew' ? (this.sewMode === 'many' ? 'Sew · Many-to-many' : 'Sew · Segment') : null,
-        views: () => ({
-          tools: {
-            active: () => this.sewMode,
-            choose: (id) => {
-              this.setSewMode(id as SewMode);
-              this.setTool('sew');
-            },
-            entries: [
-              { id: 'segment', name: 'Segment sewing', desc: 'One edge onto one edge' },
-              { id: 'many', name: 'Many-to-many', desc: 'Runs of edges onto runs of edges' },
-            ],
-          },
-        }),
-      },
-    ];
-  }
-
-  private railMenuSpec(key: RailMenuKey): RailMenuSpec {
-    let spec = this.railMenuSpecs.get(key);
-    if (!spec) {
-      spec = this.railMenus().find((entry) => entry.key === key)!;
-      this.railMenuSpecs.set(key, spec);
-    }
-    return spec;
-  }
-
-  private railMenuBtn(key: RailMenuKey): HTMLButtonElement {
-    return this.toolbar.querySelector(`button[data-rail-menu="${key}"]`) as HTMLButtonElement;
-  }
-
-  private railMenuPopup(key: RailMenuKey): HTMLElement {
-    return this.toolbar.querySelector(`[data-rail-popup="${key}"]`) as HTMLElement;
-  }
-
-  private bindRailMenus(): void {
-    for (const spec of this.railMenus()) {
-      const btn = this.railMenuBtn(spec.key);
-      const popup = this.railMenuPopup(spec.key);
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.hideToolbarTip();
-        if (popup.hidden) {
-          // Only ever one menu at a time.
-          this.hideRailMenu();
-          this.showRailMenu(spec.key);
-        } else {
-          this.hideRailMenu();
+  private syncToolRail(): void {
+    const modify = this.toolbar.querySelector('button[data-tool="modify"]') as HTMLButtonElement | null;
+    if (modify) {
+      const name = MODIFY_MODES.find((entry) => entry.mode === this.modifyMode)?.label ?? 'Extrude';
+      let tip = 'Modify · extrude, join and bridge — pick the mode in the canvas ribbon';
+      if (this.tool === 'modify') {
+        if (this.modifyMode === 'extrude') tip = 'Modify · Extrude edge';
+        else {
+          // The fuse and the bridge read the run they are set to, since that is
+          // the choice the ribbon is holding.
+          const pair = this.modifyMode === 'join' ? this.joinMode : this.bridgeMode;
+          tip = `Modify · ${name} · ${pair === 'many' ? 'Edge runs' : 'One edge each'}`;
         }
-      });
-      popup.addEventListener('click', (e) => {
-        const target = e.target as HTMLElement;
-        if (target.closest('[data-menu-back]')) {
-          e.preventDefault();
-          this.renderRailMenu(spec.key, 'tools');
-          return;
-        }
-        const item = target.closest('button[data-menu-item]') as HTMLButtonElement | null;
-        if (!item) return;
-        e.preventDefault();
-        this.chooseRailEntry(spec.key, item.dataset.menuItem ?? '');
-      });
+      }
+      modify.dataset.tip = tip;
+      modify.setAttribute('aria-label', tip);
     }
-  }
 
-  private showRailMenu(key: RailMenuKey): void {
-    this.renderRailMenu(key, 'tools');
-    this.railMenuPopup(key).hidden = false;
-    this.railMenuBtn(key).setAttribute('aria-expanded', 'true');
-    if (!this.railMenuDocPointerDown) {
-      this.railMenuDocPointerDown = (e: PointerEvent) => {
-        const target = e.target as Node;
-        for (const spec of this.railMenus()) {
-          if (this.railMenuPopup(spec.key).contains(target) || this.railMenuBtn(spec.key).contains(target)) return;
-        }
-        this.hideRailMenu();
-      };
-      document.addEventListener('pointerdown', this.railMenuDocPointerDown, true);
-    }
-  }
-
-  private hideRailMenu(): void {
-    for (const spec of this.railMenus()) {
-      this.railMenuPopup(spec.key).hidden = true;
-      this.railMenuBtn(spec.key).setAttribute('aria-expanded', 'false');
-    }
-    if (this.railMenuDocPointerDown) {
-      document.removeEventListener('pointerdown', this.railMenuDocPointerDown, true);
-      this.railMenuDocPointerDown = null;
-    }
-  }
-
-  private renderRailMenu(key: RailMenuKey, viewName: string): void {
-    const spec = this.railMenuSpec(key);
-    const views = spec.views();
-    const view = views[viewName] ?? views.tools;
-    // Whichever view is on screen is the one a row click belongs to.
-    this.railMenuView.set(key, viewName);
-    const popup = this.railMenuPopup(key);
-    popup.innerHTML = '';
-    if (viewName !== 'tools') popup.appendChild(this.railBackRow(spec));
-    if (view.render) {
-      view.render(popup);
-      return;
-    }
-    const active = view.active?.() ?? null;
-    for (const entry of view.entries ?? []) popup.appendChild(this.railMenuRow(entry, active));
-  }
-
-  private railBackRow(spec: RailMenuSpec): HTMLButtonElement {
-    const back = document.createElement('button');
-    back.type = 'button';
-    back.role = 'menuitem';
-    back.className = 'pattern-menu-back';
-    back.dataset.menuBack = '';
-    back.textContent = `‹ ${spec.label}`;
-    return back;
-  }
-
-  private railMenuRow(entry: RailMenuEntry, active: string | null): HTMLButtonElement {
-    const item = document.createElement('button');
-    item.type = 'button';
-    item.role = 'menuitem';
-    item.dataset.menuItem = entry.id;
-    item.dataset.tip = entry.desc;
-    item.classList.toggle('is-active', entry.id === active);
-    if (entry.icon) {
-      item.classList.add('has-icon');
-      const icon = document.createElement('span');
-      icon.className = 'pattern-menu-icon';
-      icon.setAttribute('aria-hidden', 'true');
-      icon.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">${entry.icon}</svg>`;
-      const text = document.createElement('span');
-      text.className = 'pattern-menu-text';
-      const name = document.createElement('span');
-      name.className = 'pattern-menu-name';
-      name.textContent = entry.name;
-      const desc = document.createElement('span');
-      desc.className = 'pattern-menu-desc';
-      desc.textContent = entry.desc;
-      text.append(name, desc);
-      item.append(icon, text);
-      return item;
-    }
-    const name = document.createElement('span');
-    name.className = 'pattern-menu-name';
-    name.textContent = entry.name;
-    const desc = document.createElement('span');
-    desc.className = 'pattern-menu-desc';
-    desc.textContent = entry.desc;
-    item.append(name, desc);
-    return item;
-  }
-
-  private chooseRailEntry(key: RailMenuKey, id: string): void {
-    const views = this.railMenuSpec(key).views();
-    const view = views[this.railMenuView.get(key) ?? 'tools'] ?? views.tools;
-    const entry = (view.entries ?? []).find((candidate) => candidate.id === id);
-    if (!entry) return;
-    if (entry.view) {
-      this.renderRailMenu(key, entry.view);
-      return;
-    }
-    this.hideRailMenu();
-    view.choose?.(id);
-  }
-
-  /** The rail buttons carry the tool in hand; the open popup carries its mark. */
-  private syncRailMenus(): void {
-    for (const spec of this.railMenus()) {
-      const btn = this.railMenuBtn(spec.key);
-      const tip = spec.toolTip();
-      const text = tip ?? spec.tip;
-      btn.dataset.tip = text;
-      btn.setAttribute('aria-label', spec.label);
-      btn.classList.toggle('active', !!tip);
-      const view = this.railMenuView.get(spec.key) ?? 'tools';
-      if (!this.railMenuPopup(spec.key).hidden) this.renderRailMenu(spec.key, view);
+    const sew = this.toolbar.querySelector('button[data-tool="sew"]') as HTMLButtonElement | null;
+    if (sew) {
+      const tip =
+        this.tool === 'sew'
+          ? this.sewMode === 'many'
+            ? 'Sew · Many-to-many'
+            : 'Sew · Segment'
+          : 'Sew · one edge each or many to many — pick the mode in the canvas ribbon';
+      sew.dataset.tip = tip;
+      sew.setAttribute('aria-label', tip);
     }
   }
 
@@ -6768,7 +6624,7 @@ export class PatternEditor {
       desc.textContent = definition.description;
       item.append(name, desc);
       item.addEventListener('click', () => {
-        this.hideRailMenu();
+        this.hideSettingsMenus();
         this.addBlock(definition.id);
       });
       menu.appendChild(item);
@@ -7549,7 +7405,7 @@ export class PatternEditor {
     if (draft) this.drawMeasureLineDraft(draft);
     // The pick waiting for a partner, so the first click of a measurement is not
     // silent.
-    const tail = this.tool === 'measure' ? this.measureChainTail : null;
+    const tail = this.isRuler('measure') ? this.measureChainTail : null;
     if (tail) {
       const at = resolveMeasureAnchor(this.pattern.pieces, tail);
       if (at) {
@@ -8150,7 +8006,7 @@ export class PatternEditor {
 
     // Measure builds a measurement out of what you pick, or draws one across the
     // work; its readout is the handle for moving it.
-    if (this.tool === 'measure') {
+    if (this.isRuler('measure')) {
       this.onMeasureDown(e, p);
       return;
     }
@@ -8252,14 +8108,14 @@ export class PatternEditor {
 
     // Join works on edges too, and on whole ones: which half a click lands on
     // says nothing about a fuse, so the pick is the edge itself.
-    if (this.tool === 'join') {
+    if (this.isModify('join')) {
       this.setRulerSelection(null);
       this.onJoinDown(p);
       return;
     }
 
     // A bridge is picked the same way a fuse is, edge by whole edge.
-    if (this.tool === 'bridge') {
+    if (this.isModify('bridge')) {
       this.setRulerSelection(null);
       this.onBridgeDown(p);
       return;
@@ -8320,7 +8176,7 @@ export class PatternEditor {
       return;
     }
 
-    if (this.tool === 'extrude') {
+    if (this.isModify('extrude')) {
       this.onExtrudeDown(e, p);
       return;
     }
@@ -8841,6 +8697,9 @@ export class PatternEditor {
   }
 
   private syncSewBar(): void {
+    // The settings popover belongs to the same hand as this bar, so the two are
+    // kept current together — as they are for the fuse and the bridge.
+    this.syncToolSettings();
     if (!this.sewBar) return;
     const active = this.tool === 'sew' && this.sewMode === 'many';
     this.sewBar.hidden = !active;
@@ -9123,7 +8982,13 @@ export class PatternEditor {
 
   /** True while the tool in hand has settings of its own, which own the popover. */
   private hasToolSettings(): boolean {
-    return this.tool === 'join' || this.tool === 'cut' || this.tool === 'add';
+    return (
+      this.tool === 'modify' ||
+      this.tool === 'sew' ||
+      this.tool === 'cut' ||
+      this.tool === 'ruler' ||
+      this.tool === 'add'
+    );
   }
 
   /**
@@ -9135,6 +9000,13 @@ export class PatternEditor {
     // The allowance ribbon is showing an edge: the slot is taken.
     const showing = this.hasToolSettings() && !(this.allowanceOn && !!this.allowanceEdge);
     this.toolSettings.hidden = !showing;
+    // The block panel shares this corner, and it is the tall one: it starts
+    // below the ribbon rather than painting over it, which is what used to bury
+    // a tool's own controls as soon as a block was picked.
+    this.root.style.setProperty(
+      '--ribbon-height',
+      `${showing ? this.toolSettings.offsetHeight + 8 : 0}px`
+    );
     if (!showing) return;
 
     for (const set of Array.from(
@@ -9142,14 +9014,40 @@ export class PatternEditor {
     )) {
       set.hidden = set.dataset.settingsFor !== this.tool;
     }
+    // The settings that belong to one mode of the tool on screen — the fuse's
+    // run, fit and tolerance, the bridge's pair — beside the mode that spends
+    // them, so the ribbon never shows a control the tool will not read.
+    for (const extra of Array.from(
+      this.toolSettings.querySelectorAll<HTMLElement>('[data-settings-extra]')
+    )) {
+      extra.hidden = !(
+        this.tool === 'modify' && extra.dataset.settingsExtra === this.modifyMode
+      );
+    }
 
     this.toolSettings.querySelectorAll('button[data-add-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
       btn.classList.toggle('is-active', btn.dataset.addMode === this.addMode);
     });
+    this.toolSettings.querySelectorAll('button[data-modify-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.classList.toggle('is-active', btn.dataset.modifyMode === this.modifyMode);
+    });
+    this.toolSettings.querySelectorAll('button[data-sew-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.classList.toggle('is-active', btn.dataset.sewMode === this.sewMode);
+    });
+    this.toolSettings.querySelectorAll('button[data-bridge-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.classList.toggle('is-active', btn.dataset.bridgeMode === this.bridgeMode);
+    });
     this.toolSettings.querySelectorAll('button[data-cut-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
       btn.classList.toggle('is-active', btn.dataset.cutMode === this.cutMode);
+    });
+    this.toolSettings.querySelectorAll('button[data-ruler-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.classList.toggle('is-active', btn.dataset.rulerMode === this.rulerMode);
     });
     this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
       const btn = el as HTMLButtonElement;
@@ -9169,10 +9067,10 @@ export class PatternEditor {
     tolerance.closest('label')?.classList.toggle('is-disabled', !matching);
   }
 
-  /** The Modify menu carries the mode, so this just keeps the bar and rail current. */
+  /** The Join job's own settings live in the ribbon, so this keeps bar, rail and ribbon current. */
   private syncJoinToolbar(): void {
     this.syncJoinBar();
-    this.syncRailMenus();
+    this.syncToolRail();
   }
 
   /** Throw the picks away — Cancel, Escape, undo, or the tool going out of hand. */
@@ -9245,7 +9143,7 @@ export class PatternEditor {
    * either side without starting the pick again.
    */
   private toggleJoinSide(): void {
-    if (this.tool !== 'join' || this.joinMode !== 'many') return;
+    if (!this.isModify('join') || this.joinMode !== 'many') return;
     if (this.joinPhase === 'move') {
       if (this.joinMove.length === 0) return;
       this.joinPhase = 'keep';
@@ -9280,7 +9178,7 @@ export class PatternEditor {
     // kept current together.
     this.syncToolSettings();
     if (!this.joinBar) return;
-    const active = this.tool === 'join';
+    const active = this.isModify('join');
     this.joinBar.hidden = !active;
     if (!active) return;
     const instruction = this.joinBar.querySelector('[data-join-instruction]') as HTMLElement;
@@ -9532,7 +9430,7 @@ export class PatternEditor {
   /** The Modify menu carries the mode, so this just keeps the bar and rail current. */
   private syncBridgeToolbar(): void {
     this.syncBridgeBar();
-    this.syncRailMenus();
+    this.syncToolRail();
   }
 
   /** Throw the picks away — Cancel, Escape, undo, or the tool going out of hand. */
@@ -9611,7 +9509,7 @@ export class PatternEditor {
    * click, and the button is how the picking changes hands.
    */
   private toggleBridgeSide(): void {
-    if (this.tool !== 'bridge' || this.bridgeMode !== 'many') return;
+    if (!this.isModify('bridge') || this.bridgeMode !== 'many') return;
     if (this.bridgePhase === 'first') {
       if (this.bridgeFirst.length === 0) return;
       this.bridgePhase = 'second';
@@ -9631,8 +9529,11 @@ export class PatternEditor {
   }
 
   private syncBridgeBar(): void {
+    // The settings popover belongs to the same hand as this bar, so the two are
+    // kept current together — as they are for the fuse.
+    this.syncToolSettings();
     if (!this.bridgeBar) return;
-    const active = this.tool === 'bridge';
+    const active = this.isModify('bridge');
     this.bridgeBar.hidden = !active;
     if (!active) return;
     const instruction = this.bridgeBar.querySelector('[data-bridge-instruction]') as HTMLElement;
@@ -10316,7 +10217,7 @@ export class PatternEditor {
     }
 
     // Sew tool: hover highlight edges even when not dragging
-    if ((this.tool === 'sew' || this.tool === 'join' || this.tool === 'bridge') && !this.drag) {
+    if ((this.tool === 'sew' || this.isModify('join') || this.isModify('bridge')) && !this.drag) {
       const p = this.svgPoint(e);
       const hit = this.findNearestEdgeAcrossPieces(p);
       const next: HoverEdge | null = hit
@@ -10394,7 +10295,7 @@ export class PatternEditor {
 
     // Extrude tool: light up the edge a click would duplicate, so it is clear
     // which outline is about to grow a tab.
-    if (this.tool === 'extrude' && !this.drag) {
+    if (this.isModify('extrude') && !this.drag) {
       const next = this.extrudeEdgeAt(this.svgPoint(e));
       const changed =
         !!next !== !!this.extrudeHover ||
@@ -10429,7 +10330,7 @@ export class PatternEditor {
 
     // Hover feedback for rulers, and for the rotate zones beside a selection's
     // corner grips (ruler + move tools only).
-    if (!this.drag && (this.tool === 'ruler' || this.tool === 'move')) {
+    if (!this.drag && (this.isRuler('ruler') || this.tool === 'move')) {
       const point = this.svgPoint(e);
       const hit = this.findRulerHit(point);
       const next = hit?.id ?? null;
