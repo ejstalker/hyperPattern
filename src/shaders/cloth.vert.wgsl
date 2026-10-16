@@ -45,3 +45,29 @@ fn mainColored(input: VertexInputColor) -> VertexOutputColor {
     output.fragColor = input.color;
     return output;
 }
+
+// The alpha variants add the per-vertex opacity the renderer uploads for frozen
+// and ghosted pieces, and hand it to the fragment stage as a varying.
+struct VertexInputColorAlpha {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+    @location(3) alpha: f32,
+}
+
+struct VertexOutputColorAlpha {
+    @builtin(position) position: vec4<f32>,
+    @location(0) fragNormal: vec3<f32>,
+    @location(1) fragColor: vec3<f32>,
+    @location(2) fragAlpha: f32,
+}
+
+@vertex
+fn mainColorAlpha(input: VertexInputColorAlpha) -> VertexOutputColorAlpha {
+    var output: VertexOutputColorAlpha;
+    output.position = uniforms.viewProj * uniforms.model * vec4<f32>(input.position, 1.0);
+    output.fragNormal = (uniforms.model * vec4<f32>(input.normal, 0.0)).xyz;
+    output.fragColor = input.color;
+    output.fragAlpha = input.alpha;
+    return output;
+}

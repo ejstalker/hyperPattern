@@ -124,6 +124,34 @@ export class CpuMassSpringEngine implements ClothSimulator {
     this.cloth.applyFrozenState(state);
   }
 
+  setPieceGhosted(pieceId: string, ghosted: boolean): void {
+    this.cloth.setPieceGhosted(pieceId, ghosted);
+  }
+
+  isPieceGhosted(pieceId: string): boolean {
+    return this.cloth.isPieceGhosted(pieceId);
+  }
+
+  getGhostedPieceIds(): string[] {
+    return this.cloth.getGhostedPieceIds();
+  }
+
+  getAlphaBuffer(): GPUBuffer | null {
+    return this.cloth.getAlphaBuffer();
+  }
+
+  hasTranslucentPieces(): boolean {
+    return this.cloth.hasTranslucentPieces();
+  }
+
+  captureGhostState(): Record<string, number[]> {
+    return this.cloth.captureGhostState();
+  }
+
+  applyGhostState(state: Record<string, number[]> | null | undefined): void {
+    this.cloth.applyGhostState(state);
+  }
+
   setDragging(dragging: boolean): void {
     this.cloth.setDragging(dragging);
   }

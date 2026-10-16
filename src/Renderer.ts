@@ -25,6 +25,40 @@ export type RenderableCloth = Cloth | SimpleCloth | ClothSimulator;
 const CYLINDER_HEIGHT_WORLD = inchesToOrbitWorld(12);
 
 /**
+ * Vertex layout of the cloth pass: positions, normals, and the optional strain
+ * colors. The alpha variants append the per-vertex opacity buffer.
+ */
+const CLOTH_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
+    {
+        arrayStride: 12,
+        attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
+    },
+    {
+        arrayStride: 12,
+        attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }],
+    },
+    {
+        arrayStride: 12,
+        attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x3' }],
+    },
+];
+
+/**
+ * Color target of the translucent-cloth pass: plain source-over blending, and
+ * the same format as the canvas. The opaque and blended passes share one shader
+ * module and differ in entry point, so both record in the same render pass.
+ */
+function blendedClothTarget(format: GPUTextureFormat): GPUColorTargetState {
+    return {
+        format,
+        blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        },
+    };
+}
+
+/**
  * Flat alpha-blended quad overlay (the quadrant snap grid). Vertices are
  * triangle-list xyz triples in world space.
  */
@@ -44,6 +78,13 @@ export class Renderer {
     private renderPipeline: GPURenderPipeline | null = null;
     /** Cloth with optional per-vertex strain colors. */
     private clothPipeline: GPURenderPipeline | null = null;
+    /**
+     * The same cloth pass with per-vertex opacity: the opaque variant drops
+     * dimmed fragments, the blended variant keeps only them and leaves depth
+     * alone so the fabric behind a ghost still shows through.
+     */
+    private clothAlphaPipeline: GPURenderPipeline | null = null;
+    private clothAlphaBlendPipeline: GPURenderPipeline | null = null;
     private floorPipeline: GPURenderPipeline | null = null;
     private wireframePipeline: GPURenderPipeline | null = null;
     private linePipeline: GPURenderPipeline | null = null;
@@ -85,6 +126,8 @@ export class Renderer {
     private shading: ShadingMode = 'simple';
     private pbrPipeline: GPURenderPipeline | null = null;
     private pbrClothPipeline: GPURenderPipeline | null = null;
+    private pbrClothAlphaPipeline: GPURenderPipeline | null = null;
+    private pbrClothAlphaBlendPipeline: GPURenderPipeline | null = null;
     /** HDRI background + light probe, shared by every viewport. */
     private environment: Environment | null = null;
     private environmentUnsubscribe: (() => void) | null = null;
@@ -233,26 +276,7 @@ export class Renderer {
             vertex: {
                 module: this.vertexShader,
                 entryPoint: 'mainColored',
-                buffers: [
-                    {
-                        arrayStride: 12,
-                        attributes: [
-                            { shaderLocation: 0, offset: 0, format: 'float32x3' },
-                        ],
-                    },
-                    {
-                        arrayStride: 12,
-                        attributes: [
-                            { shaderLocation: 1, offset: 0, format: 'float32x3' },
-                        ],
-                    },
-                    {
-                        arrayStride: 12,
-                        attributes: [
-                            { shaderLocation: 2, offset: 0, format: 'float32x3' },
-                        ],
-                    },
-                ],
+                buffers: CLOTH_VERTEX_BUFFERS,
             },
             fragment: {
                 module: this.fragmentShader,
@@ -265,6 +289,58 @@ export class Renderer {
             },
             depthStencil: {
                 depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+
+        const clothAlphaBuffers: GPUVertexBufferLayout[] = [
+            ...CLOTH_VERTEX_BUFFERS,
+            {
+                arrayStride: 4,
+                attributes: [{ shaderLocation: 3, offset: 0, format: 'float32' }],
+            },
+        ];
+        this.clothAlphaPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: this.vertexShader,
+                entryPoint: 'mainColorAlpha',
+                buffers: clothAlphaBuffers,
+            },
+            fragment: {
+                module: this.fragmentShader,
+                entryPoint: 'mainColorAlpha',
+                targets: [{ format: this.format }],
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'none',
+            },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+        this.clothAlphaBlendPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: this.vertexShader,
+                entryPoint: 'mainColorAlpha',
+                buffers: clothAlphaBuffers,
+            },
+            fragment: {
+                module: this.fragmentShader,
+                entryPoint: 'mainColorAlphaBlend',
+                targets: [blendedClothTarget(this.format)],
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'none',
+            },
+            depthStencil: {
+                depthWriteEnabled: false,
                 depthCompare: 'less-equal',
                 format: 'depth24plus',
             },
@@ -399,6 +475,56 @@ export class Renderer {
             primitive: { topology: 'triangle-list', cullMode: 'none' },
             depthStencil: {
                 depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+
+        const pbrClothAlphaBuffers: GPUVertexBufferLayout[] = [
+            ...pbrVertexBuffers,
+            {
+                arrayStride: 12,
+                attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x3' }],
+            },
+            {
+                arrayStride: 4,
+                attributes: [{ shaderLocation: 3, offset: 0, format: 'float32' }],
+            },
+        ];
+        this.pbrClothAlphaPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: pbrVertexShader,
+                entryPoint: 'mainColorAlpha',
+                buffers: pbrClothAlphaBuffers,
+            },
+            fragment: {
+                module: pbrFragmentShader,
+                entryPoint: 'mainColorAlpha',
+                targets: [{ format: this.format }],
+            },
+            primitive: { topology: 'triangle-list', cullMode: 'none' },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+        this.pbrClothAlphaBlendPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: pbrVertexShader,
+                entryPoint: 'mainColorAlpha',
+                buffers: pbrClothAlphaBuffers,
+            },
+            fragment: {
+                module: pbrFragmentShader,
+                entryPoint: 'mainColorAlphaBlend',
+                targets: [blendedClothTarget(this.format)],
+            },
+            primitive: { topology: 'triangle-list', cullMode: 'none' },
+            depthStencil: {
+                depthWriteEnabled: false,
                 depthCompare: 'less-equal',
                 format: 'depth24plus',
             },
@@ -914,6 +1040,14 @@ export class Renderer {
             typeof (cloth as ClothSimulator).isStrainMapEnabled === 'function' &&
             !!(cloth as ClothSimulator).isStrainMapEnabled?.();
         lightingData[23] = useVertexColor ? 1.0 : 0.0;
+        // A frozen or ghosted piece dims its own vertices. The dimmed fragments
+        // are drawn by a second, blended pass over the same vertices, so the
+        // cloth is drawn twice and each pass keeps only its half of the pieces.
+        const alphaCloth = 'hasTranslucentPieces' in cloth ? (cloth as ClothSimulator) : null;
+        const alphaBuffer =
+            colorBuffer && alphaCloth?.hasTranslucentPieces?.()
+                ? alphaCloth.getAlphaBuffer?.() ?? null
+                : null;
         // PBR-only tail of the same buffer: view vector, roughness, exposure,
         // metallic, tone mapping operator.
         const eye = camera.getEyePosition();
@@ -942,8 +1076,11 @@ export class Renderer {
         
         // IMPORTANT: Create bind group AFTER buffer write to ensure it references updated buffer
         // Note: Bind groups just reference the buffer, they don't cache data
-        const pbrPipeline =
-            colorBuffer && this.pbrClothPipeline ? this.pbrClothPipeline : this.pbrPipeline;
+        const pbrPipeline = alphaBuffer
+            ? this.pbrClothAlphaPipeline!
+            : colorBuffer && this.pbrClothPipeline
+              ? this.pbrClothPipeline
+              : this.pbrPipeline;
         // PBR needs the environment's textures bound: while the HDRI is still
         // building (or absent) the frame keeps the simple shader.
         const clothEnvBindGroup =
@@ -954,14 +1091,29 @@ export class Renderer {
         const pbrAvailable = clothEnvBindGroup !== null;
         const clothPipeline = clothEnvBindGroup
             ? pbrPipeline!
-            : colorBuffer && this.clothPipeline
-              ? this.clothPipeline
-              : this.renderPipeline!;
+            : alphaBuffer
+              ? this.clothAlphaPipeline!
+              : colorBuffer && this.clothPipeline
+                ? this.clothPipeline
+                : this.renderPipeline!;
         const clothBindGroup = this.createBindGroup(
             clothPipeline,
             this.uniformBuffer!,
             this.lightingBuffer!
         );
+        const clothBlendPipeline = alphaBuffer
+            ? clothEnvBindGroup
+                ? this.pbrClothAlphaBlendPipeline
+                : this.clothAlphaBlendPipeline
+            : null;
+        // The blended pass runs on its own pipelines, so it gets its own bind
+        // groups rather than relying on layout equivalence between them.
+        const clothBlendBindGroup = clothBlendPipeline
+            ? this.createBindGroup(clothBlendPipeline, this.uniformBuffer!, this.lightingBuffer!)
+            : null;
+        const blendEnvBindGroup = clothBlendPipeline
+            ? this.pbrEnvBindGroup(clothBlendPipeline)
+            : null;
         
         const pass = encoder.beginRenderPass({
             colorAttachments: [
@@ -1001,20 +1153,43 @@ export class Renderer {
         // Wireframe mode draws the mesh edges only: seeing through the fabric is
         // the whole point of the mode.
         const drawFill = this.shading !== 'wireframe';
+        /**
+         * The dimmed half of the cloth draws last, over everything else: it does
+         * not write depth, so anything drawn after it would cover it up. Filled
+         * in below, once the cloth bind groups exist.
+         */
+        let drawTranslucentCloth: (() => void) | null = null;
         if (drawFill) {
+            const usesVertexColor =
+                clothPipeline === this.clothPipeline ||
+                clothPipeline === this.pbrClothPipeline ||
+                clothPipeline === this.clothAlphaPipeline ||
+                clothPipeline === this.pbrClothAlphaPipeline;
+            const bindClothBuffers = (bindGroup: GPUBindGroup) => {
+                pass.setBindGroup(0, bindGroup);
+                pass.setVertexBuffer(0, positionBuffer);
+                pass.setVertexBuffer(1, normalBuffer);
+                if (colorBuffer && usesVertexColor) pass.setVertexBuffer(2, colorBuffer);
+                if (alphaBuffer) pass.setVertexBuffer(3, alphaBuffer);
+                pass.setIndexBuffer(indexBuffer, cloth.getIndexFormat());
+            };
             if (clothEnvBindGroup) pass.setBindGroup(1, clothEnvBindGroup);
             pass.setPipeline(clothPipeline);
-            pass.setBindGroup(0, clothBindGroup);
-            pass.setVertexBuffer(0, positionBuffer);
-            pass.setVertexBuffer(1, normalBuffer);
-            if (
-                colorBuffer &&
-                (clothPipeline === this.clothPipeline || clothPipeline === this.pbrClothPipeline)
-            ) {
-                pass.setVertexBuffer(2, colorBuffer);
-            }
-            pass.setIndexBuffer(indexBuffer, cloth.getIndexFormat());
+            bindClothBuffers(clothBindGroup);
             pass.drawIndexed(cloth.getIndexCount());
+
+            if (clothBlendPipeline && clothBlendBindGroup) {
+                const blendPipeline = clothBlendPipeline;
+                const blendBindGroup = clothBlendBindGroup;
+                // Second pass over the same vertices: the opaque half discards
+                // here, the dimmed half blends over the finished scene.
+                drawTranslucentCloth = () => {
+                    if (blendEnvBindGroup) pass.setBindGroup(1, blendEnvBindGroup);
+                    pass.setPipeline(blendPipeline);
+                    bindClothBuffers(blendBindGroup);
+                    pass.drawIndexed(cloth.getIndexCount());
+                };
+            }
         }
 
         // The wireframe overlay: either the debug overlay the demo page asks for,
@@ -1253,6 +1428,8 @@ export class Renderer {
             [0.83, 0.63, 0.09, 0.55]
           );
         }
+
+        drawTranslucentCloth?.();
 
         pass.end();
         this.device.queue.submit([encoder.finish()]);

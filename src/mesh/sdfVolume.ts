@@ -1,5 +1,6 @@
 import { vec3 } from 'gl-matrix';
 import type { Particle } from '../physics/Particle';
+import { holdTangentialTravel } from '../physics/contactHold';
 
 const BASE_COLLISION_MARGIN = 0.05;
 export const SDF_MAGIC = 0x44494350; // 'PCSD' little-endian
@@ -87,11 +88,15 @@ export class SdfVolume {
    * geometry.
    */
   sampleAt(pos: vec3): number {
-    const rel = vec3.create();
-    vec3.sub(rel, pos, this.origin);
-    const fx = rel[0] / this.voxelSize;
-    const fy = rel[1] / this.voxelSize;
-    const fz = rel[2] / this.voxelSize;
+    return this.sampleXYZ(
+      (pos[0] - this.origin[0]) / this.voxelSize,
+      (pos[1] - this.origin[1]) / this.voxelSize,
+      (pos[2] - this.origin[2]) / this.voxelSize
+    );
+  }
+
+  /** {@link sampleAt} on raw grid coordinates — no vectors, no allocation. */
+  private sampleXYZ(fx: number, fy: number, fz: number): number {
     const [nx, ny, nz] = this.dim;
     if (fx < 0 || fy < 0 || fz < 0 || fx > nx - 1 || fy > ny - 1 || fz > nz - 1) {
       const cx = Math.max(0, Math.min(nx - 1, fx));
@@ -124,14 +129,19 @@ export class SdfVolume {
 
   gradientAt(pos: vec3, out: vec3): vec3 {
     const eps = this.voxelSize * 0.5;
-    const gx = (this.sampleAt(vec3.fromValues(pos[0] + eps, pos[1], pos[2])) -
-      this.sampleAt(vec3.fromValues(pos[0] - eps, pos[1], pos[2]))) /
+    // Central differences on grid coordinates: this runs for every particle of
+    // every contact pass, so it does not build throwaway vectors to do it.
+    const gx0 = (pos[0] - this.origin[0] - eps) / this.voxelSize;
+    const gy0 = (pos[1] - this.origin[1]) / this.voxelSize;
+    const gz0 = (pos[2] - this.origin[2]) / this.voxelSize;
+    const gx = (this.sampleXYZ(gx0 + eps / this.voxelSize, gy0, gz0) -
+      this.sampleXYZ(gx0 - eps / this.voxelSize, gy0, gz0)) /
       (2 * eps);
-    const gy = (this.sampleAt(vec3.fromValues(pos[0], pos[1] + eps, pos[2])) -
-      this.sampleAt(vec3.fromValues(pos[0], pos[1] - eps, pos[2]))) /
+    const gy = (this.sampleXYZ(gx0, gy0 + eps / this.voxelSize, gz0) -
+      this.sampleXYZ(gx0, gy0 - eps / this.voxelSize, gz0)) /
       (2 * eps);
-    const gz = (this.sampleAt(vec3.fromValues(pos[0], pos[1], pos[2] + eps)) -
-      this.sampleAt(vec3.fromValues(pos[0], pos[1], pos[2] - eps))) /
+    const gz = (this.sampleXYZ(gx0, gy0, gz0 + eps / this.voxelSize) -
+      this.sampleXYZ(gx0, gy0, gz0 - eps / this.voxelSize)) /
       (2 * eps);
     vec3.set(out, gx, gy, gz);
     if (vec3.squaredLength(out) < 1e-12) vec3.set(out, 0, 1, 0);
@@ -139,7 +149,11 @@ export class SdfVolume {
     return out;
   }
 
-  resolveParticle(p: Particle, edgeLength: number): boolean {
+  resolveParticle(
+    p: Particle,
+    edgeLength: number,
+    contact?: { hold?: number; stepSeconds?: number }
+  ): boolean {
     const margin =
       edgeLength <= 0 ? BASE_COLLISION_MARGIN : Math.max(BASE_COLLISION_MARGIN, edgeLength * 0.35);
     const pos = p.getPosition();
@@ -147,10 +161,13 @@ export class SdfVolume {
     if (dist >= margin) return false;
 
     const normal = this.gradientAt(pos, vec3.create());
+    holdTangentialTravel(p, normal, contact);
     // Cap correction — deep/wrong SDF samples (common after loading a volume for GPU)
     // were slamming every particle onto the isosurface each substep: shrink, jitter,
-    // and apparent loss of gravity.
-    const maxPush = Math.max(margin * 2, edgeLength > 0 ? edgeLength * 1.5 : margin * 2);
+    // and apparent loss of gravity. A fraction of an edge per call clears any
+    // penetration within a frame or two, where 1.5 edges at every substep is a
+    // shove that carries the cloth up and around the body instead.
+    const maxPush = Math.max(margin * 2, edgeLength > 0 ? edgeLength * 0.25 : margin * 2);
     const push = Math.min(margin - dist, maxPush);
     vec3.scaleAndAdd(pos, pos, normal, push);
 

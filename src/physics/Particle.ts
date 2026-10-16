@@ -4,6 +4,24 @@ const EPSILON = 1e-6;
 const BASE_COLLISION_MARGIN = 0.05; // Base margin for plane collision
 /** Default fraction of tangential velocity retained per contact (legacy). */
 const DEFAULT_CONTACT_FRICTION_RETAIN = 0.85;
+/**
+ * Grip up to this only damps sliding; above it the cloth starts to *hold*.
+ *
+ * The velocity model saturates: η = max(0, 1 − grip × 0.95) reaches zero at a
+ * grip of about 1.05, so anything past it slid exactly as much as 1.05 did. The
+ * top of the range is where a drape needs teeth — a skirt on a smooth body has
+ * nothing else holding it up — so past this point the contact also gives back
+ * the tangential travel it just made, up to fully static at
+ * `GRIP_SLIDE_LIMIT + GRIP_STATIC_SPAN`.
+ */
+export const GRIP_SLIDE_LIMIT = 2;
+const GRIP_STATIC_SPAN = 6;
+
+/** Share of each contact step's tangential travel a grip holds back (0–1). */
+export function contactHoldFromGrip(grip: number): number {
+  if (!(grip > GRIP_SLIDE_LIMIT)) return 0;
+  return Math.min(1, (grip - GRIP_SLIDE_LIMIT) / GRIP_STATIC_SPAN);
+}
 const FLOOR_NORMAL = vec3.fromValues(0, 1, 0);
 
 export class Particle {
@@ -22,6 +40,8 @@ export class Particle {
     private edgeLength: number = 0; // Distance to adjacent particles (for adaptive margin)
     /** Tangential velocity retain on contact (1 = ice, 0 = full stick). */
     private contactFrictionRetain = DEFAULT_CONTACT_FRICTION_RETAIN;
+    /** Share of a contact step's tangential travel held back (see `contactHoldFromGrip`). */
+    private contactHold = 0;
 
     constructor(
         position: vec3,
@@ -227,16 +247,23 @@ export class Particle {
     }
 
     /**
-     * Set contact grip in [0, 2] (higher = less sliding). Internally stored as
-     * tangential velocity retain = max(0, 1 − grip × 0.95).
+     * Set contact grip (higher = less sliding). The velocity part keeps its
+     * historical shape — retain = max(0, 1 − min(grip, 2) × 0.95) — so every
+     * grip up to 2 behaves exactly as it always has; above that the grip starts
+     * holding the particle's tangential travel as well.
      */
     setContactFriction(friction: number): void {
-        const g = Math.min(2, Math.max(0, friction));
-        this.contactFrictionRetain = Math.max(0, 1 - g * 0.95);
+        const g = Math.max(0, friction);
+        this.contactFrictionRetain = Math.max(0, 1 - Math.min(GRIP_SLIDE_LIMIT, g) * 0.95);
+        this.contactHold = contactHoldFromGrip(g);
     }
 
     getContactFrictionRetain(): number {
         return this.contactFrictionRetain;
+    }
+
+    getContactHold(): number {
+        return this.contactHold;
     }
     
     setSphereCollision(center: vec3, radius: number): void {

@@ -64,6 +64,8 @@ export type SimViewportRuntimeOptions = {
   onBeforeFreezeChange?: () => void;
   /** A piece was frozen or released: let the host persist / report it. */
   onFreezeChange?: (pieceId: string, frozen: boolean) => void;
+  /** A piece was ghosted or put back: let the host persist / report it. */
+  onGhostChange?: (pieceId: string, ghosted: boolean) => void;
   /** The selected pieces changed (primary first) — the split view mirrors it. */
   onSelectionChange?: (pieceIds: string[]) => void;
   /** Shared HDRI environment; without it there is no background or PBR probe. */
@@ -862,6 +864,7 @@ export class SimViewportRuntime {
     // Frozen pieces keep their captured pose even when a rebuild handed us a
     // different one (transform layout / cleared pose).
     this.cloth.applyFrozenState(this.sim.frozenPieces);
+    this.cloth.applyGhostState?.(this.sim.ghostedPieces);
     this.cloth.setStrainMapEnabled?.(this.strainMapEnabled);
     // The outline the sew tool picks against comes from the new mesh's boundary
     // tags, so it has to be re-indexed whenever the cloth is.
@@ -1322,6 +1325,7 @@ export class SimViewportRuntime {
     freezeBtn.type = 'button';
     freezeBtn.setAttribute('role', 'menuitem');
     freezeBtn.textContent = frozen ? 'Unfreeze piece' : 'Freeze piece';
+    freezeBtn.title = 'Hold this piece where it is — its seams still pull on the rest';
     freezeBtn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -1329,6 +1333,26 @@ export class SimViewportRuntime {
       this.togglePieceFrozen(pieceId);
     });
     menu.appendChild(freezeBtn);
+
+    // Ghosting is the stronger hold: the piece stays put and stops taking part
+    // in the simulation at all. Only offered by engines that implement it.
+    if (this.cloth?.setPieceGhosted) {
+      const ghosted = this.cloth.isPieceGhosted?.(pieceId) ?? false;
+      const ghostBtn = document.createElement('button');
+      ghostBtn.type = 'button';
+      ghostBtn.setAttribute('role', 'menuitem');
+      ghostBtn.textContent = ghosted ? 'Un-ghost piece' : 'Ghost piece';
+      ghostBtn.title = ghosted
+        ? 'Put this piece back into the simulation'
+        : 'Hold this piece and take it out of the simulation — no constraints, no contact';
+      ghostBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.closePieceMenu();
+        this.togglePieceGhosted(pieceId);
+      });
+      menu.appendChild(ghostBtn);
+    }
 
     // Keep presses inside the popover from reaching the dismiss listener.
     menu.addEventListener('pointerdown', (e) => e.stopPropagation());
@@ -1364,6 +1388,8 @@ export class SimViewportRuntime {
     const frozen = !this.cloth.isPieceFrozen(pieceId);
     this.options.onBeforeFreezeChange?.();
     this.cloth.setPieceFrozen(pieceId, frozen);
+    // Freezing clears any ghost on the piece, so keep both snapshots truthful.
+    if (frozen) this.syncGhostSnapshot();
     this.syncFrozenSnapshot();
     this.options.onFreezeChange?.(pieceId, frozen);
   }
@@ -1374,6 +1400,26 @@ export class SimViewportRuntime {
     const state = this.cloth.captureFrozenState();
     if (Object.keys(state).length === 0) delete this.sim.frozenPieces;
     else this.sim.frozenPieces = state;
+  }
+
+  private togglePieceGhosted(pieceId: string): void {
+    if (!this.cloth?.setPieceGhosted) return;
+    const ghosted = !(this.cloth.isPieceGhosted?.(pieceId) ?? false);
+    this.options.onBeforeFreezeChange?.();
+    this.cloth.setPieceGhosted(pieceId, ghosted);
+    // A ghosted piece is not frozen any more, so both snapshots move together.
+    this.syncFrozenSnapshot();
+    this.syncGhostSnapshot();
+    this.options.onGhostChange?.(pieceId, ghosted);
+    this.invalidate();
+  }
+
+  /** Mirror the live ghosted pieces (and their positions) onto the sim document. */
+  private syncGhostSnapshot(): void {
+    if (!this.cloth?.captureGhostState) return;
+    const state = this.cloth.captureGhostState();
+    if (Object.keys(state).length === 0) delete this.sim.ghostedPieces;
+    else this.sim.ghostedPieces = state;
   }
 
   async snapshotDataUrl(): Promise<string> {

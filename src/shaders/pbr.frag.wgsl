@@ -159,3 +159,40 @@ fn mainColored(input: FragmentInputColor) -> @location(0) vec4<f32> {
     let albedo = mix(lighting.diffuseColor, input.fragColor, lighting.useVertexColor);
     return vec4<f32>(shade(input.fragNormal, input.fragWorldPos, albedo), 1.0);
 }
+
+struct FragmentInputColorAlpha {
+    @location(0) fragNormal: vec3<f32>,
+    @location(1) fragWorldPos: vec3<f32>,
+    @location(2) fragColor: vec3<f32>,
+    @location(3) fragAlpha: f32,
+}
+
+/**
+ * The alpha-aware fragment stage. The cloth is one draw over the whole mesh, so
+ * a translucent piece is picked out per vertex: the opaque pass drops the
+ * dimmed fragments and the blended pass keeps only them. Which pass is running
+ * is the entry point, not a uniform, so both can be recorded in one pass.
+ */
+fn clothAlphaFragment(input: FragmentInputColorAlpha, blendedPass: bool) -> vec4<f32> {
+    let translucent = input.fragAlpha < 0.999;
+    if (translucent != blendedPass) {
+        discard;
+    }
+    let albedo = mix(lighting.diffuseColor, input.fragColor, lighting.useVertexColor);
+    return vec4<f32>(
+        shade(input.fragNormal, input.fragWorldPos, albedo),
+        select(1.0, input.fragAlpha, translucent),
+    );
+}
+
+/** Everything except the dimmed pieces. */
+@fragment
+fn mainColorAlpha(input: FragmentInputColorAlpha) -> @location(0) vec4<f32> {
+    return clothAlphaFragment(input, false);
+}
+
+/** Only the dimmed pieces, blended over what the opaque pass drew. */
+@fragment
+fn mainColorAlphaBlend(input: FragmentInputColorAlpha) -> @location(0) vec4<f32> {
+    return clothAlphaFragment(input, true);
+}

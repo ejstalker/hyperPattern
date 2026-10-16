@@ -28,8 +28,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // through the avatar or crumple into self-intersections.
   let maxDelta = max(params.maxSpeed * (1.0 / max(params.invH, 1e-4)), 1e-5);
   if (dlen > maxDelta && dlen > 1e-8) {
-    delta = delta * (maxDelta / dlen);
-    q = p + delta;
+    // Over budget: the cloth is being held back by its constraints, not moving
+    // freely, so this truncated correction is not travel and must not become
+    // speed. Adopting it instead leaves a gathered seam saturated at the
+    // velocity clamp, walking the cloth down the body for minutes on end. Keep
+    // the motion it already had, damped.
+    positions[i] = vec4<f32>(p + delta * (maxDelta / dlen), 0.0);
+    velocities[i] = vec4<f32>(velocities[i].xyz * params.velRetain, 0.0);
+    return;
   }
   var v = delta * params.invH;
   v = v * params.velRetain;

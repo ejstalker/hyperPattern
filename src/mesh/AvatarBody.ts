@@ -1,12 +1,20 @@
 import { vec3, mat4 } from 'gl-matrix';
 import { identity } from '../utils/math';
 import { closestPointOnTriangle, triangleNormal } from './triangleCollision';
+import { holdTangentialTravel } from '../physics/contactHold';
 import { floorLift } from './floorLift';
 import type { ObjMesh } from './loadObj';
 import type { Particle } from '../physics/Particle';
 import type { SdfVolume } from './sdfVolume';
 
 const BASE_COLLISION_MARGIN = 0.05;
+
+/**
+ * How many voxels around a mesh-baked volume's surface count as "near enough to
+ * ask the triangles": the SDF is accurate to about a voxel and a half there, and
+ * beyond this band its answer is a body's width of clearance either way.
+ */
+const SDF_PROXY_BAND_VOXELS = 3;
 
 type CollisionTri = {
   a: vec3;
@@ -46,11 +54,26 @@ export class AvatarBody {
   private readonly bestPointScratch = vec3.create();
   private readonly bestNormalScratch = vec3.create();
   private sdfVolume: SdfVolume | null = null;
+  /**
+   * True when `sdfVolume` was baked from *these* triangles.
+   *
+   * Such a volume is a proxy for the surface, not a second opinion about it:
+   * cheap enough to sample on the GPU every substep, but only as sharp as its
+   * voxels — a 48³ field over a 166 cm body reads the body's own surface a
+   * median of 4.8 cm outside where it is, and a garment resting against that
+   * hovers visibly off the body it was fitted to. So the per-frame pass keeps
+   * using the triangles and leaves the volume to the GPU. A volume that came
+   * from elsewhere (an imported SDF) may describe another shape entirely, and
+   * then the volume is the authority.
+   */
+  private sdfIsMeshProxy = false;
 
   private constructor() {}
 
-  setSdfVolume(volume: SdfVolume | null): void {
+  setSdfVolume(volume: SdfVolume | null, options?: { bakedFromThisMesh?: boolean }): void {
     this.sdfVolume = volume;
+    this.sdfIsMeshProxy =
+      volume !== null && (options?.bakedFromThisMesh ?? false) && this.collisionTris.length > 0;
   }
 
   usesSdfCollision(): boolean {
@@ -121,10 +144,11 @@ export class AvatarBody {
     return body;
   }
 
-  /** Build triangle spatial index when not using SDF collision. */
+  /** Build the triangle spatial index, unless a volume is the only collider. */
   buildCollisionGridIfNeeded(): void {
-    if (this.sdfVolume || this.grid.size > 0 || this.collisionTris.length === 0) return;
-    this.updateCellSizeFromBounds();
+    if (this.grid.size > 0 || this.collisionTris.length === 0) return;
+    if (this.sdfVolume && !this.sdfIsMeshProxy) return;
+    this.updateCellSizeFromMesh();
     this.buildSpatialGrid();
   }
 
@@ -211,19 +235,50 @@ export class AvatarBody {
 
     this.indexCount = mesh.indices.length;
     if (!skipSpatialGrid) {
-      this.updateCellSizeFromBounds();
+      this.updateCellSizeFromMesh();
       this.buildSpatialGrid();
     }
     this._uploadMesh = { positions, normals, indices: mesh.indices };
   }
 
-  /** Size grid cells from mesh bounds (~48 cells on the longest axis). */
-  private updateCellSizeFromBounds(): void {
+  /**
+   * Size grid cells from the mesh's own triangles — about two cells across.
+   *
+   * A query can only walk whole cells, so the cell size decides how much body a
+   * particle's contact test has to look at. Sizing cells from the bounds instead
+   * (this used to be `maxExtent / 48`, ~4 cm on the default avatar) leaves every
+   * cell far wider than a cloth collision margin is deep, and each particle then
+   * tested hundreds of triangles that were nowhere near it.
+   *
+   * The *median* triangle, not the mean: a generated body carries a handful of
+   * strips — hair, lashes — whose bounding boxes span tens of centimetres, and
+   * they drag the mean up far enough to leave one cell holding the whole body,
+   * which is worse than the bounds rule it replaces. The clamps bound the two
+   * failure directions: never coarser than the old rule (or a query box stops
+   * discriminating at all), never so fine that a big triangle is written into
+   * thousands of cells.
+   */
+  private updateCellSizeFromMesh(): void {
     const ex = this.boundsMax[0] - this.boundsMin[0];
     const ey = this.boundsMax[1] - this.boundsMin[1];
     const ez = this.boundsMax[2] - this.boundsMin[2];
     const maxExtent = Math.max(ex, ey, ez, 1e-3);
-    this.cellSize = Math.max(0.15, maxExtent / 48);
+    const spans: number[] = [];
+    for (const tri of this.collisionTris) {
+      spans.push(
+        Math.max(
+          Math.abs(tri.a[0] - tri.b[0]) + Math.abs(tri.a[0] - tri.c[0]),
+          Math.abs(tri.a[1] - tri.b[1]) + Math.abs(tri.a[1] - tri.c[1]),
+          Math.abs(tri.a[2] - tri.b[2]) + Math.abs(tri.a[2] - tri.c[2])
+        )
+      );
+    }
+    spans.sort((a, b) => a - b);
+    const medianSpan = spans[spans.length >> 1] ?? maxExtent / 48;
+    this.cellSize = Math.min(
+      Math.max(medianSpan * 0.5, maxExtent / 512),
+      maxExtent / 48
+    );
   }
 
   private _uploadMesh: {
@@ -285,7 +340,6 @@ export class AvatarBody {
 
   private buildSpatialGrid(): void {
     this.grid.clear();
-    const pad = 1;
     const maxSpan = 48;
 
     for (let ti = 0; ti < this.collisionTris.length; ti++) {
@@ -305,12 +359,12 @@ export class AvatarBody {
 
       const c0 = this.cellIndex(tMin);
       const c1 = this.cellIndex(tMax);
-      let ix0 = c0[0] - pad;
-      let iy0 = c0[1] - pad;
-      let iz0 = c0[2] - pad;
-      let ix1 = c1[0] + pad;
-      let iy1 = c1[1] + pad;
-      let iz1 = c1[2] + pad;
+      let ix0 = c0[0];
+      let iy0 = c0[1];
+      let iz0 = c0[2];
+      let ix1 = c1[0];
+      let iy1 = c1[1];
+      let iz1 = c1[2];
 
       if (ix1 - ix0 > maxSpan) {
         const mid = (ix0 + ix1) >> 1;
@@ -345,7 +399,10 @@ export class AvatarBody {
   }
 
   private queryCandidates(p: vec3, radius: number): readonly number[] {
-    const r = Math.ceil(radius / this.cellSize) + 1;
+    // `radius` is measured from anywhere inside the particle's own cell, so the
+    // walk only has to reach `floor(radius / cellSize) + 1` cells out; the extra
+    // cell is the one a triangle can poke into from beyond the radius.
+    const r = Math.floor(radius / this.cellSize) + 1;
     const cx = Math.floor(p[0] / this.cellSize);
     const cy = Math.floor(p[1] / this.cellSize);
     const cz = Math.floor(p[2] / this.cellSize);
@@ -388,16 +445,54 @@ export class AvatarBody {
     return Math.max(BASE_COLLISION_MARGIN, edgeLength * 0.35);
   }
 
-  /** Push a cloth particle to the exterior of the avatar mesh. */
-  resolveParticle(p: Particle, edgeLength: number): void {
-    if (this.sdfVolume) {
-      this.sdfVolume.resolveParticle(p, edgeLength);
+  /** Push a cloth particle to the exterior of the avatar. */
+  resolveParticle(
+    p: Particle,
+    edgeLength: number,
+    contact?: { hold?: number; stepSeconds?: number }
+  ): void {
+    if (!this.sdfVolume) {
+      this.resolveParticleAgainstMesh(p, edgeLength, contact);
+      return;
+    }
+    // A volume that came from somewhere else *is* the collider.
+    if (!this.sdfIsMeshProxy) {
+      this.sdfVolume.resolveParticle(p, edgeLength, contact);
+      return;
+    }
+    // A proxy volume (see `sdfIsMeshProxy`) is the broad phase: it answers
+    // "is this particle anywhere near a surface" in one fetch, so the exact
+    // triangles are only consulted in the band where they can differ. Outside
+    // that band the volume's answer is the same as the mesh's — a body is
+    // convex enough for that over a few voxels — and the band grows with the
+    // voxels, so a coarse volume is never trusted further than it is sharp.
+    const band = this.sdfVolume.voxelSize * SDF_PROXY_BAND_VOXELS;
+    if (Math.abs(this.sdfVolume.sampleAt(p.getPosition())) > band) {
+      this.sdfVolume.resolveParticle(p, edgeLength, contact);
       return;
     }
     this.buildCollisionGridIfNeeded();
+    if (this.grid.size === 0) {
+      this.sdfVolume.resolveParticle(p, edgeLength, contact);
+      return;
+    }
+    this.resolveParticleAgainstMesh(p, edgeLength, contact);
+  }
+
+  /** Push a cloth particle out of the body mesh. */
+  private resolveParticleAgainstMesh(
+    p: Particle,
+    edgeLength: number,
+    contact?: { hold?: number; stepSeconds?: number }
+  ): void {
+    this.buildCollisionGridIfNeeded();
     const pos = p.getPosition();
     const margin = this.collisionMargin(edgeLength);
-    const searchRadius = margin + 0.75;
+    // The margin alone. `queryCandidates` walks whole cells, so it already looks
+    // a cell or two past it; padding the radius on top of that (this used to add
+    // 0.75 world units — 7.5 cm — to a 5 mm margin) only costs triangles that
+    // cannot be in contact.
+    const searchRadius = margin;
     const candidates = this.queryCandidates(pos, searchRadius);
 
     // Reused, not allocated: this runs on every particle of every substep.
@@ -423,6 +518,7 @@ export class AvatarBody {
 
     if (!found || bestDistSq >= margin * margin) return;
 
+    holdTangentialTravel(p, bestNormal, contact);
     vec3.scaleAndAdd(pos, bestPoint, bestNormal, margin);
 
     const vel = p.getVelocity();

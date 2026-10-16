@@ -1,7 +1,7 @@
 import { vec3, quat, mat4 } from 'gl-matrix';
 import type { AvatarBody } from '../../../mesh/AvatarBody';
 import { Ground } from '../../../Ground';
-import { Particle } from '../../../physics/Particle';
+import { Particle, contactHoldFromGrip } from '../../../physics/Particle';
 import { identity } from '../../../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../../../project/types';
 import type { ClothCollider, ClothFloor, ClothSimulator } from '../../ClothSimulator';
@@ -19,6 +19,7 @@ import {
 import predictWgsl from './shaders/predict.wgsl?raw';
 import solveStretchWgsl from './shaders/solve_stretch.wgsl?raw';
 import solveAttachmentWgsl from './shaders/solve_attachment.wgsl?raw';
+import solveStitchVelocityWgsl from './shaders/solve_stitch_velocity.wgsl?raw';
 import applyDeltasWgsl from './shaders/apply_deltas.wgsl?raw';
 import finalizeWgsl from './shaders/finalize.wgsl?raw';
 import computeNormalsWgsl from './shaders/compute_normals.wgsl?raw';
@@ -27,6 +28,8 @@ import collideParticlesWgsl from './shaders/collide_particles.wgsl?raw';
 import strainLimitWgsl from './shaders/strain_limit.wgsl?raw';
 import resetLambdasWgsl from './shaders/reset_lambdas.wgsl?raw';
 import hashBuildWgsl from './shaders/hash_build.wgsl?raw';
+import { FROZEN_PIECE_OPACITY, GHOSTED_PIECE_OPACITY } from '../../pieceOpacity';
+import { ghostInverseMass } from '../../ghostMass';
 
 const DELTA_SCALE = 1 << 20;
 /**
@@ -35,6 +38,18 @@ const DELTA_SCALE = 1 << 20;
  * not a global velocity cap (which starved long/thin pieces).
  */
 const SEAM_RAMP_SECONDS = 6.0;
+
+/**
+ * How much softer a gathered row is at the start of its crowd range than at the
+ * floor.
+ *
+ * The fabric has folds to give, so compressing it is cheap — until it runs out,
+ * where it should stop. Making that a rigid wall instead lets the stitch squeeze
+ * the row against it every substep, and a sewn panel then buzzes and churns for
+ * as long as the sim runs. Softening the top of the range turns the wall into a
+ * gradient the fabric can settle into.
+ */
+const SEAM_CROWD_SOFTNESS = 60;
 const WG = 256;
 
 function groups(n: number): number {
@@ -125,8 +140,16 @@ export class XpbdGpuEngine implements ClothSimulator {
   private vertexPieceIds: string[];
   /** Pieces pinned by zeroing their inverse mass; they never gain velocity. */
   private frozenPieceIds = new Set<string>();
+  /**
+   * Pieces taken out of the simulation entirely (see `applyFrozenMasses`). A
+   * ghosted piece holds its pose and interacts with nothing: no constraints, no
+   * contact, and nothing of it pushes the fabric around it.
+   */
+  private ghostedPieceIds = new Set<string>();
   /** Un-frozen per-particle inverse mass, restored when a piece is released. */
   private restInvMasses: Float32Array;
+  /** Weight that puts a ghosted particle outside every solver's `wSum <= 0`. */
+  private ghostInvMass: number;
   private seamPairs: Array<[number, number]>;
 
   private substeps: number;
@@ -146,6 +169,8 @@ export class XpbdGpuEngine implements ClothSimulator {
   private totalMass = 100;
   private maxSpeed: number;
   private friction: number;
+  /** Substep length of the last stepped frame, for the per-frame contact pass. */
+  private lastSubstepSeconds = 1 / 60;
   private enableSelfCollision: boolean;
   private particleDiameter: number;
   private seamRampElapsed = 0;
@@ -167,6 +192,9 @@ export class XpbdGpuEngine implements ClothSimulator {
   private stretchIdxBuf!: GPUBuffer;
   private stretchRestBuf!: GPUBuffer;
   private stretchLambdaBuf!: GPUBuffer;
+  /** Per stretch edge: the crowd floor of a gathered row, 1 = ordinary fabric. */
+  private stretchSlackBuf!: GPUBuffer;
+  private bendSlackBuf!: GPUBuffer;
   /** Bend (cross-edge) constraints: opposite-vertex pair + rest distance. */
   private bendIdxBuf!: GPUBuffer;
   private bendRestBuf!: GPUBuffer;
@@ -184,6 +212,9 @@ export class XpbdGpuEngine implements ClothSimulator {
   private renderNrmBuf!: GPUBuffer;
   private colorBuffer!: GPUBuffer;
   private strainColorData!: Float32Array;
+  /** Per-vertex opacity for the renderer (see `updatePieceAlpha`). */
+  private alphaData!: Float32Array;
+  private alphaBuffer!: GPUBuffer;
   private stretchEdges: StrainEdge[] = [];
   private strainMapEnabled = false;
   private indexBuffer!: GPUBuffer;
@@ -262,6 +293,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.cpuVel = new Float32Array(this.nParticles * 3);
     this.invMasses = new Float32Array(this.topo.inverseMasses);
     this.restInvMasses = new Float32Array(this.invMasses);
+    this.ghostInvMass = ghostInverseMass(this.restInvMasses);
     this.radii = new Float32Array(this.topo.radii);
     this.edgeLengths = new Float32Array(this.topo.edgeLengths);
     this.indices = new Uint32Array(this.topo.indices);
@@ -347,18 +379,29 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.stretchColorOffsets = coloring.offsets;
     const stretchIdx = new Uint32Array(Math.max(this.nStretch, 1) * 2);
     const stretchRest = new Float32Array(Math.max(this.nStretch, 1));
+    const stretchSlack = new Float32Array(Math.max(this.nStretch, 1));
     for (let slot = 0; slot < this.nStretch; slot++) {
       const src = coloring.idx[slot]!;
       stretchIdx[slot * 2] = this.topo.stretch[src]!.i;
       stretchIdx[slot * 2 + 1] = this.topo.stretch[src]!.j;
       stretchRest[slot] = this.topo.stretch[src]!.rest;
+      stretchSlack[slot] = this.topo.stretch[src]!.slack ?? 1;
     }
     this.stretchIdxBuf = this.createBuf(stretchIdx.byteLength, usage, 'xpbd-stretch-idx');
     this.stretchRestBuf = this.createBuf(stretchRest.byteLength, usage, 'xpbd-stretch-rest');
+    this.stretchSlackBuf = this.createBuf(stretchSlack.byteLength, usage, 'xpbd-stretch-slack');
+    this.writeBuf(this.stretchSlackBuf, stretchSlack);
     this.stretchLambdaBuf = this.createBuf(
       Math.max(this.nStretch, 1) * 4,
       usage,
       'xpbd-stretch-lambda'
+    );
+    // Bends share the distance kernel but are never gathered: floor 1 = the
+    // two-sided constraint.
+    this.bendSlackBuf = this.createBuf(Math.max(this.nBend, 1) * 4, usage, 'xpbd-bend-slack');
+    this.writeBuf(
+      this.bendSlackBuf,
+      new Float32Array(Math.max(this.nBend, 1)).fill(1)
     );
     this.writeBuf(this.stretchIdxBuf, stretchIdx);
     this.writeBuf(this.stretchRestBuf, stretchRest);
@@ -440,6 +483,13 @@ export class XpbdGpuEngine implements ClothSimulator {
       GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       'xpbd-render-color'
     );
+    this.alphaData = new Float32Array(n).fill(1);
+    this.alphaBuffer = this.createBuf(
+      n * 4,
+      GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      'xpbd-render-alpha'
+    );
+    this.writeBuf(this.alphaBuffer, this.alphaData);
     this.indexBuffer = this.createBuf(
       this.indices.byteLength || 4,
       GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
@@ -515,6 +565,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.pipelines.hashScan = mk(hashBuildWgsl, 'scan');
     this.pipelines.hashScatter = mk(hashBuildWgsl, 'scatter');
     this.pipelines.attach = mk(solveAttachmentWgsl);
+    this.pipelines.stitchVelocity = mk(solveStitchVelocityWgsl);
     this.pipelines.applyDeltas = mk(applyDeltasWgsl);
     this.pipelines.finalize = mk(finalizeWgsl);
     this.pipelines.collideSdf = mk(collideSdfWgsl);
@@ -640,13 +691,6 @@ export class XpbdGpuEngine implements ClothSimulator {
         for (let it = 0; it < this.iterations; it++) this.dispatchStrainLimit(pass);
       }
 
-      // The fabric's own passes — stretch, bend, the strain limiter — reopen a
-      // closed seam every substep, because the gathered side has to travel as it
-      // folds. Give the stitch the same number of passes they get, after they
-      // have had theirs, so what is left is the fabric's resistance rather than
-      // the solver running out of turns.
-      for (let it = 0; it < this.iterations; it++) this.dispatchAttach(pass, seamProgress, h);
-
       {
         const uData = new ArrayBuffer(16);
         const f = new Float32Array(uData);
@@ -672,6 +716,24 @@ export class XpbdGpuEngine implements ClothSimulator {
         );
         pass.dispatchWorkgroups(groups(n));
       }
+
+      // The stitch has the last word on *where* the cloth is, and none at all on
+      // how fast it is going. The fabric's own passes — stretch, bend, the strain
+      // limiter — reopen a closed seam every substep, because the gathered side
+      // has to travel as it folds, so the stitch is re-solved here, on the
+      // committed positions, after they have all had their turn.
+      //
+      // It must not run before `finalize`: there a seam correction becomes the
+      // velocity of the pair (`v = delta / h`), so every substep the stitch
+      // re-promises the fabric its own pull as speed at the velocity clamp. That
+      // is what left a gathered seam buzzing and walking around the body.
+      this.dispatchAttach(pass, seamProgress, h, this.positionsBuf);
+
+      // ...and now that the cloth is where the stitch wants it, a closed stitch
+      // also refuses to let the pair part: position work alone leaves a taut
+      // seam's two rows free to separate at velocity every substep, which is
+      // jitter running along the stitch.
+      this.dispatchStitchVelocity(pass, seamProgress);
 
       // Body/floor contact after finalize so sew can't pull through the avatar.
       this.dispatchCollideSdf(pass, h);
@@ -709,8 +771,10 @@ export class XpbdGpuEngine implements ClothSimulator {
     idxBuf: GPUBuffer,
     restBuf: GPUBuffer,
     lambdaBuf: GPUBuffer,
+    slackBuf: GPUBuffer,
     compliance: number,
-    invH2: number
+    invH2: number,
+    crowdSoftness = 1
   ): void {
     if (colorOffsets.length <= 1) return;
     pass.setPipeline(this.pipelines.stretch);
@@ -726,6 +790,9 @@ export class XpbdGpuEngine implements ClothSimulator {
       f[2] = compliance;
       u32[3] = this.nParticles;
       f[4] = invH2;
+      // The crowd floor is per edge (the `slack` buffer); `crowdSoftness` says
+      // how much softer a gathered row is at the start of its crowd range.
+      f[5] = crowdSoftness;
       const u = this.uniform(`${label}-${c}`, uData);
       pass.setBindGroup(
         0,
@@ -736,6 +803,7 @@ export class XpbdGpuEngine implements ClothSimulator {
           { binding: 3, resource: { buffer: idxBuf } },
           { binding: 4, resource: { buffer: restBuf } },
           { binding: 5, resource: { buffer: lambdaBuf } },
+          { binding: 6, resource: { buffer: slackBuf } },
         ])
       );
       pass.dispatchWorkgroups(groups(count));
@@ -751,8 +819,10 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.stretchIdxBuf,
       this.stretchRestBuf,
       this.stretchLambdaBuf,
+      this.stretchSlackBuf,
       this.stretchCompliance,
-      invH2
+      invH2,
+      SEAM_CROWD_SOFTNESS
     );
   }
 
@@ -765,6 +835,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.bendIdxBuf,
       this.bendRestBuf,
       this.bendLambdaBuf,
+      this.bendSlackBuf,
       this.bendCompliance,
       invH2
     );
@@ -839,24 +910,37 @@ export class XpbdGpuEngine implements ClothSimulator {
     run(this.pipelines.hashScatter, [4, 5, 6], groups(this.nParticles));
   }
 
-  private dispatchAttach(pass: GPUComputePassEncoder, seamProgress: number, h: number): void {
+  private dispatchAttach(
+    pass: GPUComputePassEncoder,
+    seamProgress: number,
+    h: number,
+    /**
+     * Which of the two position buffers the stitch is solved against. Inside the
+     * substep that is `predicted`, the usual constraint target; once the step is
+     * committed it is `positions`, so the correction lands on the cloth the next
+     * substep starts from and never becomes the pair's velocity.
+     */
+    target: GPUBuffer = this.predictedBuf
+  ): void {
     if (this.nAttach === 0) return;
-    // One kernel, two jobs, and they want different budgets. While the seam is
-    // still wrapping, one pass may close only a fraction of this substep's
-    // travel budget: that — not a global velocity cap — is what stops a seam
-    // slamming through the body, and it is why long, thin pieces are no longer
-    // speed-starved on the way over. (Same threshold `encodeStep` calls
-    // "wrapping".)
+    // Same threshold `encodeStep` calls "wrapping".
     const t = Math.min(1, Math.max(0, seamProgress));
     const closed = t >= 0.999;
-    // Once it is closed the stitch gets the whole budget and full strength. It
-    // has to: the fabric's passes push a gathered pair apart between solves, so
-    // a seam that may only recover a sliver per pass settles where the two
-    // balance — which is a centimetre of daylight under a gathered skirt,
-    // instead of the fabric resting against the stitch.
+    // Once a seam is closed the stitch works at full strength. It has to: the
+    // fabric's passes push a gathered pair apart between solves, so a seam that
+    // may only recover a sliver per pass settles where the two balance — which
+    // was a centimetre of daylight under a gathered skirt, instead of the fabric
+    // resting against the stitch.
     const underRelax = closed ? 1 : 0.12 + 0.18 * t;
+    // How far one pass may move the pair. While wrapping, that is a share of the
+    // substep's travel budget split across the passes: not a global velocity cap,
+    // which starved long, thin pieces on the way over, but enough to stop a seam
+    // slamming through the body. Closed, the pair is already at its rest gap, so
+    // it gets a whole substep of travel — far more than the fabric can push it
+    // open by — because any tighter and the cap itself is what holds the stitch
+    // open.
     const maxClose = closed
-      ? Math.max(this.topo.avgEdgeLength * 0.08, this.maxSpeed * h)
+      ? Math.max(this.topo.avgEdgeLength * 0.5, this.maxSpeed * h)
       : Math.max(
           this.topo.avgEdgeLength * 0.08,
           this.maxSpeed * h / Math.max(1, this.iterations)
@@ -875,11 +959,41 @@ export class XpbdGpuEngine implements ClothSimulator {
       0,
       this.bg(this.pipelines.attach, [
         { binding: 0, resource: { buffer: u } },
-        { binding: 1, resource: { buffer: this.predictedBuf } },
+        { binding: 1, resource: { buffer: target } },
         { binding: 2, resource: { buffer: this.invMassBuf } },
         { binding: 3, resource: { buffer: this.seamIdxBuf } },
         { binding: 4, resource: { buffer: this.seamRestBuf } },
         { binding: 5, resource: { buffer: this.seamInitialBuf } },
+      ])
+    );
+    pass.dispatchWorkgroups(groups(this.nAttach));
+  }
+
+  /**
+   * Stop a closed stitch parting at velocity level (see the shader for why).
+   *
+   * Momentum-conserving and energy-removing by construction: only the pair's
+   * separating component is taken out, split by inverse mass.
+   */
+  private dispatchStitchVelocity(pass: GPUComputePassEncoder, seamProgress: number): void {
+    if (this.nAttach === 0) return;
+    const uData = new ArrayBuffer(32);
+    const f = new Float32Array(uData);
+    const u32 = new Uint32Array(uData);
+    u32[0] = this.nAttach;
+    u32[1] = this.nParticles;
+    u32[2] = seamProgress >= 0.999 ? 1 : 0;
+    f[3] = this.maxSpeed;
+    const u = this.uniform('stitch-velocity', uData);
+    pass.setPipeline(this.pipelines.stitchVelocity);
+    pass.setBindGroup(
+      0,
+      this.bg(this.pipelines.stitchVelocity, [
+        { binding: 0, resource: { buffer: u } },
+        { binding: 1, resource: { buffer: this.positionsBuf } },
+        { binding: 2, resource: { buffer: this.velocitiesBuf } },
+        { binding: 3, resource: { buffer: this.invMassBuf } },
+        { binding: 4, resource: { buffer: this.seamIdxBuf } },
       ])
     );
     pass.dispatchWorkgroups(groups(this.nAttach));
@@ -896,6 +1010,8 @@ export class XpbdGpuEngine implements ClothSimulator {
     u32[3] = this.meshObstacles.length;
     f[4] = this.floorY;
     f[5] = 0; // per-particle margin is computed in the shader
+    f[6] = contactHoldFromGrip(this.friction);
+    f[7] = h;
     const u = this.uniform('sdf', uData);
 
     pass.setPipeline(this.pipelines.collideSdf);
@@ -1023,7 +1139,10 @@ export class XpbdGpuEngine implements ClothSimulator {
       proxy.setContactFriction(this.friction);
       proxy.setEdgeLength(this.edgeLengths[i] ?? edge);
       proxy.groundCollision();
-      this.avatar.resolveParticle(proxy, this.edgeLengths[i] ?? edge);
+      this.avatar.resolveParticle(proxy, this.edgeLengths[i] ?? edge, {
+        hold: proxy.getContactHold(),
+        stepSeconds: this.lastSubstepSeconds,
+      });
       const dx = pos[0]! - x0;
       const dy = pos[1]! - y0;
       const dz = pos[2]! - z0;
@@ -1173,6 +1292,10 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.seamRampElapsed += clampedDt;
     const seamProgress = Math.min(1, this.seamRampElapsed / SEAM_RAMP_SECONDS);
     const h = clampedDt / this.substeps;
+    // The per-frame CPU contact pass corrects the same substep-sized slice of
+    // travel the GPU pass does, so a gripped contact takes back comparable
+    // ground in either engine.
+    this.lastSubstepSeconds = h;
 
     // Keep pos/vel resident on the GPU across frames unless CPU contact feedback
     // or an explicit edit (drag/reset) dirtied the CPU mirror.
@@ -1239,6 +1362,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       const particleMass = mass / Math.max(1, this.nParticles);
       const inv = particleMass > 0 ? 1 / particleMass : 0;
       this.restInvMasses.fill(inv);
+      this.ghostInvMass = ghostInverseMass(this.restInvMasses);
       this.applyFrozenMasses();
     }
   }
@@ -1272,6 +1396,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.cpuPos.set(this.cpuInitial);
     this.cpuVel.fill(0);
     this.frozenPieceIds.clear();
+    this.ghostedPieceIds.clear();
     this.applyFrozenMasses();
     this.seamRampElapsed = 0;
     this.dragging = false;
@@ -1493,8 +1618,12 @@ export class XpbdGpuEngine implements ClothSimulator {
       ? !this.frozenPieceIds.has(pieceId)
       : this.frozenPieceIds.has(pieceId);
     if (!changed) return;
-    if (frozen) this.frozenPieceIds.add(pieceId);
-    else this.frozenPieceIds.delete(pieceId);
+    if (frozen) {
+      this.frozenPieceIds.add(pieceId);
+      this.ghostedPieceIds.delete(pieceId);
+    } else {
+      this.frozenPieceIds.delete(pieceId);
+    }
     this.zeroPieceVelocity(pieceId);
     this.applyFrozenMasses();
     this.simStateDirty = true;
@@ -1502,6 +1631,72 @@ export class XpbdGpuEngine implements ClothSimulator {
 
   isPieceFrozen(pieceId: string): boolean {
     return this.frozenPieceIds.has(pieceId);
+  }
+
+  /**
+   * Ghost a piece: hold its pose and take it out of the simulation (see
+   * `applyFrozenMasses`). Freezing and ghosting are two answers to "hold this
+   * piece", so one replaces the other rather than stacking.
+   */
+  setPieceGhosted(pieceId: string, ghosted: boolean): void {
+    const changed = ghosted
+      ? !this.ghostedPieceIds.has(pieceId)
+      : this.ghostedPieceIds.has(pieceId);
+    if (!changed) return;
+    if (ghosted) {
+      this.ghostedPieceIds.add(pieceId);
+      this.frozenPieceIds.delete(pieceId);
+    } else {
+      this.ghostedPieceIds.delete(pieceId);
+    }
+    this.zeroPieceVelocity(pieceId);
+    this.applyFrozenMasses();
+    this.simStateDirty = true;
+  }
+
+  isPieceGhosted(pieceId: string): boolean {
+    return this.ghostedPieceIds.has(pieceId);
+  }
+
+  getGhostedPieceIds(): string[] {
+    return [...this.ghostedPieceIds];
+  }
+
+  captureGhostState(): Record<string, number[]> {
+    const state: Record<string, number[]> = {};
+    for (const pieceId of this.ghostedPieceIds) {
+      const positions = this.capturePiecePositions(pieceId);
+      if (positions) state[pieceId] = positions;
+    }
+    return state;
+  }
+
+  applyGhostState(state: Record<string, number[]> | null | undefined): void {
+    this.ghostedPieceIds.clear();
+    if (state) {
+      for (const [pieceId, positions] of Object.entries(state)) {
+        let count = 0;
+        for (const id of this.vertexPieceIds) if (id === pieceId) count++;
+        if (count === 0) continue;
+        // A remesh renumbers vertices, so only restore a saved pose when the
+        // per-piece vertex count still lines up.
+        if (positions.length === count * 3) {
+          let k = 0;
+          for (let i = 0; i < this.nParticles; i++) {
+            if (this.vertexPieceIds[i] !== pieceId) continue;
+            this.cpuPos[i * 3] = positions[k * 3]!;
+            this.cpuPos[i * 3 + 1] = positions[k * 3 + 1]!;
+            this.cpuPos[i * 3 + 2] = positions[k * 3 + 2]!;
+            k++;
+          }
+        }
+        this.ghostedPieceIds.add(pieceId);
+        this.frozenPieceIds.delete(pieceId);
+        this.zeroPieceVelocity(pieceId);
+      }
+    }
+    this.applyFrozenMasses();
+    this.simStateDirty = true;
   }
 
   getFrozenPieceIds(): string[] {
@@ -1562,14 +1757,55 @@ export class XpbdGpuEngine implements ClothSimulator {
     }
   }
 
-  /** Rebuild invMasses from the un-frozen rest values, zeroing pinned pieces. */
+  /**
+   * Rebuild invMasses from the rest values, with held pieces marked.
+   *
+   * A **frozen** piece gets w = 0: it stops integrating but stays in the solve,
+   * so its seams still pull on whatever it is sewn to. A **ghosted** piece gets
+   * the negative sentinel from `ghostInverseMass`, which every kernel already
+   * treats as "no weight": `wSum <= 0` skips any constraint with a ghosted end
+   * (stretch, bend, seam, the strain limiter), a self-collision pair with one
+   * ghosted side is skipped, and contact skips the particle itself (`w <= 0`).
+   * So one flag takes a piece out of the simulation without touching any
+   * constraint buffer — and a *frozen* piece is unaffected, because the kernels
+   * never see a negative weight from it.
+   */
   private applyFrozenMasses(): void {
     for (let i = 0; i < this.nParticles; i++) {
-      const frozen = this.frozenPieceIds.has(this.vertexPieceIds[i]!);
-      this.invMasses[i] = frozen ? 0 : this.restInvMasses[i]!;
+      const piece = this.vertexPieceIds[i]!;
+      if (this.ghostedPieceIds.has(piece)) this.invMasses[i] = this.ghostInvMass;
+      else if (this.frozenPieceIds.has(piece)) this.invMasses[i] = 0;
+      else this.invMasses[i] = this.restInvMasses[i]!;
     }
     this.writeBuf(this.invMassBuf, this.invMasses);
     this.writeMassEdgeBuffer();
+    this.updatePieceAlpha();
+  }
+
+  /**
+   * Refresh the per-vertex opacity the renderer reads: solid cloth, a dimmed
+   * frozen piece, a faint ghosted one. Every route that changes which pieces
+   * are held goes through `applyFrozenMasses`, so this stays in step with the
+   * simulation state.
+   */
+  private updatePieceAlpha(): void {
+    if (!this.alphaBuffer) return;
+    for (let i = 0; i < this.nParticles; i++) {
+      const piece = this.vertexPieceIds[i]!;
+      if (this.ghostedPieceIds.has(piece)) this.alphaData[i] = GHOSTED_PIECE_OPACITY;
+      else if (this.frozenPieceIds.has(piece)) this.alphaData[i] = FROZEN_PIECE_OPACITY;
+      else this.alphaData[i] = 1;
+    }
+    this.writeBuf(this.alphaBuffer, this.alphaData);
+  }
+
+  getAlphaBuffer(): GPUBuffer | null {
+    return this.alphaBuffer ?? null;
+  }
+
+  /** True while any piece is dimmed, so the renderer needs its blended pass. */
+  hasTranslucentPieces(): boolean {
+    return this.ghostedPieceIds.size > 0 || this.frozenPieceIds.size > 0;
   }
 
   setDragging(dragging: boolean): void {

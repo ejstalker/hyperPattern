@@ -371,8 +371,12 @@ export type SimParams = {
   /** Self-collision / SDF particle radius = scalar × avg edge length. */
   particleDiameterScalar?: number;
   /**
-   * Contact friction / grip (0–2).
-   * Tangential velocity retain ≈ max(0, 1 − friction × 0.95).
+   * Contact friction / grip (0–20).
+   *
+   * Up to 2 this is the historical model — tangential velocity retain ≈
+   * max(0, 1 − friction × 0.95), which reaches zero around 1.05. Above 2 the
+   * contact also holds back the tangential travel it just made, so the cloth
+   * sticks where it touches (fully static by about 8).
    */
   contactFriction?: number;
   enableSelfCollision?: boolean;
@@ -407,6 +411,12 @@ export type SimInstance = {
    * the cloth keeps draping and its seams stay live. Maps piece id → flat xyz.
    */
   frozenPieces?: Record<string, number[]>;
+  /**
+   * Pattern pieces taken out of the simulation, at the positions they held when
+   * they were ghosted. A ghosted piece keeps its pose and touches nothing: no
+   * constraints, no contact, no weight — the same shape as `frozenPieces`.
+   */
+  ghostedPieces?: Record<string, number[]>;
 };
 
 export type CanvasNodeBase = {

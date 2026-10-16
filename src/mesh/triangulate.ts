@@ -844,13 +844,50 @@ export function triangulatePattern(
   return mergeMeshes(meshes);
 }
 
-export type SeamParticlePair = { a: number; b: number; restCm: number };
+export type SeamParticlePair = {
+  a: number;
+  b: number;
+  restCm: number;
+  /**
+   * How far the fabric running along side `a` may crowd, as a share of its rest
+   * edge length. Set only when this side is the longer of the two the seam
+   * joins — the side with fabric to give — and only when the lengths actually
+   * differ. Absent means the row behaves like ordinary two-sided fabric.
+   */
+  crowdA?: number;
+  crowdB?: number;
+};
+
+/**
+ * A seam longer than this against its partner is a gather: the fabric on the
+ * long side has to take up the difference. Below it the two sides are the same
+ * length to within hand-drawing tolerance, so nothing needs to give.
+ */
+const GATHER_RATIO_LIMIT = 0.97;
+/** Never let a gathered row crowd past this share of its rest length. */
+const MIN_CROWD_FLOOR = 0.25;
+
+/** Polyline length of one side of a seam, in the mesh's own units. */
+function edgeLength(verts: Array<{ index: number }>, vertices: Array<{ x: number; y: number }>): number {
+  let total = 0;
+  for (let i = 1; i < verts.length; i++) {
+    const p0 = vertices[verts[i - 1].index];
+    const p1 = vertices[verts[i].index];
+    if (!p0 || !p1) continue;
+    total += Math.hypot(p1.x - p0.x, p1.y - p0.y);
+  }
+  return total;
+}
 
 /**
  * Resolve pattern seams into particle index pairs using mesh boundary tags.
  *
  * When seam-aware meshing matched both sides' counts, this is a pure zip.
  * Otherwise picks distinct evenly-spaced verts (no many-to-one duplicates).
+ *
+ * Pairs on a gathered seam also carry the crowd floor of the side with fabric
+ * to give, so the solver can let that row fold into the slack instead of
+ * fighting the stitch — see `buildClothTopology`.
  */
 export function resolveSeamParticlePairs(
   pattern: PatternDocument | undefined,
@@ -883,6 +920,16 @@ export function resolveSeamParticlePairs(
     const idxA = pickDistinctIndices(sortA.length, nPairs);
     const idxB = pickDistinctIndices(sortB.length, nPairs);
 
+    // How much shorter one side is than the other decides whether this seam
+    // gathers at all, and how far the long side's row has to crowd.
+    const lenA = edgeLength(sortA, mesh.vertices);
+    const lenB = edgeLength(sortB, mesh.vertices);
+    const longest = Math.max(lenA, lenB);
+    const ratio = longest > 1e-9 ? Math.min(lenA, lenB) / longest : 1;
+    const crowdFloor = ratio < GATHER_RATIO_LIMIT ? Math.max(ratio, MIN_CROWD_FLOOR) : null;
+    const crowdA = crowdFloor !== null && lenA >= lenB ? crowdFloor : undefined;
+    const crowdB = crowdFloor !== null && lenB > lenA ? crowdFloor : undefined;
+
     for (let i = 0; i < nPairs; i++) {
       const ia = sortA[idxA[i]].index;
       const ib = sortB[idxB[i]].index;
@@ -890,7 +937,10 @@ export function resolveSeamParticlePairs(
       const key = ia < ib ? `${ia}_${ib}` : `${ib}_${ia}`;
       if (globalSeen.has(key)) continue;
       globalSeen.add(key);
-      pairs.push({ a: ia, b: ib, restCm });
+      const pair: SeamParticlePair = { a: ia, b: ib, restCm };
+      if (crowdA !== undefined) pair.crowdA = crowdA;
+      if (crowdB !== undefined) pair.crowdB = crowdB;
+      pairs.push(pair);
     }
   }
 

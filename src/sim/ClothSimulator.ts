@@ -63,6 +63,18 @@ export interface ClothSimulator extends ClothRenderExtras {
   setPieceFrozen(pieceId: string, frozen: boolean): void;
   isPieceFrozen(pieceId: string): boolean;
   getFrozenPieceIds(): string[];
+  /**
+   * Hold a piece *and* take it out of the simulation: it keeps its pose, but
+   * none of its constraints, contact or weight touches the rest of the cloth.
+   * Freeze and ghost are alternatives — one replaces the other.
+   */
+  setPieceGhosted?(pieceId: string, ghosted: boolean): void;
+  isPieceGhosted?(pieceId: string): boolean;
+  getGhostedPieceIds?(): string[];
+  /** Live positions of every ghosted piece, keyed by piece id (flat xyz). */
+  captureGhostState?(): Record<string, number[]>;
+  /** Re-ghost pieces on a freshly built cloth, at their saved positions. */
+  applyGhostState?(state: Record<string, number[]> | null | undefined): void;
   /** Live positions of every frozen piece, keyed by piece id (flat xyz). */
   captureFrozenState(): Record<string, number[]>;
   /**
@@ -99,6 +111,10 @@ export interface ClothSimulator extends ClothRenderExtras {
 
   /** Per-vertex RGB for strain visualization (same count as particles). */
   getColorBuffer?(): GPUBuffer | null;
+  /** Per-vertex opacity (one f32 per vertex) for frozen / ghosted pieces. */
+  getAlphaBuffer?(): GPUBuffer | null;
+  /** True while some piece is not fully opaque, so the blended pass is needed. */
+  hasTranslucentPieces?(): boolean;
   setStrainMapEnabled?(enabled: boolean): void;
   isStrainMapEnabled?(): boolean;
 }

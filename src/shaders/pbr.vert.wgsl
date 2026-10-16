@@ -55,3 +55,32 @@ fn mainColored(input: VertexInputColor) -> VertexOutputColor {
     output.fragColor = input.color;
     return output;
 }
+
+// The alpha variants carry the per-vertex opacity uploaded for frozen and
+// ghosted pieces through to the blended pass.
+struct VertexInputColorAlpha {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+    @location(3) alpha: f32,
+}
+
+struct VertexOutputColorAlpha {
+    @builtin(position) position: vec4<f32>,
+    @location(0) fragNormal: vec3<f32>,
+    @location(1) fragWorldPos: vec3<f32>,
+    @location(2) fragColor: vec3<f32>,
+    @location(3) fragAlpha: f32,
+}
+
+@vertex
+fn mainColorAlpha(input: VertexInputColorAlpha) -> VertexOutputColorAlpha {
+    var output: VertexOutputColorAlpha;
+    let world = uniforms.model * vec4<f32>(input.position, 1.0);
+    output.position = uniforms.viewProj * world;
+    output.fragWorldPos = world.xyz;
+    output.fragNormal = (uniforms.model * vec4<f32>(input.normal, 0.0)).xyz;
+    output.fragColor = input.color;
+    output.fragAlpha = input.alpha;
+    return output;
+}

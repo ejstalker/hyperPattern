@@ -3,6 +3,7 @@ import { Particle } from '../physics/Particle';
 import { SpringDamper } from '../physics/SpringDamper';
 import { Triangle } from '../physics/Triangle';
 import { Ground } from '../Ground';
+import { FROZEN_PIECE_OPACITY, GHOSTED_PIECE_OPACITY } from './pieceOpacity';
 import type { AvatarBody } from '../mesh/AvatarBody';
 import { identity } from '../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../project/types';
@@ -61,12 +62,25 @@ export class PatternCloth {
   private vertexPieceIds: string[] = [];
   /** Pieces pinned at their captured pose; their particles never integrate. */
   private frozenPieceIds = new Set<string>();
+  /**
+   * Pieces taken out of the simulation: pinned like a frozen piece, but their
+   * seam springs are dropped too, so nothing of theirs pulls on the fabric
+   * around them (their own springs are already inert — a pinned particle takes
+   * no force).
+   */
+  private ghostedPieceIds = new Set<string>();
   private connections: SpringDamper[] = [];
   private bendSprings: SpringDamper[] = [];
   private seamSprings: SpringDamper[] = [];
   private seamRestLengths: Array<{ initial: number; target: number }> = [];
   /** Particle index pairs for seam visualization (a,b,a,b,...). */
   private seamPairIndices: Array<[number, number]> = [];
+  /**
+   * Every seam the mesh was built with, untouched. `rebuildSeamSprings`
+   * derives the live springs from this list, so un-ghosting a piece can bring
+   * its seams back.
+   */
+  private seamSpecs: Array<{ a: number; b: number; rest: { initial: number; target: number } }> = [];
   private seamRampElapsed = 0;
   private seamSpringTarget = 0;
   private triangles: Triangle[] = [];
@@ -108,6 +122,9 @@ export class PatternCloth {
   private positionBuffer: GPUBuffer | null = null;
   private normalBuffer: GPUBuffer | null = null;
   private colorBuffer: GPUBuffer | null = null;
+  /** Per-vertex opacity for the renderer (see `updatePieceAlpha`). */
+  private alphaData: Float32Array | null = null;
+  private alphaBuffer: GPUBuffer | null = null;
   private indexBuffer: GPUBuffer | null = null;
   private wireframeEdgeBuffer: GPUBuffer | null = null;
   private wireframeEdgeCount = 0;
@@ -225,25 +242,16 @@ export class PatternCloth {
       p.setContactFriction(this.contactFriction);
     }
 
-    this.seamPairIndices = [];
+    this.seamSpecs = topo.seamConstraints.map((sc) => ({
+      a: sc.i,
+      b: sc.j,
+      rest: { initial: sc.initialDist, target: sc.rest },
+    }));
     this.seamSprings = [];
     this.seamRestLengths = [];
+    this.seamPairIndices = [];
     this.seamRampElapsed = 0;
-    for (const sc of topo.seamConstraints) {
-      const a = sc.i;
-      const b = sc.j;
-      this.seamSprings.push(
-        new SpringDamper(
-          this.particles[a],
-          this.particles[b],
-          this.seamSpringTarget * 0.35,
-          this.dampingConst * 1.5,
-          sc.initialDist
-        )
-      );
-      this.seamRestLengths.push({ initial: sc.initialDist, target: sc.rest });
-      this.seamPairIndices.push([a, b]);
-    }
+    this.rebuildSeamSprings();
 
     this.indices = Array.from(topo.indices);
     this.indexCount = this.indices.length;
@@ -299,6 +307,13 @@ export class PatternCloth {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     this.syncStrainColors(true);
+
+    this.alphaData = new Float32Array(this.particles.length).fill(1);
+    this.alphaBuffer = this.device.createBuffer({
+      size: this.alphaData.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.updatePieceAlpha();
 
     const idx = new Uint32Array(this.indices);
     this.indexBuffer = this.device.createBuffer({
@@ -577,10 +592,118 @@ export class PatternCloth {
    * springs still push on the other end, so sewing stays live.
    */
   setPieceFrozen(pieceId: string, frozen: boolean): void {
-    if (frozen) this.frozenPieceIds.add(pieceId);
-    else this.frozenPieceIds.delete(pieceId);
+    if (frozen) {
+      this.frozenPieceIds.add(pieceId);
+      this.ghostedPieceIds.delete(pieceId);
+      this.rebuildSeamSprings();
+    } else {
+      this.frozenPieceIds.delete(pieceId);
+    }
     this.pinPieces();
     this.syncBuffers();
+  }
+
+  /**
+   * Ghost a piece: hold its pose and take it out of the simulation. Freezing
+   * and ghosting are two answers to "hold this piece", so one replaces the
+   * other rather than stacking.
+   */
+  setPieceGhosted(pieceId: string, ghosted: boolean): void {
+    if (ghosted) {
+      this.ghostedPieceIds.add(pieceId);
+      this.frozenPieceIds.delete(pieceId);
+    } else {
+      this.ghostedPieceIds.delete(pieceId);
+    }
+    this.pinPieces();
+    this.rebuildSeamSprings();
+    this.syncBuffers();
+  }
+
+  isPieceGhosted(pieceId: string): boolean {
+    return this.ghostedPieceIds.has(pieceId);
+  }
+
+  getGhostedPieceIds(): string[] {
+    return [...this.ghostedPieceIds];
+  }
+
+  captureGhostState(): Record<string, number[]> {
+    const state: Record<string, number[]> = {};
+    for (const pieceId of this.ghostedPieceIds) {
+      const positions = this.capturePiecePositions(pieceId);
+      if (positions) state[pieceId] = positions;
+    }
+    return state;
+  }
+
+  applyGhostState(state: Record<string, number[]> | null | undefined): void {
+    this.ghostedPieceIds.clear();
+    if (state) {
+      for (const [pieceId, positions] of Object.entries(state)) {
+        let count = 0;
+        for (const id of this.vertexPieceIds) if (id === pieceId) count++;
+        if (count === 0) continue;
+        if (positions.length === count * 3) {
+          let k = 0;
+          for (let i = 0; i < this.particles.length; i++) {
+            if (this.vertexPieceIds[i] !== pieceId) continue;
+            vec3.set(
+              this.particles[i].position,
+              positions[k * 3],
+              positions[k * 3 + 1],
+              positions[k * 3 + 2]
+            );
+            k++;
+          }
+        }
+        this.ghostedPieceIds.add(pieceId);
+        this.frozenPieceIds.delete(pieceId);
+      }
+    }
+    this.pinPieces();
+    this.rebuildSeamSprings();
+    this.syncBuffers();
+  }
+
+  /**
+   * Derive the live seam springs from `seamSpecs`: every stitch that does not
+   * touch a ghosted piece is active, and the ramp is re-applied so the springs
+   * that survive keep the target they had.
+   */
+  private rebuildSeamSprings(): void {
+    const springs: SpringDamper[] = [];
+    const rests: Array<{ initial: number; target: number }> = [];
+    const pairs: Array<[number, number]> = [];
+    for (const spec of this.seamSpecs) {
+      const { a, b } = spec;
+      if (
+        this.ghostedPieceIds.has(this.vertexPieceIds[a]) ||
+        this.ghostedPieceIds.has(this.vertexPieceIds[b])
+      ) {
+        continue;
+      }
+      springs.push(
+        new SpringDamper(
+          this.particles[a],
+          this.particles[b],
+          this.seamSpringTarget * 0.35,
+          this.dampingConst * 1.5,
+          spec.rest.initial
+        )
+      );
+      rests.push(spec.rest);
+      pairs.push([a, b]);
+    }
+    this.seamSprings = springs;
+    this.seamRestLengths = rests;
+    this.seamPairIndices = pairs;
+    // The bond overlay is sized for the active pairs, so refresh it when the
+    // count changes (once the buffers exist — the mesh build does this later).
+    if (this.seamLineVertexCount !== 0 && pairs.length * 2 !== this.seamLineVertexCount) {
+      this.createSeamLineBuffers();
+    }
+    this.setSeamProgress(this.seamRampElapsed / SEAM_RAMP_SECONDS);
   }
 
   isPieceFrozen(pieceId: string): boolean {
@@ -640,10 +763,11 @@ export class PatternCloth {
     return out.length ? out : null;
   }
 
-  /** Apply the fixed flag to match `frozenPieceIds` (and shed velocity). */
+  /** Apply the fixed flag to match the held pieces (and shed their velocity). */
   private pinPieces(): void {
     for (let i = 0; i < this.particles.length; i++) {
-      const frozen = this.frozenPieceIds.has(this.vertexPieceIds[i]);
+      const piece = this.vertexPieceIds[i];
+      const frozen = this.frozenPieceIds.has(piece) || this.ghostedPieceIds.has(piece);
       const p = this.particles[i];
       p.setFixed(frozen);
       if (frozen) {
@@ -651,12 +775,44 @@ export class PatternCloth {
         p.resetForce();
       }
     }
+    this.updatePieceAlpha();
+  }
+
+  /**
+   * Refresh the per-vertex opacity the renderer reads: solid cloth, a dimmed
+   * frozen piece, a faint ghosted one.
+   */
+  private updatePieceAlpha(): void {
+    if (!this.alphaBuffer || !this.alphaData) return;
+    for (let i = 0; i < this.particles.length; i++) {
+      const piece = this.vertexPieceIds[i];
+      if (this.ghostedPieceIds.has(piece)) this.alphaData[i] = GHOSTED_PIECE_OPACITY;
+      else if (this.frozenPieceIds.has(piece)) this.alphaData[i] = FROZEN_PIECE_OPACITY;
+      else this.alphaData[i] = 1;
+    }
+    // Fresh view so writeBuffer accepts ArrayBuffer (not SharedArrayBuffer typing).
+    const upload = new Float32Array(this.alphaData.length);
+    upload.set(this.alphaData);
+    this.device.queue.writeBuffer(this.alphaBuffer, 0, upload);
+  }
+
+  getAlphaBuffer(): GPUBuffer | null {
+    return this.alphaBuffer;
+  }
+
+  /** True while any piece is dimmed, so the renderer needs its blended pass. */
+  hasTranslucentPieces(): boolean {
+    return this.ghostedPieceIds.size > 0 || this.frozenPieceIds.size > 0;
   }
 
   resetToInitialState(): void {
     this.dragging = false;
     this.seamRampElapsed = 0;
     this.frozenPieceIds.clear();
+    if (this.ghostedPieceIds.size > 0) {
+      this.ghostedPieceIds.clear();
+      this.rebuildSeamSprings();
+    }
     for (let i = 0; i < this.particles.length; i++) {
       vec3.copy(this.particles[i].position, this.initialPositions[i]);
       vec3.zero(this.particles[i].getVelocity());
@@ -665,6 +821,7 @@ export class PatternCloth {
     }
     this.setSeamProgress(0);
     this.prevT = 0;
+    this.updatePieceAlpha();
     this.syncBuffers();
   }
 
@@ -732,7 +889,10 @@ export class PatternCloth {
         // skipped for it rather than nudging it onto the floor or body.
         if (p.isFixedParticle()) continue;
         p.groundCollision();
-        this.avatar.resolveParticle(p, this.edgeLengths[pi] ?? this.avgEdgeLength);
+        this.avatar.resolveParticle(p, this.edgeLengths[pi] ?? this.avgEdgeLength, {
+          hold: p.getContactHold(),
+          stepSeconds: sub,
+        });
       }
     }
     this.syncBuffers();
@@ -904,6 +1064,7 @@ export class PatternCloth {
     this.positionBuffer?.destroy();
     this.normalBuffer?.destroy();
     this.colorBuffer?.destroy();
+    this.alphaBuffer?.destroy();
     this.indexBuffer?.destroy();
     this.wireframeEdgeBuffer?.destroy();
     this.wireframeEdgeBuffer = null;

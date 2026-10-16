@@ -322,9 +322,12 @@ export async function createAvatarBodyFromAvatar(
       mesh.render.indices,
       MAKEHUMAN_UNIT_TO_WORLD,
       device,
+      // Not skipped: the volume is a proxy for this mesh, and the per-frame
+      // contact pass resolves against the triangles (see `sdfIsMeshProxy`). The
+      // grid is built on first use, so an unused body never pays for it.
       { skipSpatialGrid: true }
     );
-    body.setSdfVolume(sdf.volume);
+    body.setSdfVolume(sdf.volume, { bakedFromThisMesh: true });
     report.collisionMesh = cachedAnalysis(mesh, 'collision');
     report.sdfSource = sdf.source;
     report.bakeMs = sdf.ms;

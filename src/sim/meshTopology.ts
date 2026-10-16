@@ -6,7 +6,19 @@ import { CM_TO_WORLD } from './units';
 
 export const FALLBACK_PIECE_ID = '__cloth__';
 
-export type StretchConstraint = { i: number; j: number; rest: number };
+export type StretchConstraint = {
+  i: number;
+  j: number;
+  rest: number;
+  /**
+   * Crowd floor of an edge that runs along a sewn edge, as a share of its rest
+   * length — how far this row may shorten before it pushes back. Only the row
+   * along the *long* side of a gathered seam gets one (the side with fabric to
+   * give); ordinary fabric, and the short side of a gather, is two-sided and
+   * inextensible exactly as it has always been.
+   */
+  slack?: number;
+};
 export type BendConstraint = { i0: number; i1: number; i2: number; i3: number; restAngle: number };
 /** Long-range / attach: particle i capped to maxDist from slot position. */
 export type LraConstraint = {
@@ -320,6 +332,29 @@ export function buildClothTopology(
       initialDist: Math.max(initialDist, targetRest),
     });
     seamPairs.push([pair.a, pair.b]);
+  }
+
+  // Edges that run along a sewn edge: both ends are stitched, so this is the
+  // row of fabric the seam is cinching — and the only place a crowd floor can
+  // apply. A vertex only carries one when its seam asked for fabric to give, so
+  // a plain 1:1 seam leaves every stretch edge two-sided and inextensible.
+  const crowdFloorByVertex = new Map<number, number>();
+  for (const pair of seamPairsRaw) {
+    if (pair.crowdA !== undefined) {
+      const current = crowdFloorByVertex.get(pair.a) ?? 1;
+      crowdFloorByVertex.set(pair.a, Math.min(current, pair.crowdA));
+    }
+    if (pair.crowdB !== undefined) {
+      const current = crowdFloorByVertex.get(pair.b) ?? 1;
+      crowdFloorByVertex.set(pair.b, Math.min(current, pair.crowdB));
+    }
+  }
+  if (crowdFloorByVertex.size > 0) {
+    for (const c of stretch) {
+      const floorI = crowdFloorByVertex.get(c.i);
+      const floorJ = crowdFloorByVertex.get(c.j);
+      if (floorI !== undefined && floorJ !== undefined) c.slack = Math.min(floorI, floorJ);
+    }
   }
 
   const { offsets, neighbors } = buildOneRing(n, edges);

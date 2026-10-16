@@ -151,9 +151,15 @@ import {
 } from '../project/projectLibrary';
 import { HistoryManager } from '../project/history/HistoryManager';
 import { resetAvatarOverlayCache } from '../pattern/avatarPatternOverlay';
-import { buildAvatarMeshes, collisionSummaryText, createAvatarBodyFromAvatar } from '../avatar/avatarService';
-import { updateAvatar } from '../persistence/avatarLibrary';
+import {
+  avatarCacheKeyFor,
+  buildAvatarMeshes,
+  collisionSummaryText,
+  createAvatarBodyFromAvatar,
+} from '../avatar/avatarService';
+import { loadAvatarLibrary, updateAvatar } from '../persistence/avatarLibrary';
 import type { Avatar } from '../project/avatars';
+import type { AvatarBody } from '../mesh/AvatarBody';
 
 const WORLD_TO_CM = 10;
 
@@ -302,6 +308,8 @@ export class StudioApp {
   private saveInFlight = false;
   private saveQueued = false;
   private restoringUndo = false;
+  /** Body restored from the avatar library, so a rebuilt runtime can be re-aimed at it. */
+  private restoredAvatar: { key: string; body: AvatarBody } | null = null;
   private expandedNodeId: string | null = null;
   private expandPlaceholder: HTMLElement | null = null;
   private expandOverlay: HTMLElement | null = null;
@@ -1190,6 +1198,47 @@ export class StudioApp {
   }
 
   /**
+   * Put the project's generated body back under the cloth.
+   *
+   * Which body the cloth collides against lives in the avatar body instance, not
+   * in the project file, and a reload used to start every viewport on the
+   * bundled reference body: a garment was sewn and fitted against the generated
+   * avatar, and nothing told the sim which one that was. The avatar a project
+   * was built against *is* stored — the library keeps the generated model key
+   * and the collision resolution it was generated with — so load it back the way
+   * the Avatars editor applies one, and re-apply the same body to any runtime
+   * rebuilt later (a board remount, undo, a project switch).
+   */
+  private async restoreStoredAvatar(): Promise<void> {
+    if (!this.device) return;
+    const library = await loadAvatarLibrary();
+    const active = library.sets.find((s) => s.id === library.activeId) ?? library.sets[0];
+    // A 2D avatar has no generated model to restore, so the bundled body stands.
+    if (!active || active.kind !== '3d') return;
+
+    const key = `${avatarCacheKeyFor(active)}|${active.sdfResolution ?? 'triangle'}`;
+    if (this.restoredAvatar?.key === key) {
+      this.applyAvatarBody(this.restoredAvatar.body);
+      return;
+    }
+
+    const { body, collision } = await createAvatarBodyFromAvatar(this.device, active, {
+      sdfResolution: active.sdfResolution || undefined,
+    });
+    this.restoredAvatar = { key, body };
+    this.applyAvatarBody(body);
+    this.setStatus(`Avatar “${active.name}” restored — ${collisionSummaryText(collision)}`);
+  }
+
+  /** Aim every sim and transform viewport at `body`, and refresh their overlays. */
+  private applyAvatarBody(body: AvatarBody): void {
+    for (const rt of this.simRuntimes.values()) rt.setAvatarBody(body);
+    for (const rt of this.transformRuntimes.values()) rt.setAvatarBody(body);
+    resetAvatarOverlayCache();
+    for (const ed of this.editors.values()) ed.reloadAvatarOverlay();
+  }
+
+  /**
    * Generate a 3D body for `avatar` from its measurements and push it into every
    * sim / transform viewport. Returns a report for the editor.
    */
@@ -1211,10 +1260,7 @@ export class StudioApp {
         onProgress: (value) => setStatus(`Baking collision SDF… ${Math.round(value * 100)}%`),
       });
 
-      for (const rt of this.simRuntimes.values()) rt.setAvatarBody(body);
-      for (const rt of this.transformRuntimes.values()) rt.setAvatarBody(body);
-      resetAvatarOverlayCache();
-      for (const ed of this.editors.values()) ed.reloadAvatarOverlay();
+      this.applyAvatarBody(body);
 
       await updateAvatar(avatar.id, {
         kind: '3d',
@@ -4006,6 +4052,18 @@ export class StudioApp {
                 : `Unfroze ${label}`
             );
           },
+          onGhostChange: (pieceId, ghosted) => {
+            this.markDirty();
+            const name = this.patternForSim(sim.id)?.pieces.find(
+              (p) => p.id === pieceId
+            )?.name;
+            const label = name?.trim() || 'piece';
+            this.setStatus(
+              ghosted
+                ? `Ghosted ${label} — it is out of the simulation until you un-ghost it`
+                : `Un-ghosted ${label} — it is back in the simulation`
+            );
+          },
         }
       );
       await runtime.initRenderer();
@@ -4095,6 +4153,10 @@ export class StudioApp {
     this.raf = requestAnimationFrame(loop);
     this.layoutNodes();
     this.setStatus('Ready — Pattern → Mesh → Transform 3D → Sim');
+    // Every viewport was just built on the bundled body; put the project's own
+    // avatar back under the cloth (and under the transform stages) before the
+    // user can drape anything.
+    void this.restoreStoredAvatar();
     // Re-asserted here because the pipeline line above is rewritten whenever the
     // board redraws, and lost image bytes are not something to let scroll away.
     this.reportMissingImages();
@@ -4565,8 +4627,9 @@ export class StudioApp {
       case 'reset':
         rt.cloth?.resetToInitialState();
         sim.pose = null;
-        // Reset returns every piece to its rest layout, so nothing stays frozen.
+        // Reset returns every piece to its rest layout, so nothing stays held.
         delete sim.frozenPieces;
+        delete sim.ghostedPieces;
         this.setStatus(`Reset: ${sim.name}`);
         break;
       case 'rebuild':
@@ -5165,8 +5228,8 @@ export class StudioApp {
               <input id="pMaxStretch" type="range" min="1" max="1.5" step="0.01" value="${p.maxStretch ?? 1.12}" /></label>
             <label>${tip('Bend springs', 'Resistance to folding, as a fraction of Spring. Low = soft drapey folds; high locks panels flat and fights seams. Recommended: 10–40% (default 20%). Avoid 100% for garments.', `${bendPct}%`, 'vBendScale')}
               <input id="pBendScale" type="range" min="0" max="1" step="0.05" value="${p.bendSpringScale ?? 0.2}" /></label>
-            <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Range 0–2 (default 0.45).', (p.contactFriction ?? 0.45).toFixed(2), 'vFriction')}
-              <input id="pFriction" type="range" min="0" max="2" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
+            <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Range 0–20 (default 0.45): up to 2 the contact only slows a slide, above that it starts holding the cloth where it touches, fully static by about 8.', (p.contactFriction ?? 0.45).toFixed(2), 'vFriction')}
+              <input id="pFriction" type="range" min="0" max="20" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
             <label>${tip('Gravity', 'Downward acceleration scale for drape. Higher hangs heavier; lower floats. Recommended: 0.6–1.2 (default 0.8).', p.gravity.toFixed(2), 'vGrav')}
               <input id="pGrav" type="range" min="0" max="5" step="0.05" value="${p.gravity}" /></label>
           </div>
@@ -5191,8 +5254,8 @@ export class StudioApp {
               <input id="pSpringGpu" type="range" min="100" max="5000" value="${p.springConst}" /></label>
             <label>${tip('Mass', 'Total garment mass (split across particles). Heavier = more inertia and drape; lighter reacts faster. Recommended: 50–150 (default 100).', String(Math.round(p.mass)), 'vMassGpu')}
               <input id="pMassGpu" type="range" min="10" max="300" value="${p.mass}" /></label>
-            <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Range 0–2 (default 0.45).', (p.contactFriction ?? 0.45).toFixed(2), 'vFrictionGpu')}
-              <input id="pFrictionGpu" type="range" min="0" max="2" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
+            <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Range 0–20 (default 0.45): up to 2 the contact only slows a slide, above that it starts holding the cloth where it touches, fully static by about 8.', (p.contactFriction ?? 0.45).toFixed(2), 'vFrictionGpu')}
+              <input id="pFrictionGpu" type="range" min="0" max="20" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
             <label>${tip('LRA stretchiness', 'Long-range attachment / sew slack multiplier. Higher = looser seams and attachments; lower pulls tighter. Recommended: 1.1–1.4 (default 1.2).', (p.longRangeStretchiness ?? 1.2).toFixed(2), 'vLra')}
               <input id="pLra" type="range" min="1" max="2" step="0.05" value="${p.longRangeStretchiness ?? 1.2}" /></label>
             <label>${tip('Gravity', 'Downward acceleration scale for drape. Higher hangs heavier; lower floats. Recommended: 0.6–1.2 (default 0.8).', p.gravity.toFixed(2), 'vGravGpu')}

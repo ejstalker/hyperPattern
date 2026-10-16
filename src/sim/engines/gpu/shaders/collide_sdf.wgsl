@@ -9,8 +9,10 @@ struct Params {
   numObs: u32,
   floorY: f32,
   margin: f32,
-  _p0: f32,
-  _p1: f32,
+  /** Share of a contact step's tangential travel the grip holds back (0–1). */
+  hold: f32,
+  /** Substep length, for turning that share into a distance. */
+  dt: f32,
 }
 
 struct Obstacle {
@@ -166,6 +168,13 @@ fn resolve_contact(
   } else {
     nrm = nrm / nlen;
   }
+  // Static grip: hand back the tangential travel this step just made, so a high
+  // grip holds the cloth where the contact caught it instead of only slowing its
+  // slide. Zero for every grip up to the point where the velocity model runs out.
+  if (params.hold > 0.0) {
+    let slip = v - nrm * dot(v, nrm);
+    p = p - slip * (params.hold * params.dt);
+  }
   p = p + nrm * min(depth, maxPush);
 
   let vn = dot(v, nrm);
@@ -192,7 +201,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // cross-width edges are short aren't floated off the body by a global average.
   let edge = massEdge[i].y;
   let margin = max(BASE_COLLISION_MARGIN, edge * 0.35);
-  let maxPush = max(margin * 2.0, edge * 1.5);
+  // How far one substep may push a particle out of the body. A baked field is
+  // smooth, so a particle just outside the surface can sample as *inside* it by
+  // several centimetres; pushing "to the surface" along that reading flings the
+  // cloth up and around the body (the gradient at a hip points out and up), and
+  // because the clamp is per substep it happens twelve times a frame. Extracting
+  // a penetration at a fraction of an edge per substep is enough to clear it in
+  // a frame or two without the cloth ever leaving the ground it stands on.
+  let maxPush = max(margin * 2.0, edge * 0.25);
 
   {
     let r = resolve_contact(p, v, p.y - params.floorY, vec3<f32>(0.0, 1.0, 0.0), margin, maxPush);

@@ -261,7 +261,9 @@ export async function importAvatarModel(options: ImportAvatarOptions): Promise<A
       );
       throwIfAborted();
       const volume = new SdfVolume(sdfData);
-      body.setSdfVolume(volume);
+      // Baked from this body's own triangles, so the mesh stays the authority
+      // for the per-frame contact pass.
+      body.setSdfVolume(volume, { bakedFromThisMesh: true });
       sdfFileName = sdfCacheFileName(objFileName, unitToWorld, sdfResolution);
       await saveSdfToRefPpl(sdfFileName, SdfVolume.encode(sdfData));
       useSdf = true;

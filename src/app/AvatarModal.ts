@@ -227,6 +227,8 @@ export class AvatarModal {
                         <option value="32"${active.sdfResolution === 32 ? ' selected' : ''}>SDF 32³ — fastest</option>
                         <option value="48"${active.sdfResolution === 48 ? ' selected' : ''}>SDF 48³ — balanced</option>
                         <option value="64"${active.sdfResolution === 64 ? ' selected' : ''}>SDF 64³ — high detail</option>
+                        <option value="96"${active.sdfResolution === 96 ? ' selected' : ''}>SDF 96³ — fine (slow bake)</option>
+                        <option value="128"${active.sdfResolution === 128 ? ' selected' : ''}>SDF 128³ — sharpest (slowest bake)</option>
                       </select>
                     </label>
                     <label class="avatar-3d-decouple">
