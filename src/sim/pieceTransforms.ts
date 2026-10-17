@@ -1,3 +1,4 @@
+import { quat } from 'gl-matrix';
 import type { PieceTransform3d } from '../project/types';
 import type { ClothSimulator } from './ClothSimulator';
 import { FALLBACK_PIECE_ID } from './meshTopology';
@@ -153,4 +154,38 @@ export function recordPieceSuccessors(
   const next: Record<string, string[]> = { ...(successors ?? {}) };
   next[parentId] = [...new Set(childIds)].filter((id) => id !== parentId);
   return next;
+}
+
+/** Quaternion for a per-axis XYZ euler rotation in degrees. */
+export function eulerDegToQuat(eulerDeg: [number, number, number]): [number, number, number, number] {
+  const q = quat.create();
+  quat.fromEuler(q, eulerDeg[0], eulerDeg[1], eulerDeg[2]);
+  return [q[0], q[1], q[2], q[3]];
+}
+
+/** Per-axis XYZ euler rotation in degrees for a quaternion. */
+export function quatToEulerDeg(qIn: quat | [number, number, number, number]): [number, number, number] {
+  const q = quat.fromValues(qIn[0], qIn[1], qIn[2], qIn[3]);
+  quat.normalize(q, q);
+  const x = q[0];
+  const y = q[1];
+  const z = q[2];
+  const w = q[3];
+  const sinr = 2 * (w * x + y * z);
+  const cosr = 1 - 2 * (x * x + y * y);
+  const roll = Math.atan2(sinr, cosr);
+  const sinp = 2 * (w * y - z * x);
+  const pitch = Math.abs(sinp) >= 1 ? (Math.sign(sinp) * Math.PI) / 2 : Math.asin(sinp);
+  const siny = 2 * (w * z + x * y);
+  const cosy = 1 - 2 * (y * y + z * z);
+  const yaw = Math.atan2(siny, cosy);
+  return [(roll * 180) / Math.PI, (pitch * 180) / Math.PI, (yaw * 180) / Math.PI];
+}
+
+/** The stored orientation of a piece placement, as a quaternion. */
+export function resolvePieceQuat(t: PieceTransform3d): [number, number, number, number] {
+  if (t.rotationQuat && t.rotationQuat.length === 4) {
+    return t.rotationQuat;
+  }
+  return eulerDegToQuat(t.rotationDeg);
 }

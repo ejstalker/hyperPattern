@@ -15,9 +15,10 @@ export const AVATAR_PROJECT_ID = '__avatars__';
 /**
  * Bump when the *meaning* of the stored bytes changes, not just the inputs: a
  * volume baked under a different grid convention is a different asset, and
- * silently reusing one puts the collision surface in the wrong place.
+ * silently reusing one puts the collision surface in the wrong place. Version 3
+ * is the per-axis grid — same voxel size, no cubic padding.
  */
-const SDF_ASSET_FORMAT = 2;
+const SDF_ASSET_FORMAT = 3;
 
 export function avatarSdfAssetId(cacheKey: string, resolution: number): string {
   return `avatar-sdf:${SDF_ASSET_FORMAT}:${resolution}:${cacheKey}`;

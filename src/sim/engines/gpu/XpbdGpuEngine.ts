@@ -30,6 +30,7 @@ import resetLambdasWgsl from './shaders/reset_lambdas.wgsl?raw';
 import hashBuildWgsl from './shaders/hash_build.wgsl?raw';
 import { FROZEN_PIECE_OPACITY, GHOSTED_PIECE_OPACITY } from '../../pieceOpacity';
 import { ghostInverseMass } from '../../ghostMass';
+import { DEFAULT_MAX_SPEED } from '../../../project/createDefault';
 
 const DELTA_SCALE = 1 << 20;
 /**
@@ -279,7 +280,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.bendCompliance = bendComplianceFromParams(params);
     this.maxStretch = params.maxStretch ?? this.maxStretch;
     this.diameterScalar = params.particleDiameterScalar ?? this.diameterScalar;
-    this.maxSpeed = params.maxSpeed ?? 30;
+    this.maxSpeed = params.maxSpeed ?? DEFAULT_MAX_SPEED;
     this.friction = params.contactFriction ?? 0.45;
     this.enableSelfCollision = params.enableSelfCollision ?? false;
 

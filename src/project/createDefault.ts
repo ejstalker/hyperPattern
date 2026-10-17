@@ -24,6 +24,37 @@ export function uid(prefix = 'id'): string {
   return `${prefix}_${Date.now().toString(36)}_${_seq.toString(36)}`;
 }
 
+/**
+ * Bounds of the Max speed control, in world units per second.
+ *
+ * The clamp does real work at both ends: it is what stops a bad step throwing
+ * the cloth across the room, and — because a closed seam may only move a pair
+ * as far as the substep's travel budget — what limits how far one substep can
+ * take a stitch. Below about 0.5 the cloth crawls; above 10 a slam-through is
+ * back on the table.
+ */
+export const MAX_SPEED_MIN = 0.5;
+export const MAX_SPEED_MAX = 10;
+/** Where the control starts: enough travel for a drape, no room for a rocket. */
+export const DEFAULT_MAX_SPEED = 4;
+
+/**
+ * Bring a stored `maxSpeed` inside the control's range.
+ *
+ * Projects saved while the clamp ran to 40 keep their value until something
+ * changes it, and a slider whose thumb sits at 10 while the readout says 30 is
+ * a lie about what the engine is using.
+ */
+export function clampMaxSpeed(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_SPEED;
+  return Math.min(MAX_SPEED_MAX, Math.max(MAX_SPEED_MIN, value));
+}
+
+/** `4`, not `4.0` — but the half-unit steps still read as `0.5`. */
+export function formatMaxSpeed(value: number | undefined): string {
+  return String(Number(clampMaxSpeed(value).toFixed(2)));
+}
+
 export const DEFAULT_SIM_PARAMS: SimParams = {
   particleResolution: 15,
   mass: 100,
@@ -47,8 +78,9 @@ export const DEFAULT_SIM_PARAMS: SimParams = {
   contactFriction: 0.45,
   enableSelfCollision: false,
   interleavedHash: 3,
-  maxSpeed: 30,
+  maxSpeed: DEFAULT_MAX_SPEED,
 };
+
 
 /** Default mesh preview frame size (40% of original 340×400). */
 export const DEFAULT_MESH_FRAME_WIDTH = 136;

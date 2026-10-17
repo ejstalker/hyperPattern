@@ -23,6 +23,8 @@ import { loadAvatarBody } from './avatarAsset';
 import type { AvatarBody } from '../mesh/AvatarBody';
 import { SelectionOverlay } from './SelectionOverlay';
 import { ClothSewTool } from './ClothSewTool';
+import { PlacementGesture, type PlacementCommit } from './placementGesture';
+import { viewportOwnsKey } from './viewportKeyGuard';
 import { ViewportShadingControl } from './ViewportShadingControl';
 import type { Environment } from '../render/environment';
 import type { MaterialLibrary } from '../render/materials';
@@ -66,6 +68,13 @@ export type SimViewportRuntimeOptions = {
   onFreezeChange?: (pieceId: string, frozen: boolean) => void;
   /** A piece was ghosted or put back: let the host persist / report it. */
   onGhostChange?: (pieceId: string, ghosted: boolean) => void;
+  /**
+   * The user finished arranging pieces with a drag. The host decides what to do
+   * with it: a drape that has not run yet hands the arrangement back to the
+   * Transform 3D node it was built from, so the move is not lost on the next
+   * rebuild.
+   */
+  onArrangementCommit?: (commit: PlacementCommit) => void;
   /** The selected pieces changed (primary first) — the split view mirrors it. */
   onSelectionChange?: (pieceIds: string[]) => void;
   /** Shared HDRI environment; without it there is no background or PBR probe. */
@@ -149,6 +158,15 @@ export class SimViewportRuntime {
   private selectedPieceIds: Set<string> = new Set();
   private transformMode: TransformMode = 'translate';
   private strainMapEnabled = false;
+  /**
+   * Whether the fabric has been stepped since its cloth was last built.
+   *
+   * The difference between a drape that is merely *laid out* — rebuilt from its
+   * Transform 3D node, pieces where that node put them — and one that has been
+   * simulated: only the first still holds the upstream arrangement, which is what
+   * makes moving a piece in it a placement rather than a nudge.
+   */
+  private hasStepped = false;
   private nav: NavMode = 'none';
   private lastX = 0;
   private lastY = 0;
@@ -158,6 +176,11 @@ export class SimViewportRuntime {
   private dragPivot: vec3 = vec3.create();
   private gizmoAxis: MoveAxis | null = null;
   private lastPlaneHit: vec3 | null = null;
+  /** What the current drag has done to the cloth, reported when it ends. */
+  private readonly placement = new PlacementGesture();
+  /** The pointer is on this canvas, which is how it claims the W/E keys. */
+  private pointerOver = false;
+  private keyHandler: ((e: KeyboardEvent) => void) | null = null;
   private dragPlanePoint: vec3 = vec3.create();
   private dragPlaneNormal: vec3 = vec3.fromValues(0, 1, 0);
   private sim: SimInstance;
@@ -247,6 +270,11 @@ export class SimViewportRuntime {
     this.pointMarkers = [];
     this.incidentTriangles = null;
     this.closePieceMenu();
+    if (this.keyHandler) {
+      window.removeEventListener('keydown', this.keyHandler, true);
+      this.keyHandler = null;
+    }
+    this.placement.cancel();
     document.removeEventListener('pointerdown', this.onDocumentPointerDown);
     window.removeEventListener('keydown', this.onWindowKeyDown);
     window.removeEventListener('resize', this.onWindowResize);
@@ -544,8 +572,8 @@ export class SimViewportRuntime {
       this.transformToggle.classList.toggle('is-rotate', rotating);
       this.transformToggle.textContent = rotating ? 'Rotate' : 'Move';
       this.transformToggle.title = rotating
-        ? 'Rotation mode — drag a gizmo axis to rotate the selection around the group pivot'
-        : 'Move mode — drag the selection or a gizmo axis to translate · Shift-click to multi-select';
+        ? 'Rotation mode (E) — drag a gizmo axis to rotate the selection around the group pivot'
+        : 'Move mode (W) — drag the selection or a gizmo axis to translate · Shift-click to multi-select';
       this.transformToggle.setAttribute('aria-pressed', String(rotating));
     }
     this.syncMoveGizmo();
@@ -590,6 +618,7 @@ export class SimViewportRuntime {
       onDragStart: (axis, clientX, clientY) => {
         if (!this.cloth || this.selectedPieceIds.size === 0) return;
         this.invalidate();
+        this.placement.begin(this.selectedPieceIds);
         this.nav = 'gizmo';
         this.gizmoAxis = axis;
         this.cloth.setDragging(true);
@@ -655,6 +684,7 @@ export class SimViewportRuntime {
         this.gizmoAxis = null;
         this.lastPlaneHit = null;
         this.syncFrozenSnapshot();
+        this.commitArrangement();
       },
     });
   }
@@ -734,9 +764,19 @@ export class SimViewportRuntime {
     return pivot;
   }
 
+  /**
+   * Report a finished drag to the host. A drag that changed nothing reports
+   * nothing, so a plain click never writes an arrangement anywhere.
+   */
+  private commitArrangement(): void {
+    const commit = this.placement.end();
+    if (commit) this.options.onArrangementCommit?.(commit);
+  }
+
   /** Translate every selected piece by the same world-space delta. */
   private translateSelection(delta: vec3): void {
     if (!this.cloth || this.selectedPieceIds.size === 0) return;
+    this.placement.movedBy(delta);
     for (const id of this.selectedPieceIds) {
       this.cloth.translateBy(delta, id);
     }
@@ -754,6 +794,7 @@ export class SimViewportRuntime {
     const normalized = vec3.clone(axis);
     if (vec3.squaredLength(normalized) < 1e-8) return;
     vec3.normalize(normalized, normalized);
+    this.placement.turned(normalized, radians);
     const rotation = quat.create();
     quat.setAxisAngle(rotation, normalized, radians);
     const rel = vec3.create();
@@ -873,7 +914,14 @@ export class SimViewportRuntime {
     this.setPieceSelected(null);
     this.buildPointMarkerEls();
     this.refreshPointMarkers();
+    // A fresh cloth starts where its upstream node put it: nothing simulated yet.
+    this.hasStepped = false;
     this.invalidate();
+  }
+
+  /** False while the fabric still lies where its cloth was built. */
+  hasSteppedSimulation(): boolean {
+    return this.hasStepped;
   }
 
   setStrainMapEnabled(enabled: boolean): void {
@@ -1095,6 +1143,7 @@ export class SimViewportRuntime {
         this.lastPlaneHit = null;
         // A frozen piece may have been dragged; keep its saved pose current.
         this.syncFrozenSnapshot();
+        this.commitArrangement();
       }
       if (movedCamera && this.pointerMoved) {
         this.captureCamera(this.sim);
@@ -1135,6 +1184,9 @@ export class SimViewportRuntime {
       'wheel',
       (e) => {
         e.preventDefault();
+        // The wheel belongs to the viewport under the pointer: without this the
+        // board's own wheel handler zooms the whole canvas at the same time.
+        e.stopPropagation();
         const factor = e.deltaY > 0 ? 1.06 : 0.94;
         this.camera.setDistance(Math.max(1.5, Math.min(80, this.camera.getDistance() * factor)));
         this.viewGnomon?.syncFromCamera(this.camera);
@@ -1154,11 +1206,50 @@ export class SimViewportRuntime {
     document.addEventListener('pointerdown', this.onDocumentPointerDown);
     window.addEventListener('keydown', this.onWindowKeyDown);
     window.addEventListener('resize', this.onWindowResize);
+
+    this.canvas.addEventListener('pointerenter', () => {
+      this.pointerOver = true;
+    });
+    this.canvas.addEventListener('pointerleave', () => {
+      this.pointerOver = false;
+    });
+    this.bindTransformKeys();
+  }
+
+  /**
+   * W and E put the drape's gizmo in move / rotate mode.
+   *
+   * These sit on the window in the capture phase, ahead of a pattern editor's
+   * single-key tool shortcuts, and `viewportOwnsKey` decides from hover whether
+   * the keys are ours: a node viewport never takes focus, so a canvas-level
+   * listener would never fire.
+   */
+  private bindTransformKeys(): void {
+    this.keyHandler = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (
+        !viewportOwnsKey({
+          hovered: this.pointerOver,
+          host: this.host,
+          target: e.target,
+          activeElement: document.activeElement,
+        })
+      ) {
+        return;
+      }
+      const key = e.key.toLowerCase();
+      if (key !== 'w' && key !== 'e') return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.setTransformMode(key === 'w' ? 'translate' : 'rotate');
+    };
+    window.addEventListener('keydown', this.keyHandler, true);
   }
 
   /** Start free-dragging the cloth on a camera-facing plane (same as gizmo free axis). */
   private beginClothDrag(clientX: number, clientY: number): void {
     if (!this.cloth || this.selectedPieceIds.size === 0) return;
+    this.placement.begin(this.selectedPieceIds);
     this.nav = 'cloth';
     this.gizmoAxis = 'free';
     this.cloth.setDragging(true);
@@ -1231,6 +1322,7 @@ export class SimViewportRuntime {
   stepAndRender(): void {
     if (!this.renderer || !this.cloth) return;
     this.resize();
+    this.hasStepped = true;
     this.cloth.update(true);
     this.camera.update();
     this.renderer.render(this.cloth, this.camera);

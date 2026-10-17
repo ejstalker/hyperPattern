@@ -9,6 +9,11 @@ import {
   normalizeProject,
   DEFAULT_MESH_FRAME_WIDTH,
   DEFAULT_MESH_FRAME_HEIGHT,
+  DEFAULT_MAX_SPEED,
+  MAX_SPEED_MIN,
+  MAX_SPEED_MAX,
+  clampMaxSpeed,
+  formatMaxSpeed,
 } from '../project/createDefault';
 import {
   cloneSimCamera,
@@ -78,13 +83,25 @@ import {
   type ContainerView,
 } from '../project/containers';
 import { MeshPreview } from '../mesh/MeshPreview';
+import { quat, vec3 } from 'gl-matrix';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
+import type { PlacementCommit } from '../sim/placementGesture';
+import { quatToEulerDeg, resolvePieceQuat } from '../sim/pieceTransforms';
 import { Environment, loadEnvironmentSettings } from '../render/environment';
 import { MaterialLibrary } from '../render/materials';
 import { Transform3dRuntime } from '../sim/Transform3dRuntime';
 import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from '../sim/transformDefaults';
 
 type Rect = { x: number; y: number; w: number; h: number };
+
+/** What a drape is doing: running, holding a simulated pose, or showing a layout. */
+type SimPlayState = 'live' | 'paused' | 'ready';
+
+type SimTransport = {
+  play: HTMLButtonElement;
+  /** The state the button was last drawn in, so a no-change sync costs nothing. */
+  state: SimPlayState | null;
+};
 
 /** Does a node's box on the canvas meet `rect`? Both are in canvas units. */
 function nodeBoxIntersects(
@@ -112,6 +129,17 @@ const MAX_BOARD_ZOOM = 4;
  */
 const CONTAINER_CHROME_TOLERANCE = 1.25;
 const CONTAINER_CHROME_SETTLE_MS = 140;
+
+/**
+ * How long a zoom has to be still before the board is drawn again.
+ *
+ * A gesture freezes the drawing and scales it — see `BoardZoomGesture` — so this
+ * is the delay after the last zoom step before the page, the wires and every
+ * frame's chrome are rebuilt at the zoom it landed on. Long enough that a
+ * trackpad's gaps between events do not end the gesture, short enough that
+ * letting go feels like it snaps into focus.
+ */
+const ZOOM_GESTURE_SETTLE_MS = 140;
 
 /**
  * How much of a pattern to draw, measured by how big a centimetre is on screen:
@@ -150,6 +178,11 @@ import {
   setAutosaveIntervalMinutes,
 } from '../project/projectLibrary';
 import { HistoryManager } from '../project/history/HistoryManager';
+import {
+  BoardZoomGesture,
+  formatLayerTransform,
+  type BoardView,
+} from './zoomGesture';
 import { resetAvatarOverlayCache } from '../pattern/avatarPatternOverlay';
 import {
   avatarCacheKeyFor,
@@ -235,6 +268,8 @@ export class StudioApp {
   private meshPreviews = new Map<string, MeshPreview>();
   private simRuntimes = new Map<string, SimViewportRuntime>();
   private transformRuntimes = new Map<string, Transform3dRuntime>();
+  /** The play/pause button per drape, and the state it was last drawn in. */
+  private simTransports = new Map<string, SimTransport>();
   private transformInspectorPieceId: string | null = null;
   private device: GPUDevice | null = null;
   /**
@@ -296,6 +331,17 @@ export class StudioApp {
   /** The board zoom the containers were last told about — see `applyBoardTransform`. */
   private chromeZoomSynced: number | null = null;
   private chromeSettleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The zoom in flight, if the drawing is currently being scaled rather than drawn. */
+  private zoomGesture = new BoardZoomGesture();
+  private zoomGestureTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Where the page's drawing sits in the board wrap, read before the first freeze. */
+  private frozenPageOrigin: { x: number; y: number } | null = null;
+  /** When the last zoom step was applied, for telling a run of them from one. */
+  private lastZoomFlushAt = Number.NEGATIVE_INFINITY;
+  /** Per node, the chrome that has to be told the board's zoom — see `cacheBoardZoomChrome`. */
+  private boardChrome = new Map<string, HTMLElement[]>();
+  /** The zoom those elements were last given, so a pan does not rewrite it. */
+  private chromeVarZoom: number | null = null;
   /** Frames that were off the canvas when the board last moved — see `syncContainerDetail`. */
   private culledContainers = new Set<string>();
   /** Bumped on each board remount so in-flight initGpuAndSims cannot register stale runtimes. */
@@ -1254,10 +1300,19 @@ export class StudioApp {
         this.device = gpu.device;
       }
 
-      setStatus('Generating body…');
+      const say = (text: string) => {
+        setStatus(text);
+        this.setStatus(text);
+      };
+      say('Generating body…');
       const { body, mesh, collision } = await createAvatarBodyFromAvatar(this.device, avatar, {
         sdfResolution: options.sdfResolution,
-        onProgress: (value) => setStatus(`Baking collision SDF… ${Math.round(value * 100)}%`),
+        // Both lines, seconds included: a bake that stalls shows a rising clock
+        // instead of a frozen "generating body".
+        onProgress: (value, elapsedMs) =>
+          say(
+            `Baking collision SDF… ${Math.round(value * 100)}% · ${Math.max(0, elapsedMs / 1000).toFixed(0)} s`
+          ),
       });
 
       this.applyAvatarBody(body);
@@ -1842,6 +1897,11 @@ export class StudioApp {
 
   private bindBoardPan(): void {
     const wrap = document.getElementById('boardWrap')!;
+    // A press means the drawing is about to be read or hit-tested, and a frozen
+    // layer is scaled rather than drawn: what an editor measures against its own
+    // layout would not be where the pointer is. End the gesture and let it be
+    // exact. Capture phase, because a node stops its own presses on the way up.
+    wrap.addEventListener('pointerdown', () => this.endZoomGesture(), true);
     wrap.addEventListener('pointerdown', (e) => {
       if ((e.target as HTMLElement).closest('.canvas-node')) return;
       if (e.button === 1 || (e.button === 0 && e.altKey)) {
@@ -2029,19 +2089,132 @@ export class StudioApp {
     const rect = wrap.getBoundingClientRect();
     const mx = pending.clientX - rect.left;
     const my = pending.clientY - rect.top;
+    // A gesture is a *run* of steps. The first one is drawn the ordinary way —
+    // one step is one repaint, and drawing it means a single notch of the wheel
+    // stays sharp — and a step that follows it inside the settle window opens the
+    // freeze instead, over the view the layers were drawn at.
+    const previousFlush = this.lastZoomFlushAt;
+    this.lastZoomFlushAt = performance.now();
+    if (!this.zoomGesture.active && performance.now() - previousFlush <= ZOOM_GESTURE_SETTLE_MS) {
+      this.beginZoomGesture({ zoom: oldZoom, panX, panY });
+    }
     this.project.canvas.zoom = newZoom;
     this.project.canvas.panX = mx - ((mx - panX) / oldZoom) * newZoom;
     this.project.canvas.panY = my - ((my - panY) / oldZoom) * newZoom;
     this.applyBoardTransform();
+    if (this.zoomGesture.active) this.scheduleZoomGestureEnd();
+    // The page is redrawn by `applyBoardTransform`; the wires are drawn here. A
+    // frozen step draws neither — the gesture records the view the layers are at,
+    // and `drawWires` bails out mid-gesture anyway.
+    else this.drawWires();
+  }
+
+  /**
+   * Start scaling what is on screen instead of drawing it.
+   *
+   * The board's own transform is what zooms everything inside it, and the browser
+   * is what scales those pixels — vector work it has already rasterised is not
+   * re-rasterised just because the transform under it changed, which is the whole
+   * reason a gesture can be cheaper than a repaint. The two layers drawn *outside*
+   * the board (the page and the wires) are the ones that would otherwise be
+   * rebuilt every frame, so they are frozen too and follow the zoom by transform,
+   * from the view they were drawn at.
+   */
+  private beginZoomGesture(view: BoardView): void {
+    this.zoomGesture.begin(view);
+    const wrap = document.getElementById('boardWrap');
+    const host = this.canvasSurface;
+    this.frozenPageOrigin = null;
+    if (host) {
+      const wrapRect = wrap?.getBoundingClientRect();
+      const hostRect = host.getBoundingClientRect();
+      // Where the drawing starts inside the wrap: the rail it sits beside, plus
+      // wherever the host itself sits. Read now — a transformed layout rect
+      // reports the transform, not the layout.
+      const rail = this.canvasEditor?.viewOriginInHost() ?? { x: 0, y: 0 };
+      this.frozenPageOrigin = {
+        x: rail.x + (wrapRect && hostRect ? hostRect.left - wrapRect.left : 0),
+        y: rail.y + (wrapRect && hostRect ? hostRect.top - wrapRect.top : 0),
+      };
+    }
+    this.scaleFrozenLayers();
+  }
+
+  /** Put the frozen layers where a repaint at the current view would have put them. */
+  private scaleFrozenLayers(): void {
+    const view = this.project.canvas;
+    // Both layers are transformed about their own top-left corner: they are
+    // pinned to the wrap by their layout, and `layerTransform` accounts for where
+    // that corner sits. The default origin — the middle of the element — would
+    // scale the layer about a point that moves with the wrap's size.
+    const wires = this.zoomGesture.layerTransform(view);
+    if (wires) {
+      this.wiresSvg.style.transformOrigin = '0 0';
+      this.wiresSvg.style.transform = formatLayerTransform(wires);
+    }
+    const page = this.zoomGesture.layerTransform(view, this.frozenPageOrigin ?? undefined);
+    if (page) this.canvasEditor?.setGestureTransform(formatLayerTransform(page));
+  }
+
+  private scheduleZoomGestureEnd(): void {
+    if (this.zoomGestureTimer !== null) clearTimeout(this.zoomGestureTimer);
+    this.zoomGestureTimer = setTimeout(() => {
+      this.zoomGestureTimer = null;
+      this.endZoomGesture();
+    }, ZOOM_GESTURE_SETTLE_MS);
+  }
+
+  /**
+   * Drop the frozen state. True when there was one, and the layers are back at
+   * their own layout rather than carrying a transform.
+   */
+  private unfreezeBoardView(): boolean {
+    if (this.zoomGestureTimer !== null) {
+      clearTimeout(this.zoomGestureTimer);
+      this.zoomGestureTimer = null;
+    }
+    if (!this.zoomGesture.end()) return false;
+    this.wiresSvg.style.transform = '';
+    this.wiresSvg.style.transformOrigin = '';
+    this.canvasEditor?.setGestureTransform(null);
+    this.frozenPageOrigin = null;
+    return true;
+  }
+
+  /**
+   * Draw the board again at the zoom it stopped on.
+   *
+   * This is the render the gesture deferred: the page, the wires and every
+   * frame's chrome, once, instead of once per step.
+   */
+  private endZoomGesture(): void {
+    if (!this.unfreezeBoardView()) return;
+    const zoom = this.project.canvas.zoom;
+    // Nothing was told about the zoom the layers were frozen at, so everything
+    // is out of date, not merely behind.
+    this.chromeZoomSynced = null;
+    this.syncContainerDetail(true);
+    this.chromeZoomSynced = zoom;
+    this.syncCanvasSurfaceView();
     this.drawWires();
+    this.settleContainerChrome();
+  }
+
+  /** A redraw that is not the gesture's own: what is frozen no longer matches. */
+  private endGestureBeforeRedraw(): void {
+    if (this.zoomGesture.active) this.endZoomGesture();
   }
 
   private applyBoardTransform(): void {
     const { panX, panY, zoom } = this.project.canvas;
     this.board.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
-    // Chrome inside the board is scaled with it; anything that has to stay a
-    // constant size on screen (a frame's resize edges) divides by this.
-    this.board.style.setProperty('--board-zoom', String(zoom));
+    this.applyBoardZoomChrome(zoom);
+    // Mid-gesture the board is not redrawn at all: what is on screen is scaled,
+    // and the drawing catches up when the board stops — see `beginZoomGesture`.
+    if (this.zoomGesture.active) {
+      this.scaleFrozenLayers();
+      return;
+    }
     // A frame on the board is scaled by that transform, so its editor needs to
     // know by how much before it draws its next stroke.
     this.syncContainerDetail(this.chromeZoomSynced !== zoom);
@@ -2051,14 +2224,40 @@ export class StudioApp {
     this.syncCanvasSurfaceView();
   }
 
+  /**
+   * Tell the chrome that stays a constant size on screen how far the board is
+   * scaled.
+   *
+   * The property is written on the handful of elements that *use* it — a node's
+   * title bar, a frame's resize bands, a note's grab bands — rather than on the
+   * board. Custom properties are inherited, so writing it on the board re-resolves
+   * the style of every descendant: cheap for a board of a few nodes, and 82 ms a
+   * frame for one with a mesh on it, because a cloth preview is a hundred thousand
+   * SVG nodes and each of them counts. Writing it where it is read keeps a zoom
+   * step to a handful of elements and no descendants at all.
+   */
+  private applyBoardZoomChrome(zoom: number): void {
+    if (this.chromeVarZoom === zoom) return;
+    this.chromeVarZoom = zoom;
+    const value = String(zoom);
+    for (const chrome of this.boardChrome.values()) {
+      for (const element of chrome) element.style.setProperty('--board-zoom', value);
+    }
+  }
+
   private renderAll(): void {
     this.gpuInitGeneration++;
+    // The board is being rebuilt underneath everything the gesture froze.
+    this.unfreezeBoardView();
     this.settleContainerChrome();
     this.closeNodeFullscreen();
     this.teardownSims();
     this.board.innerHTML = '';
     this.editors.clear();
     this.meshPreviews.clear();
+    this.simTransports.clear();
+    this.boardChrome.clear();
+    this.chromeVarZoom = null;
     this.mountCanvasSurface();
     this.applyBoardTransform();
     const nodes = [...this.project.canvas.nodes].sort((a, b) => a.zIndex - b.zIndex);
@@ -2107,6 +2306,8 @@ export class StudioApp {
   private syncCanvasSurfaceView(): void {
     const editor = this.canvasEditor;
     if (!editor) return;
+    // The page cannot be redrawn into a view it is only pretending to be at.
+    this.endGestureBeforeRedraw();
     // Screen pixels per centimetre on the page: the drafting scale, zoomed. The
     // page is drawn in screen space, so this *is* the on-screen size of a
     // centimetre, and it is what the detail ladder is measured against.
@@ -2293,6 +2494,7 @@ export class StudioApp {
         'sim-active',
         node.type === 'simViewport' && (node as SimViewportNode).simId === this.project.activeSimId
       );
+      if (node.type === 'simViewport') this.syncSimTransport((node as SimViewportNode).simId);
     }
   }
 
@@ -3813,10 +4015,6 @@ export class StudioApp {
       const actions = this.viewportActions(body);
       const strainOn = this.simRuntimes.get(sim.id)?.isStrainMapEnabled() ?? false;
       actions.innerHTML = `
-        <button type="button" data-sim="activate">Play</button>
-        <button type="button" data-sim="pause">Pause</button>
-        <button type="button" data-sim="reset">Reset</button>
-        <button type="button" data-sim="rebuild">Rebuild</button>
         <button type="button" data-sim="snap">Snapshot</button>
         <button type="button" data-sim="strain" class="sim-strain-btn${strainOn ? ' is-on' : ''}" title="Toggle fabric strain map (blue=compress, green=rest, red=stretch)" aria-pressed="${strainOn}">Strain</button>
       `;
@@ -3829,6 +4027,7 @@ export class StudioApp {
       canvas.className = 'sim-canvas';
       body.classList.add('sim-body');
       body.appendChild(canvas);
+      this.mountSimTransport(node.simId, body);
       // runtime attached after GPU init
       (el as HTMLElement & { _simCanvas?: HTMLCanvasElement; _simHost?: HTMLElement })._simCanvas =
         canvas;
@@ -3922,6 +4121,31 @@ export class StudioApp {
 
     this.mountNodePorts(el, node);
     this.board.appendChild(el);
+    this.cacheBoardZoomChrome(node.id, el);
+  }
+
+  /**
+   * Find the elements whose chrome is measured in screen pixels, once, as the node
+   * is mounted.
+   *
+   * They are looked up here rather than on every zoom because a node's body can be
+   * enormous — a cloth preview is a hundred thousand SVG nodes — and a board that
+   * walked them all would spend more time searching for the chrome than drawing
+   * it. There are a handful of them per node: the title bar, a frame's resize
+   * bands, a note's grab bands.
+   */
+  private cacheBoardZoomChrome(nodeId: string, el: HTMLElement): void {
+    const chrome = Array.from(
+      el.querySelectorAll<HTMLElement>('.node-chrome, .node-frame-edge, .node-text-grab-band')
+    );
+    if (chrome.length === 0) {
+      this.boardChrome.delete(nodeId);
+      return;
+    }
+    this.boardChrome.set(nodeId, chrome);
+    const value = String(this.project.canvas.zoom);
+    for (const element of chrome) element.style.setProperty('--board-zoom', value);
+    this.chromeVarZoom = this.project.canvas.zoom;
   }
 
   private mountNodePorts(el: HTMLElement, node: CanvasNode): void {
@@ -4039,6 +4263,7 @@ export class StudioApp {
           onSewEdges: (a, b) => this.sewEdgesFromView(this.patternForSim(sim.id), a, b),
           onReverseSeam: (seamId) => this.reverseSeamFromView(this.patternForSim(sim.id), seamId),
           onDeleteSeam: (seamId) => this.deleteSeamFromView(this.patternForSim(sim.id), seamId),
+          onArrangementCommit: (commit) => this.commitDrapeArrangement(sim.id, commit),
           onBeforeFreezeChange: () => this.pushUndo(),
           onFreezeChange: (pieceId, frozen) => {
             this.markDirty();
@@ -4152,6 +4377,9 @@ export class StudioApp {
     };
     this.raf = requestAnimationFrame(loop);
     this.layoutNodes();
+    // Now that the runtimes exist they can say whether each drape has been
+    // simulated, which is what the transport buttons show.
+    this.syncSimTransports();
     this.setStatus('Ready — Pattern → Mesh → Transform 3D → Sim');
     // Every viewport was just built on the bundled body; put the project's own
     // avatar back under the cloth (and under the transform stages) before the
@@ -4164,11 +4392,14 @@ export class StudioApp {
 
   private teardownSims(): void {
     cancelAnimationFrame(this.raf);
+    // Full dispose rather than just dropping the cloth: the runtimes listen on
+    // the window for their 3D keys, and the board is about to be cleared, so a
+    // listener left behind would outlive the viewport it belongs to.
     for (const rt of this.simRuntimes.values()) {
-      rt.cloth?.destroy();
+      rt.dispose();
     }
     for (const rt of this.transformRuntimes.values()) {
-      rt.cloth?.destroy();
+      rt.dispose();
     }
     this.simRuntimes.clear();
     this.transformRuntimes.clear();
@@ -4605,6 +4836,140 @@ export class StudioApp {
     }
   }
 
+  /**
+   * The drape's transport, bottom-left: play/pause and a rewind that rebuilds.
+   *
+   * Play/pause carries the state of the drape. Live, it shows a pause glyph and
+   * reads as the running drape it is; paused, a play glyph; and a drape that has
+   * only been *rebuilt* — laid out from its Transform 3D node but never simulated
+   * — is dimmed and dashed, because what is on screen is a layout, not a drape.
+   */
+  private mountSimTransport(simId: string, body: HTMLElement): void {
+    const bar = document.createElement('div');
+    bar.className = 'sim-transport';
+    bar.innerHTML = `
+      <button type="button" class="sim-transport-btn sim-play-btn" data-sim="activate">
+        <svg class="sim-icon sim-icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5z"/></svg>
+        <svg class="sim-icon sim-icon-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 5h3.5v14H7.5zM13 5h3.5v14H13z"/></svg>
+      </button>
+      <button type="button" class="sim-transport-btn sim-rewind-btn" data-sim="rebuild" title="Rewind — drop the drape and lay the pieces out from the Transform 3D node again">
+        <svg class="sim-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 12l8.5-5.5v11zM2.5 12L11 6.5v11z"/></svg>
+      </button>
+    `;
+    bar.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest('button[data-sim]') as HTMLButtonElement | null;
+      if (!b) return;
+      void this.onSimAction(simId, b.dataset.sim!);
+    });
+    body.appendChild(bar);
+    const play = bar.querySelector('.sim-play-btn') as HTMLButtonElement;
+    this.simTransports.set(simId, { play, state: null });
+    this.syncSimTransport(simId);
+  }
+
+  /**
+   * Which of the three things a drape can be doing right now.
+   *
+   * There is no `running` flag to read: a sim is live exactly when it is the
+   * project's active sim, and "rebuilt but not yet simulated" is the difference
+   * between a drape that has been played and one that is still showing the
+   * layout its upstream node produced.
+   */
+  private simPlayState(simId: string): SimPlayState {
+    if (this.project.activeSimId === simId) return 'live';
+    // The live runtime knows whether the fabric has actually been stepped, which
+    // is the honest answer: a cloth rebuilt from its upstream layout shows the
+    // layout however the document was last saved.
+    const rt = this.simRuntimes.get(simId);
+    if (rt) return rt.hasSteppedSimulation() ? 'paused' : 'ready';
+    // Nothing mounted yet (a node being mounted, or one that is off board): the
+    // document's own record of the last run is all there is to go on.
+    const sim = this.project.sims.find((s) => s.id === simId);
+    return sim?.simulated === false ? 'ready' : 'paused';
+  }
+
+  private syncSimTransport(simId: string): void {
+    const entry = this.simTransports.get(simId);
+    if (!entry) return;
+    const state = this.simPlayState(simId);
+    if (entry.state === state) return;
+    entry.state = state;
+    const live = state === 'live';
+    // One button, two verbs: what a click means is what the glyph shows.
+    entry.play.dataset.sim = live ? 'pause' : 'activate';
+    entry.play.classList.toggle('is-live', live);
+    entry.play.classList.toggle('is-ready', state === 'ready');
+    entry.play.setAttribute('aria-pressed', String(live));
+    entry.play.setAttribute('aria-label', live ? 'Pause the drape' : 'Play the drape');
+    entry.play.title =
+      state === 'live'
+        ? 'Running — click to pause'
+        : state === 'ready'
+          ? 'Rebuilt, not draped yet — click to run the simulation'
+          : 'Paused — click to keep simulating';
+  }
+
+  private syncSimTransports(): void {
+    for (const simId of this.simTransports.keys()) this.syncSimTransport(simId);
+  }
+
+  /**
+   * A drag in a drape that has not been simulated yet is *placement*, not a nudge
+   * to a simulation: the pieces still lie where the upstream Transform 3D node
+   * put them, so the move belongs to that node. Writing it back as per-piece
+   * positions and orientations (and the layout pose) is what keeps it — the next
+   * rebuild re-lays the cloth out from the transform node, and a move that only
+   * lived in the drape's cloth would be lost there.
+   *
+   * Once the drape has been played the pieces have a simulation of their own and
+   * the drag is a nudge; overwriting the upstream layout with a draped shape
+   * would be wrong, so that case is left alone.
+   */
+  private commitDrapeArrangement(simId: string, commit: PlacementCommit): void {
+    if (this.simPlayState(simId) !== 'ready') return;
+    const transform = this.transformForSim(simId);
+    const sim = this.project.sims.find((s) => s.id === simId);
+    const cloth = this.simRuntimes.get(simId)?.cloth ?? null;
+    if (!transform || !sim || !cloth) return;
+    this.pushUndo();
+    for (const pieceId of commit.pieceIds) {
+      const stored = transform.pieceTransforms[pieceId] ?? {
+        position: cloth.getPieceCentroidTuple(pieceId),
+        rotationDeg: [0, 0, 0] as [number, number, number],
+      };
+      const orientation = quat.fromValues(...resolvePieceQuat(stored));
+      // Same accumulation the transform stage does for its own drags: each turn
+      // goes on the world axes, on top of the orientation the piece already had.
+      for (const turn of commit.turns) {
+        const delta = quat.create();
+        quat.setAxisAngle(delta, vec3.fromValues(...turn.axis), turn.radians);
+        quat.multiply(orientation, delta, orientation);
+        quat.normalize(orientation, orientation);
+      }
+      const rotationQuat: [number, number, number, number] = [
+        orientation[0],
+        orientation[1],
+        orientation[2],
+        orientation[3],
+      ];
+      transform.pieceTransforms[pieceId] = {
+        position: cloth.getPieceCentroidTuple(pieceId),
+        rotationDeg: quatToEulerDeg(rotationQuat),
+        rotationQuat,
+      };
+    }
+    // The transform viewport shows the same layout, so it has to catch up with it.
+    const transformRuntime = this.transformRuntimes.get(transform.id);
+    if (transformRuntime) transformRuntime.applyStoredArrangement();
+    if (transform.pose) sim.pose = transform.pose;
+    this.markDirty();
+    if (this.selectedNodeId) this.renderInspector();
+    const count = commit.pieceIds.length;
+    this.setStatus(
+      `Placed ${count === 1 ? 'piece' : `${count} pieces`} — the Transform 3D layout they came from now holds this arrangement`
+    );
+  }
+
   private async onSimAction(simId: string, action: string): Promise<void> {
     const sim = this.project.sims.find((s) => s.id === simId);
     const rt = this.simRuntimes.get(simId);
@@ -4617,6 +4982,7 @@ export class StudioApp {
         }
         this.project.activeSimId = simId;
         sim.dropped = true;
+        sim.simulated = true;
         this.setStatus(`Active: ${sim.name} — drag fabric to move · empty drag to orbit`);
         break;
       case 'pause':
@@ -4630,6 +4996,7 @@ export class StudioApp {
         // Reset returns every piece to its rest layout, so nothing stays held.
         delete sim.frozenPieces;
         delete sim.ghostedPieces;
+        sim.simulated = false;
         this.setStatus(`Reset: ${sim.name}`);
         break;
       case 'rebuild':
@@ -4637,6 +5004,8 @@ export class StudioApp {
         const initialPose = this.poseForSim(simId);
         sim.pose = initialPose;
         sim.dropped = true;
+        // Laid out afresh: nothing has been simulated since.
+        sim.simulated = false;
         rt.rebuildCloth(
           this.meshGeometryForSim(simId),
           sim.params,
@@ -4674,6 +5043,7 @@ export class StudioApp {
       }
     }
     this.layoutNodes();
+    this.syncSimTransports();
     this.renderInspector();
   }
 
@@ -4895,6 +5265,8 @@ export class StudioApp {
     const viaTransform = this.transformForSim(simId);
     const pose = viaTransform ? this.poseForSim(simId) : clearPose ? null : sim.pose;
     if (!viaTransform && clearPose) sim.pose = null;
+    // Rebuilding lays the cloth out again, so nothing has been simulated since.
+    sim.simulated = false;
     runtime.rebuildCloth(
       this.meshGeometryForSim(simId),
       sim.params,
@@ -4930,10 +5302,18 @@ export class StudioApp {
       clearTimeout(this.chromeSettleTimer);
       this.chromeSettleTimer = null;
     }
+    // The gesture repaints every frame when it ends; catching up before that is
+    // the per-frame repaint it exists to avoid.
+    if (this.zoomGesture.active) return;
     for (const editor of this.editors.values()) editor.settleContainer();
   }
 
   private drawWires(): void {
+    // Anything that redraws the wires is a change to the board, and a frozen view
+    // cannot describe a board that has moved on: end the gesture first. The
+    // gesture's own end draws them itself, so this is a second pass over the same
+    // list, which is cheap and rare.
+    this.endGestureBeforeRedraw();
     const wrap = document.getElementById('boardWrap')!;
     const rect = wrap.getBoundingClientRect();
     this.wiresSvg.setAttribute('width', String(rect.width));
@@ -5242,8 +5622,8 @@ export class StudioApp {
               <input id="pStrainIters" type="range" min="0" max="20" value="${p.constraintIterations ?? 6}" /></label>
             <label>${tip('Velocity retain', 'Multiply velocity each substep (1 = none). Slightly below 1 damps high-frequency ringing without heavy Damping. Recommended: 0.995–0.999 (default 0.998).', (p.velocityDamping ?? 0.998).toFixed(3), 'vVelDamp')}
               <input id="pVelDamp" type="range" min="0.95" max="1" step="0.001" value="${p.velocityDamping ?? 0.998}" /></label>
-            <label>${tip('Max speed', 'Clamp particle speed (world units/s) to stop explosions from bad steps. Recommended: 20–40 (default 30). Lower if the cloth still rockets; raise if motion feels capped.', String(Math.round(p.maxSpeed ?? 30)), 'vMaxSpeed')}
-              <input id="pMaxSpeed" type="range" min="5" max="80" step="1" value="${p.maxSpeed ?? 30}" /></label>
+            <label>${tip('Max speed', `Clamp particle speed (world units/s) to stop explosions from bad steps. Range ${MAX_SPEED_MIN}–${MAX_SPEED_MAX} (default ${DEFAULT_MAX_SPEED}). Lower if the cloth still rockets; raise if motion feels capped.`, formatMaxSpeed(p.maxSpeed), 'vMaxSpeed')}
+              <input id="pMaxSpeed" type="range" min="${MAX_SPEED_MIN}" max="${MAX_SPEED_MAX}" step="0.5" value="${clampMaxSpeed(p.maxSpeed)}" /></label>
           </div>
         </div>
         <div id="gpuParams" style="${isGpu ? '' : 'display:none'}">
@@ -5268,8 +5648,8 @@ export class StudioApp {
               <input id="pSubsteps" type="range" min="2" max="32" value="${p.substeps ?? 8}" /></label>
             <label>${tip('Iterations', 'Constraint solver passes per substep. More = harder stretch/seams, costlier. Recommended: 2–8 (default 4).', String(p.constraintIterations ?? 4), 'vIters')}
               <input id="pIters" type="range" min="1" max="16" value="${p.constraintIterations ?? 4}" /></label>
-            <label>${tip('Max speed', 'Clamp particle travel/speed each substep. Lower reduces slam-through during sew wrap; raise if drape feels sluggish. Recommended: 8–20 (default 30). While seams close, wrap is further capped near 10.', String(Math.round(p.maxSpeed ?? 30)), 'vMaxSpeedGpu')}
-              <input id="pMaxSpeedGpu" type="range" min="4" max="40" step="1" value="${p.maxSpeed ?? 30}" /></label>
+            <label>${tip('Max speed', `Clamp particle travel and speed each substep. Range ${MAX_SPEED_MIN}–${MAX_SPEED_MAX} (default ${DEFAULT_MAX_SPEED}). Lower reduces slam-through while seams wrap a piece over the body; raise if the drape feels sluggish. It also sets how far one substep may move a stitched pair, so a little headroom above the fabric's own speed is enough.`, formatMaxSpeed(p.maxSpeed), 'vMaxSpeedGpu')}
+              <input id="pMaxSpeedGpu" type="range" min="${MAX_SPEED_MIN}" max="${MAX_SPEED_MAX}" step="0.5" value="${clampMaxSpeed(p.maxSpeed)}" /></label>
             <label class="inspector-check">${tip('Self-collision', 'Cloth–cloth contact via spatial hash. Prevents self-intersection; expensive. Leave off for simple drapes; on for layered or bunched garments.', p.enableSelfCollision ? 'On' : 'Off', 'vSelfCol')}
               <input id="pSelfCol" type="checkbox" ${p.enableSelfCollision ? 'checked' : ''} /></label>
           </div>
@@ -5296,11 +5676,11 @@ export class StudioApp {
         setValue('vCpuSubsteps', String(p.substeps ?? 24));
         setValue('vStrainIters', String(p.constraintIterations ?? 6));
         setValue('vVelDamp', (p.velocityDamping ?? 0.998).toFixed(3));
-        setValue('vMaxSpeed', String(Math.round(p.maxSpeed ?? 30)));
+        setValue('vMaxSpeed', formatMaxSpeed(p.maxSpeed));
         setValue('vLra', (p.longRangeStretchiness ?? 1.2).toFixed(2));
         setValue('vSubsteps', String(p.substeps ?? 8));
         setValue('vIters', String(p.constraintIterations ?? 4));
-        setValue('vMaxSpeedGpu', String(Math.round(p.maxSpeed ?? 30)));
+        setValue('vMaxSpeedGpu', formatMaxSpeed(p.maxSpeed));
         setValue('vSelfCol', p.enableSelfCollision ? 'On' : 'Off');
       };
       const bind = (id: string, fn: (v: number) => void) => {
@@ -5657,6 +6037,7 @@ export class StudioApp {
 
     const gone = new Set(nodes.map((n) => n.id));
     this.project.canvas.nodes = this.project.canvas.nodes.filter((n) => !gone.has(n.id));
+    for (const id of gone) this.boardChrome.delete(id);
 
     for (const node of nodes) {
       if (node.type === 'simViewport') {
@@ -5670,6 +6051,7 @@ export class StudioApp {
           const rt = this.simRuntimes.get(simId);
           rt?.cloth?.destroy();
           this.simRuntimes.delete(simId);
+          this.simTransports.delete(simId);
           this.project.sims = this.project.sims.filter((s) => s.id !== simId);
           this.project.assignments = this.project.assignments.filter((a) => a.simId !== simId);
           this.project.transformSimAssignments = this.project.transformSimAssignments.filter(

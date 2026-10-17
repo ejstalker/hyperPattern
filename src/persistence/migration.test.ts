@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import { projectStore } from './ProjectStore';
 import { createSmallFixture } from './fixtures';
 import { serializeProject } from './projectCodec';
+import { MAX_SPEED_MAX } from '../project/createDefault';
 
 const LEGACY_LIBRARY_KEY = 'patternCanvas.library.v1';
 
@@ -54,5 +55,23 @@ describe('legacy JSON compatibility', () => {
     const json = serializeProject(project);
     const imported = projectStore.importJson(json);
     expect(imported.patterns.length).toBe(project.patterns.length);
+  });
+
+  it('brings a stored Max speed inside the range the control offers', () => {
+    const project = createSmallFixture();
+    // Saved back when the clamp ran to 40 with a default of 30.
+    project.sims = project.sims.map((sim) => ({
+      ...sim,
+      params: { ...sim.params, maxSpeed: 30 },
+    }));
+    const imported = projectStore.importJson(serializeProject(project));
+    for (const sim of imported.sims) expect(sim.params.maxSpeed).toBe(MAX_SPEED_MAX);
+    // A value already inside the range is left exactly as it was.
+    project.sims = project.sims.map((sim) => ({
+      ...sim,
+      params: { ...sim.params, maxSpeed: 2.5 },
+    }));
+    const kept = projectStore.importJson(serializeProject(project));
+    for (const sim of kept.sims) expect(sim.params.maxSpeed).toBe(2.5);
   });
 });

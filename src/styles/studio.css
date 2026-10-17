@@ -3486,6 +3486,80 @@ optgroup {
   left: 8px;
 }
 
+/*
+ * The drape's transport, bottom-left.
+ *
+ * Separate from the action bar in the bottom centre (Snapshot / Strain, which
+ * you press occasionally) because play/pause is the control you reach for while
+ * watching the fabric: it is big, and the glyph *is* the state. Live, it shows a
+ * pause glyph in the accent colour; paused, a play glyph; and a drape that has
+ * only been rebuilt — laid out but never simulated — is dimmed and dashed,
+ * because what is on screen is a layout rather than a drape.
+ */
+.sim-transport {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sim-transport-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid rgba(242, 235, 227, 0.25);
+  border-radius: 8px;
+  background: rgba(28, 26, 23, 0.86);
+  color: #f2ebe3;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+
+.sim-transport-btn:hover {
+  border-color: var(--accent);
+}
+
+.sim-transport-btn:active {
+  transform: translateY(1px);
+}
+
+.sim-transport-btn .sim-icon {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+}
+
+.sim-play-btn .sim-icon-pause {
+  display: none;
+}
+
+.sim-play-btn.is-live {
+  border-color: var(--accent);
+  background: rgba(196, 92, 38, 0.3);
+  color: #ffd9c2;
+}
+
+.sim-play-btn.is-live .sim-icon-play {
+  display: none;
+}
+
+.sim-play-btn.is-live .sim-icon-pause {
+  display: block;
+}
+
+.sim-play-btn.is-ready {
+  border-style: dashed;
+  background: rgba(28, 26, 23, 0.6);
+  color: rgba(242, 235, 227, 0.62);
+  box-shadow: none;
+}
+
 /* Cloth edge highlight for the sew tool: layout-space lines over the fabric. */
 .cloth-edge-overlay {
   position: absolute;

@@ -26,7 +26,14 @@ import { migrateLegacySimCamera } from './cameraDefaults';
 import { createViewportRenderer } from './SimViewportRuntime';
 import { SelectionOverlay } from './SelectionOverlay';
 import { ClothSewTool } from './ClothSewTool';
-import { arrangementBelongsTo, keepPieceTransforms } from './pieceTransforms';
+import { viewportOwnsKey } from './viewportKeyGuard';
+import {
+  arrangementBelongsTo,
+  eulerDegToQuat,
+  keepPieceTransforms,
+  quatToEulerDeg,
+  resolvePieceQuat,
+} from './pieceTransforms';
 import { ViewportShadingControl } from './ViewportShadingControl';
 import type { Environment } from '../render/environment';
 import type { MaterialLibrary } from '../render/materials';
@@ -62,37 +69,6 @@ export const ARRANGE_SIM_PARAMS: SimParams = {
   dragCoeff: 1.0,
   engine: 'cpu-mass-spring',
 };
-
-function eulerDegToQuat(eulerDeg: [number, number, number]): [number, number, number, number] {
-  const q = quat.create();
-  quat.fromEuler(q, eulerDeg[0], eulerDeg[1], eulerDeg[2]);
-  return [q[0], q[1], q[2], q[3]];
-}
-
-function quatToEulerDeg(qIn: quat | [number, number, number, number]): [number, number, number] {
-  const q = quat.fromValues(qIn[0], qIn[1], qIn[2], qIn[3]);
-  quat.normalize(q, q);
-  const x = q[0];
-  const y = q[1];
-  const z = q[2];
-  const w = q[3];
-  const sinr = 2 * (w * x + y * z);
-  const cosr = 1 - 2 * (x * x + y * y);
-  const roll = Math.atan2(sinr, cosr);
-  const sinp = 2 * (w * y - z * x);
-  const pitch = Math.abs(sinp) >= 1 ? (Math.sign(sinp) * Math.PI) / 2 : Math.asin(sinp);
-  const siny = 2 * (w * z + x * y);
-  const cosy = 1 - 2 * (y * y + z * z);
-  const yaw = Math.atan2(siny, cosy);
-  return [(roll * 180) / Math.PI, (pitch * 180) / Math.PI, (yaw * 180) / Math.PI];
-}
-
-function resolvePieceQuat(t: PieceTransform3d): [number, number, number, number] {
-  if (t.rotationQuat && t.rotationQuat.length === 4) {
-    return t.rotationQuat;
-  }
-  return eulerDegToQuat(t.rotationDeg);
-}
 
 function applyPiecePlacement(cloth: ClothSimulator, pieceId: string, t: PieceTransform3d): void {
   cloth.applyPieceQuat(pieceId, resolvePieceQuat(t));
@@ -154,6 +130,9 @@ export class Transform3dRuntime {
   private hoverClientX = 0;
   private hoverClientY = 0;
   private hoverValid = false;
+  /** The pointer is on this canvas, which is how it claims the W/E/R keys. */
+  private pointerOver = false;
+  private keyHandler: ((e: KeyboardEvent) => void) | null = null;
   /** Primary (last-clicked) piece — drives the inspector and local-axis ops. */
   private selectedPieceId: string | null = null;
   /** Full multi-selection; may contain several pieces for group transforms. */
@@ -226,6 +205,10 @@ export class Transform3dRuntime {
   dispose(): void {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    if (this.keyHandler) {
+      window.removeEventListener('keydown', this.keyHandler, true);
+      this.keyHandler = null;
+    }
     this.cloth?.destroy();
     this.cloth = null;
     this.renderer = null;
@@ -419,6 +402,24 @@ export class Transform3dRuntime {
     applyPiecePlacement(this.cloth, pieceId, this.transform.pieceTransforms[pieceId]);
     this.persistArrangement();
     this.syncMoveGizmo();
+  }
+
+  /**
+   * Put the cloth back where the stored placements say it is.
+   *
+   * The arrangement is document data that something else may have edited — a
+   * drape that has not been simulated yet writes its moves back here — so this
+   * viewport has to catch up with it.
+   */
+  applyStoredArrangement(): void {
+    if (!this.cloth) return;
+    for (const pieceId of this.getPieceIds()) {
+      const stored = this.transform.pieceTransforms[pieceId];
+      if (stored) applyPiecePlacement(this.cloth, pieceId, stored);
+    }
+    this.transform.pose = this.cloth.exportPose();
+    this.syncMoveGizmo();
+    this.invalidate();
   }
 
   resetLayout(): void {
@@ -679,22 +680,36 @@ export class Transform3dRuntime {
     this.syncMoveGizmo();
   }
 
+  /**
+   * W / E / R on the window, in the capture phase.
+   *
+   * A node viewport never takes focus (a press `preventDefault`s, which cancels
+   * the focus that follows), so a listener on the canvas itself never fires —
+   * hence the window, and `viewportOwnsKey` decides from hover whether these
+   * keys are ours. Capture phase is what gets there before a pattern editor's
+   * own single-key tool shortcuts, which listen on the document.
+   */
   private bindKeyboard(): void {
     this.canvas.tabIndex = 0;
     this.canvas.style.outline = 'none';
-    this.canvas.addEventListener('keydown', (e) => {
+    this.canvas.addEventListener('pointerenter', () => {
+      this.pointerOver = true;
+    });
+    this.keyHandler = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const key = e.key.toLowerCase();
-      const t = e.target as HTMLElement | null;
       if (
-        t &&
-        t !== this.canvas &&
-        (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)
+        !viewportOwnsKey({
+          hovered: this.pointerOver,
+          host: this.host,
+          target: e.target,
+          activeElement: document.activeElement,
+        })
       ) {
         return;
       }
       // The gizmo's own two modes are one key each, the way every 3D package
       // spells them: W to move, E to turn.
+      const key = e.key.toLowerCase();
       if (key === 'w' || key === 'e') {
         e.preventDefault();
         e.stopPropagation();
@@ -706,7 +721,8 @@ export class Transform3dRuntime {
       e.preventDefault();
       e.stopPropagation();
       this.rotateSelectedPieceQuarterTurn();
-    });
+    };
+    window.addEventListener('keydown', this.keyHandler, true);
   }
 
   private mountTransformToggle(): void {
@@ -1162,12 +1178,13 @@ export class Transform3dRuntime {
     });
 
     this.canvas.addEventListener('pointerleave', () => {
+      this.pointerOver = false;
       this.hoverValid = false;
       if (this.hoveredQuadrant != null) {
         this.hoveredQuadrant = null;
         this.pushQuadrantOverlay();
       }
-      if (this.isSewEnabled()) this.sewTool?.clear();
+      if (this.isSewEnabled()) this.sewTool?.clearHover();
     });
 
     this.canvas.addEventListener('pointermove', (e) => {
@@ -1304,6 +1321,9 @@ export class Transform3dRuntime {
       'wheel',
       (e) => {
         e.preventDefault();
+        // The wheel belongs to the viewport under the pointer: without this the
+        // board's own wheel handler zooms the whole canvas at the same time.
+        e.stopPropagation();
         const factor = e.deltaY > 0 ? 1.06 : 0.94;
         this.camera.setDistance(Math.max(1.5, Math.min(80, this.camera.getDistance() * factor)));
         this.viewGnomon?.syncFromCamera(this.camera);

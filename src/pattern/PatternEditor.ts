@@ -2435,6 +2435,31 @@ export class PatternEditor {
     return { x: view.left - root.left, y: view.top - root.top };
   }
 
+  /**
+   * Move and scale the drawing without redrawing it.
+   *
+   * A host that is zooming the board wants the drawing to follow the zoom, and
+   * repainting it for every step of a gesture is work the next step throws away —
+   * so it hands the whole move over as one transform instead. Only the two layers
+   * that *are* the drawing are transformed; the rail, the ribbons and the popovers
+   * are chrome pinned in screen pixels, and stay where they are.
+   *
+   * Read `viewOriginInHost()` before the first transform and hold on to it: it is
+   * measured from layout, so it reports the transformed position once this is in
+   * place. Pass `null` to put the drawing back, and read it again after that.
+   */
+  setGestureTransform(transform: string | null): void {
+    for (const layer of [this.svg, this.avatarSvg]) {
+      if (transform) {
+        layer.style.transformOrigin = '0 0';
+        layer.style.transform = transform;
+      } else {
+        layer.style.transform = '';
+        layer.style.transformOrigin = '';
+      }
+    }
+  }
+
   /** Reload avatar silhouette after the studio avatar mesh/prefs change. */
   reloadAvatarOverlay(): void {
     if (!this.avatarOverlayOn) return;

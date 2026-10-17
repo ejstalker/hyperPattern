@@ -382,7 +382,11 @@ export type SimParams = {
   enableSelfCollision?: boolean;
   /** Rebuild spatial hash every N substeps. */
   interleavedHash?: number;
-  /** Clamp particle speed (world units/s) after each CPU substep / GPU finalize. */
+  /**
+   * Clamp particle speed (world units/s) after each CPU substep / GPU finalize.
+   * Bounds of the control are `MAX_SPEED_MIN`–`MAX_SPEED_MAX` (0.5–10) with a
+   * default of `DEFAULT_MAX_SPEED` (4) in `createDefault`.
+   */
   maxSpeed?: number;
 };
 
@@ -405,6 +409,15 @@ export type SimInstance = {
   pose: SimPose | null;
   camera: SimCameraState;
   dropped: boolean;
+  /**
+   * Whether the fabric has actually been simulated since it was last laid out.
+   *
+   * It is what tells a *rebuilt* drape from a paused one: both hold a pose and
+   * neither is running, but only the rebuilt one is still showing the upstream
+   * layout, which is what makes moving a piece in it a placement of that piece
+   * rather than a nudge to a simulation.
+   */
+  simulated?: boolean;
   /**
    * Pattern pieces pinned in place. A frozen piece holds its captured vertex
    * positions as the sim plays forward and across rebuilds, while the rest of

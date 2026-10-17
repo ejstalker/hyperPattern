@@ -248,7 +248,8 @@ export async function describeAvatarAssets(avatar: Avatar): Promise<AvatarAssetS
 export type AvatarBodyOptions = {
   /** Bake/attach a signed-distance collision volume at this resolution (undefined = triangle collision). */
   sdfResolution?: number;
-  onProgress?: (value: number) => void;
+  /** Bake progress: share of the field done, and how long the bake has run. */
+  onProgress?: (value: number, elapsedMs: number) => void;
 };
 
 function computeBounds(positions: Float32Array): {
@@ -271,7 +272,7 @@ function computeBounds(positions: Float32Array): {
 export async function buildAvatarSdfForMesh(
   mesh: GeneratedAvatarMesh,
   resolution: number,
-  onProgress?: (value: number) => void
+  onProgress?: (value: number, elapsedMs: number) => void
 ): Promise<{ volume: SdfVolume; source: 'device-cache' | 'baked'; ms: number; bytes: number }> {
   const started = performance.now();
   const cached = await loadAvatarSdf(mesh.cacheKey, resolution);

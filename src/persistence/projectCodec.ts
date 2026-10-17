@@ -1,6 +1,6 @@
 import type { MeshDocument, ProjectDocument } from '../project/types';
 import { DEFAULT_DISPLAY_UNIT } from '../project/types';
-import { createMeshDocument, uid } from '../project/createDefault';
+import { clampMaxSpeed, createMeshDocument, uid } from '../project/createDefault';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import { DEFAULT_CANVAS_CM_SCALE, fitContainerView } from '../project/containers';
 /**
@@ -118,6 +118,15 @@ export function normalizeProject(project: ProjectDocument): ProjectDocument {
       if (assignment.transformId === staleId) {
         assignment.transformId = replacement.id;
       }
+    }
+  }
+
+  // Max speed's control used to run to 40 with a default of 30. A stored value
+  // outside the new range would leave the inspector's thumb disagreeing with the
+  // number next to it, and the engine still clamping at the old value.
+  for (const sim of normalized.sims) {
+    if (sim.params && sim.params.maxSpeed !== undefined) {
+      sim.params.maxSpeed = clampMaxSpeed(sim.params.maxSpeed);
     }
   }
 

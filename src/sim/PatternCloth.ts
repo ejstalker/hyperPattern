@@ -8,6 +8,7 @@ import type { AvatarBody } from '../mesh/AvatarBody';
 import { identity } from '../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../project/types';
 import { CM_TO_WORLD } from './units';
+import { DEFAULT_MAX_SPEED } from '../project/createDefault';
 import { buildClothTopology, FALLBACK_PIECE_ID } from './meshTopology';
 import { buildWireframeEdgeIndices } from './wireframeEdges';
 import { fillStrainColors, type StrainEdge } from './strainMap';
@@ -102,7 +103,7 @@ export class PatternCloth {
   private bendSpringScale = 0.2;
   /** Per-substep velocity retain (slightly below 1 kills ringing). */
   private velocityDamping = 0.998;
-  private maxSpeed = 30;
+  private maxSpeed = DEFAULT_MAX_SPEED;
   private contactFriction = 0.45;
 
   private avatar: AvatarBody;
@@ -173,7 +174,7 @@ export class PatternCloth {
     this.maxStretch = params.maxStretch ?? 1.12;
     this.bendSpringScale = params.bendSpringScale ?? 0.2;
     this.velocityDamping = params.velocityDamping ?? 0.998;
-    this.maxSpeed = params.maxSpeed ?? 30;
+    this.maxSpeed = params.maxSpeed ?? DEFAULT_MAX_SPEED;
     this.contactFriction = params.contactFriction ?? 0.45;
 
     this.buildFromMesh(mesh, params.mass);

@@ -141,6 +141,18 @@ export class ClothSewTool {
     this.overlay.setStitch(null);
   }
 
+  /**
+   * Drop the edge highlight only — a half-made seam and the seam popover stay.
+   *
+   * The pointer has to cross off the canvas to reach the popover the right-click
+   * opened under it, and that must not be what closes it.
+   */
+  clearHover(): void {
+    this.hovered = null;
+    this.hoverT = 0;
+    this.sync();
+  }
+
   /** True while a first edge is picked and waiting for its partner. */
   hasPendingEdge(): boolean {
     return this.source !== null;
