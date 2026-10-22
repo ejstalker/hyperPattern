@@ -168,6 +168,14 @@ export class CpuMassSpringEngine implements ClothSimulator {
     return this.cloth.getPositionsSnapshot();
   }
 
+  getRestPositionsSnapshot(): Float32Array | null {
+    return this.cloth.getRestPositionsSnapshot();
+  }
+
+  getTriangleIndices(): Uint32Array {
+    return Uint32Array.from(this.cloth.getTriangleIndices());
+  }
+
   getNormalBuffer(): GPUBuffer {
     return this.cloth.getNormalBuffer();
   }

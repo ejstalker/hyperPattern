@@ -1003,6 +1003,21 @@ export class PatternCloth {
     return this.flatPositions.length ? this.flatPositions : null;
   }
 
+  getTriangleIndices(): readonly number[] {
+    return this.indices;
+  }
+
+  /** Flat layout the cloth was built from, xyz interleaved (world units). */
+  getRestPositionsSnapshot(): Float32Array {
+    const out = new Float32Array(this.initialPositions.length * 3);
+    for (let i = 0; i < this.initialPositions.length; i++) {
+      out[i * 3] = this.initialPositions[i]![0]!;
+      out[i * 3 + 1] = this.initialPositions[i]![1]!;
+      out[i * 3 + 2] = this.initialPositions[i]![2]!;
+    }
+    return out;
+  }
+
   getNormalBuffer(): GPUBuffer {
     return this.normalBuffer!;
   }

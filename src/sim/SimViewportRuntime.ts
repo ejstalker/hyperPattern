@@ -940,6 +940,15 @@ export class SimViewportRuntime {
     this.invalidate();
   }
 
+  getAvatarBody(): AvatarBody | null {
+    return this.avatarBody;
+  }
+
+  /** The cloth being simulated here, for viewport-level tools like the OBJ export. */
+  getCloth(): ClothSimulator | null {
+    return this.cloth;
+  }
+
   /**
    * Pick the rendered cloth. The center ray stays exact; a small CSS-pixel
    * fallback ring makes thin folds and triangle edges selectable without

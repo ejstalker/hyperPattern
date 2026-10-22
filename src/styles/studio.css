@@ -81,13 +81,6 @@ optgroup {
   min-width: 160px;
 }
 
-.toolbar-sep {
-  width: 1px;
-  height: 20px;
-  background: var(--border);
-  margin: 0 4px;
-}
-
 .studio-toolbar button {
   display: inline-flex;
   align-items: center;
@@ -190,10 +183,6 @@ optgroup {
   color: var(--ink);
 }
 
-.unit-popover {
-  min-width: 196px;
-}
-
 .studio-modal-toolbar .autosave-field {
   display: inline-flex;
   align-items: center;
@@ -286,7 +275,23 @@ optgroup {
   background: var(--bg);
 }
 
+.mesh-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
+/*
+ * The SVG sits over the canvas: it is what the pointer talks to, and it carries
+ * the marks that are not geometry — the grid, the seams, the pattern points. The
+ * surface and its wireframe are painted underneath, in one canvas.
+ */
 .mesh-svg {
+  position: relative;
+  z-index: 1;
   width: 100%;
   height: 100%;
   display: block;
@@ -304,17 +309,6 @@ optgroup {
   fill: var(--point-marker-fill);
   stroke: var(--point-marker-stroke);
   pointer-events: none;
-}
-
-.mesh-tri {
-  fill: #35302a;
-  stroke: none;
-}
-
-.mesh-edge {
-  stroke: #c2b9aa;
-  stroke-width: 0.18;
-  fill: none;
 }
 
 .mesh-seam-line {
@@ -407,6 +401,19 @@ optgroup {
   cursor: crosshair;
 }
 
+/*
+ * A terminal is 16 board pixels, which is four of them on screen at a quarter zoom:
+ * too small to aim at, and the hover prompt it now carries would be unreachable.
+ * The hit area is a circle around it rather than the dot itself — the dot is what
+ * you see, this is what you can hit, and it leaves the drawing untouched.
+ */
+.node-port::before {
+  content: '';
+  position: absolute;
+  inset: -14px;
+  border-radius: 50%;
+}
+
 .node-port-in {
   left: -9px;
 }
@@ -444,6 +451,37 @@ optgroup {
 
 .node-port.is-connected {
   border-color: #fff;
+}
+
+/*
+ * The "+ 3d container" prompt beside a 2D container's free output terminal.
+ *
+ * Screen space, not board space: it sits in the board wrap and is placed from the
+ * terminal's own rectangle, so it stays the same size at any zoom and can be
+ * dismissed by anything that moves the terminal out from under it.
+ */
+.drape-offer {
+  position: absolute;
+  z-index: 60;
+  transform: translateY(-50%);
+  padding: 5px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: rgba(28, 26, 23, 0.95);
+  color: #f2ebe3;
+  font: 11px var(--mono);
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.drape-offer:hover {
+  background: var(--accent);
+  color: #14120f;
+}
+
+.drape-offer[hidden] {
+  display: none;
 }
 
 .studio-board-wrap.is-wiring {
@@ -641,7 +679,10 @@ optgroup {
   align-items: center;
   gap: 4px;
   min-width: 0;
-  flex: 1;
+  /* Sized to its chips rather than to the bar, so the file menu beside it sits
+     against the title instead of floating in the middle of the chrome. It still
+     shrinks and scrolls when the pipeline is longer than the window. */
+  flex: 0 1 auto;
   overflow-x: auto;
   scrollbar-width: thin;
 }
@@ -932,7 +973,7 @@ optgroup {
   inset: 0;
   z-index: 4000;
   display: flex;
-  padding: 20px;
+  padding: 8px;
   box-sizing: border-box;
   /* Opaque, not blurred: a full-viewport backdrop-filter is rasterised on the
      CPU in Electron/VS Code webviews and stalls every interaction behind it. */
@@ -992,6 +1033,12 @@ optgroup {
 
 .canvas-node.is-expanded .resize-handle,
 .canvas-node.is-expanded > .node-port {
+  display: none !important;
+}
+
+/* The overlay never clips, so the button that decides whether it does has
+   nothing to say there — clipping is set from the board. */
+.canvas-node.is-expanded .node-clip-btn {
   display: none !important;
 }
 
@@ -1328,19 +1375,31 @@ optgroup {
 .pattern-toolbar {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 6px 4px;
-  background: var(--bg-elev);
-  border-right: 1px solid var(--border);
+  gap: 6px;
+  padding: 0;
+  background: none;
+  border: 0;
   z-index: 3;
   flex-shrink: 0;
   overflow: visible;
+  /* The column is mostly air between the tools and the corner button. Let the
+     canvas have that back and keep only the controls themselves clickable. */
+  pointer-events: none;
 }
 
+.pattern-toolbar > * {
+  pointer-events: auto;
+}
+
+/* Only the tools wear the palette surface; the rail below them is gaps. */
 .pattern-toolbar-tools {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  padding: 4px;
+  border-radius: var(--palette-radius);
+  background: var(--palette-bg);
+  box-shadow: var(--palette-shadow);
 }
 
 .pattern-tool-flyout {
@@ -1386,20 +1445,145 @@ optgroup {
   color: #fff;
 }
 
-/* ── Viewport zoom ──────────────────────────────────────────────────────────
-   A typed zoom, a lock that holds the level, and the hicon projection. They sit
-   just above the seam allowance button, in the rail's bottom cluster. */
-.pattern-zoom-menu {
-  width: 168px;
-  gap: 6px;
-  padding: 8px;
+/* ── View settings ──────────────────────────────────────────────────────────
+   Everything that changes how the pattern is *seen* rather than what it is —
+   zoom and its lock, the projections, the allowance, the references. None of it
+   belongs in a column of drawing tools, so it gathers behind one button in the
+   rail's bottom corner and opens upward as a named list. */
+.pattern-view-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  /* Lines the button up with the column of tools above it. */
+  padding: 0 4px;
+  margin-top: auto;
 }
 
-.pattern-zoom-title {
+.pattern-toolbar .pattern-view-btn {
+  position: relative;
+  width: 44px;
+  height: 30px;
+  padding: 0 3px 0 8px;
+  justify-content: space-between;
+  border-radius: var(--palette-radius);
+  background: var(--palette-bg);
+  box-shadow: var(--palette-shadow);
+  color: var(--ink);
+}
+
+.pattern-toolbar .pattern-view-btn.is-open {
+  background-image: linear-gradient(var(--hover-strong), var(--hover-strong));
+  color: #fff;
+}
+
+/* The zoom can be held shut, and the menu that says so is itself shut: the
+   button carries the marker instead. */
+.pattern-toolbar .pattern-view-btn.is-locked::after {
+  content: '';
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.pattern-view-caret {
+  flex: 0 0 auto;
+  opacity: 0.55;
+}
+
+.pattern-view-menu {
+  position: absolute;
+  left: 4px;
+  bottom: calc(100% + 6px);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 208px;
+  max-height: min(62vh, 430px);
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--palette-bg);
+  box-shadow: var(--palette-shadow);
+}
+
+.pattern-view-menu[hidden] {
+  display: none !important;
+}
+
+.pattern-view-title {
+  padding: 2px 8px 6px;
   color: var(--muted);
   font: 600 10px/1 var(--font);
   letter-spacing: 0.07em;
   text-transform: uppercase;
+}
+
+.pattern-view-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 8px 0;
+  color: var(--muted);
+  font: 500 11px/1.2 var(--font);
+}
+
+/* One row is an icon and its name across the full width, so the list reads as
+   a column of switches rather than a grid of unlabelled icons. */
+.pattern-toolbar .pattern-view-row {
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  gap: 8px;
+  justify-content: flex-start;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: 500 12px/1 var(--font);
+  text-align: left;
+}
+
+.pattern-toolbar .pattern-view-row svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.pattern-toolbar .pattern-view-row:hover svg {
+  color: var(--ink);
+}
+
+.pattern-toolbar .pattern-view-row.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.pattern-toolbar .pattern-view-row.active svg {
+  color: #fff;
+}
+
+.pattern-view-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pattern-view-sep {
+  height: 1px;
+  margin: 5px 8px;
+  background: rgba(242, 235, 227, 0.12);
+}
+
+.pattern-zoom-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0;
 }
 
 .pattern-zoom-row {
@@ -1468,27 +1652,10 @@ optgroup {
   flex: 0 0 auto;
 }
 
-/* The lock lives in the popover, so the rail button carries the marker: a dot
-   when the level is held, readable with the popover shut. */
-.pattern-toolbar .pattern-zoom-btn.is-locked {
-  position: relative;
-  border-color: var(--accent);
-}
-
-.pattern-toolbar .pattern-zoom-btn.is-locked::after {
-  content: '';
-  position: absolute;
-  right: 2px;
-  bottom: 2px;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent);
-}
-
-.pattern-zoom-hint {
-  color: var(--muted);
-  font: 10px/1.4 var(--mono);
+.pattern-view-note {
+  color: var(--accent-ink, var(--ink));
+  font: 600 10px/1.2 var(--font);
+  letter-spacing: 0.02em;
 }
 
 .pattern-zoom-menu.is-locked .pattern-zoom-field,
@@ -1639,11 +1806,6 @@ optgroup {
   height: 5px;
   border-radius: 50%;
   background: var(--point-marker-fill);
-}
-
-.pattern-toolbar-spacer {
-  flex: 1;
-  min-height: 8px;
 }
 
 /*
@@ -3560,6 +3722,122 @@ optgroup {
   box-shadow: none;
 }
 
+/**
+ * The drape's export control, bottom-right: a 24 px split button. The left half
+ * downloads an OBJ of what is on screen, the caret opens the Blender pack — a
+ * bigger thing, so it lives one click deeper.
+ */
+.sim-export {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 12;
+  display: flex;
+  box-sizing: border-box;
+  width: 24px;
+  height: 24px;
+  border: 1px solid rgba(242, 235, 227, 0.25);
+  border-radius: 6px;
+  background: rgba(28, 26, 23, 0.86);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  overflow: visible;
+}
+
+.sim-export:hover {
+  border-color: var(--accent);
+}
+
+.sim-export-main,
+.sim-export-caret {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #f2ebe3;
+  cursor: pointer;
+}
+
+.sim-export-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-radius: 5px 0 0 5px;
+}
+
+.sim-export-caret {
+  flex: 0 0 7px;
+  border-left: 1px solid rgba(242, 235, 227, 0.2);
+  border-radius: 0 5px 5px 0;
+}
+
+.sim-export-main:hover,
+.sim-export-caret:hover,
+.sim-export-caret.is-open {
+  background: rgba(242, 235, 227, 0.12);
+}
+
+.sim-export-main:active,
+.sim-export-caret:active {
+  transform: translateY(1px);
+}
+
+.sim-export-main .sim-icon {
+  width: 11px;
+  height: 11px;
+}
+
+.sim-export-caret svg {
+  width: 7px;
+  height: 14px;
+}
+
+.sim-export-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  min-width: 232px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #1a1815;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  z-index: 13;
+}
+
+.sim-export-menu[hidden] {
+  display: none;
+}
+
+.sim-export-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ink);
+  font: 11px var(--font);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sim-export-item:hover {
+  background: #2a2621;
+}
+
+.sim-export-item-title {
+  font-weight: 600;
+}
+
+.sim-export-item-note {
+  color: #9a9188;
+  font-size: 10px;
+}
+
 /* Cloth edge highlight for the sew tool: layout-space lines over the fabric. */
 .cloth-edge-overlay {
   position: absolute;
@@ -4487,15 +4765,6 @@ optgroup {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
-}
-
-.studio-status {
-  border-top: 1px solid var(--border);
-  padding: 4px 12px;
-  font-size: 12px;
-  color: var(--muted);
-  background: var(--bg-elev);
-  font-family: var(--mono);
 }
 
 .studio-modal-root[hidden] {
@@ -5833,4 +6102,536 @@ optgroup {
   stroke: var(--accent);
   stroke-dasharray: 4 3;
   pointer-events: none;
+}
+
+/* ── Floating chrome ─────────────────────────────────────────────────────────
+   The board is the surface. The top bar and the tool rail are palettes that
+   hover over it — a gap around them, rounded, shadowed — rather than strips
+   that frame the window and eat the canvas.
+
+   Nothing in this chrome draws a hairline. A control is a fill that lightens
+   under the pointer, a popup is a shadow on a dark panel, and an active tool is
+   a fill rather than an outlined box, so the strongest edges on screen are the
+   garment's own. `--hover` is translucent on purpose: it lightens whatever sits
+   under it, so one rule reads correctly on a palette, on the board, and over an
+   accent-coloured button that is already filled. */
+:root {
+  --hover: rgba(242, 235, 227, 0.1);
+  --hover-strong: rgba(242, 235, 227, 0.17);
+  --palette-gap: 10px;
+  --palette-radius: 12px;
+  --palette-bg: #26231f;
+  --palette-shadow: 0 10px 30px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+.studio {
+  position: relative;
+}
+
+/* The page's chrome is a menu button and the file's name, over a scrim rather
+   than in a bar: nothing is boxed, and the canvas is free to run under it. The
+   scrim is the only thing that makes the label legible over the grid, so it fades
+   out in both directions and takes no pointer events. */
+.studio-toolbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 40;
+  padding: 12px 0 0 12px;
+  background: none;
+  box-shadow: none;
+  border: 0;
+}
+
+/* The scrim is its own layer, below the rail and below the header, so it can be
+   a long diagonal wash without any of its own edges landing on screen: a smaller
+   box ends the gradient mid-fade and draws a seam across the board. */
+.studio-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  pointer-events: none;
+  background: linear-gradient(
+    142deg,
+    rgba(8, 7, 6, 0.94) 0px,
+    rgba(8, 7, 6, 0.72) 90px,
+    rgba(8, 7, 6, 0.3) 200px,
+    rgba(8, 7, 6, 0) 340px
+  );
+}
+
+.studio-toolbar .menu-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.studio-toolbar .menu-toggle svg {
+  width: 18px;
+  height: 18px;
+}
+
+.studio-toolbar .menu-toggle.is-open {
+  background: var(--hover);
+}
+
+/* The file being edited, beside the button that opens everything else — and
+   the place the file is renamed, so it is a button like its neighbours: the
+   same wash under the pointer, the same rounded hit area. */
+.studio-toolbar .active-file {
+  display: inline-flex;
+  align-items: center;
+  max-width: 320px;
+  height: 26px;
+  padding: 0 8px;
+  margin-left: -6px;
+  border-radius: 7px;
+  overflow: hidden;
+  background: transparent;
+  color: var(--ink);
+  font: 600 13px var(--font);
+  letter-spacing: 0.01em;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  cursor: text;
+}
+
+.studio-toolbar .active-file[hidden] {
+  display: none !important;
+}
+
+.studio-toolbar .active-file:hover,
+.studio-toolbar .active-file:focus-visible {
+  background: var(--hover);
+}
+
+.studio-toolbar .active-file-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* The field the title becomes: same box, same wash, the caret in the text. */
+.studio-toolbar .active-file-input {
+  height: 26px;
+  max-width: 320px;
+  padding: 0 7px;
+  border-radius: 7px;
+  background: var(--hover);
+  color: var(--ink);
+  font: 600 13px var(--font);
+  letter-spacing: 0.01em;
+  text-shadow: none;
+}
+
+/* The menu itself: one column of rows, the field at the top, groups divided by a
+   hairline in the panel colour rather than by a border. */
+.studio-toolbar .app-menu {
+  top: calc(100% + 4px);
+  left: 10px;
+  min-width: 232px;
+  gap: 1px;
+}
+
+.app-menu-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 6px 6px;
+}
+
+.app-menu-field-label,
+.app-menu-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.app-menu-label {
+  padding: 6px 8px 2px;
+}
+
+.app-menu-field input {
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: rgba(242, 235, 227, 0.07);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+}
+
+.app-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.studio-toolbar .app-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.studio-toolbar .app-menu button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.app-menu-key {
+  color: var(--muted);
+  font: 11px var(--mono);
+}
+
+.studio-toolbar .app-menu button.is-active .app-menu-key {
+  color: var(--ink);
+}
+
+/* ── File menu beside the file's name ────────────────────────────────────────
+   The caret sits right of the title in the toolbar, and the menu hangs under it:
+   save, rename, and the projects you were in a moment ago. */
+
+.doc-menu {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+/* Scoped: `.studio-toolbar button` paints a panel fill on every button in the
+   bar, which a bare class does not out-rank. */
+.studio-toolbar .doc-caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.studio-toolbar .doc-caret:hover,
+.doc-menu.is-open .studio-toolbar .doc-caret,
+.studio-toolbar .doc-menu.is-open .doc-caret {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.doc-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 248px;
+  max-height: min(60vh, 420px);
+  overflow: auto;
+  padding: 6px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--bg-elev);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+}
+
+.doc-popover[hidden] {
+  display: none;
+}
+
+.doc-popover button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.doc-popover .app-menu-field {
+  padding: 2px 4px 4px;
+}
+
+.doc-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-popover .app-menu-key {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.doc-empty {
+  padding: 2px 8px 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* The rail, on whatever surface it is mounted to. Inside an expanded node that
+   surface starts under the chrome ribbon; on the board it has to clear the
+   floating top bar, which is what `--rail-top` is for. */
+.pattern-toolbar {
+  position: absolute;
+  left: var(--palette-gap);
+  top: var(--rail-top, var(--palette-gap));
+  bottom: var(--palette-gap);
+  z-index: 30;
+}
+
+.canvas-surface.is-canvas-surface {
+  --rail-top: calc(var(--palette-gap) * 2 + var(--toolbar-height, 44px));
+  /* The board's own overlays start below the floating bar rather than under it. */
+  --node-top-inset: calc(var(--palette-gap) * 2 + var(--toolbar-height, 44px));
+}
+
+/* The rail floats over the canvas now, so anything that used to sit in the
+   top-left slot of the editor — the tool settings, the selection bar, the ruler
+   options — has to clear it instead of being covered by it. */
+.pattern-editor {
+  --rail-width: 62px;
+}
+
+.pattern-point-bar,
+.pattern-ruler-bar,
+.pattern-tool-settings,
+.pattern-allowance-bar,
+.pattern-block-bar,
+.pattern-avatar-bar {
+  left: calc(8px + var(--rail-width, 0px));
+}
+
+/* ── Controls are fills, not outlines ─────────────────────────────────────── */
+
+button,
+select,
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='color']),
+textarea {
+  border-color: transparent !important;
+}
+
+/* A hover is a light wash over whatever the control already is: it reads as a
+   lift on the palette, on the board and on a filled accent button alike. */
+button:not(:disabled):hover {
+  background-image: linear-gradient(var(--hover), var(--hover));
+}
+
+button:not(:disabled):active {
+  background-image: linear-gradient(var(--hover-strong), var(--hover-strong));
+}
+
+button:disabled {
+  background-image: none;
+}
+
+/* With the strokes gone, keyboard focus needs its own ring back. */
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* A few states were carried by a hairline ring drawn inside the control. With
+   the strokes gone the fill says it, so the ring goes too. */
+.toolbar-popover button.is-active,
+.node-fullscreen-tab.is-active,
+.node-fullscreen-tab.is-stale.is-active {
+  box-shadow: none;
+}
+
+/* The one field that was transparent by design, because its dashed stroke said
+   "calculated for you". Take the stroke away and it needs a fill instead. */
+.measure-field.is-auto input {
+  background: rgba(242, 235, 227, 0.05);
+}
+
+/* Group boxes in the panels group by a wash instead of a frame, so the field
+   inside keeps the only edge in the panel: its own fill against the group. */
+.inspector-fieldset,
+.inspector-section {
+  border: 0;
+  background: rgba(242, 235, 227, 0.04);
+}
+
+/* A segmented control is one fill made of segments: the seam between two of
+   them is a dark 1px gap rather than a stroke, so the group still reads as a
+   group without drawing a box around each part. */
+.pattern-settings-group button + button,
+.pattern-block-mode button + button,
+.pattern-block-div button + button,
+.pattern-ruler-scale button + button {
+  border-left-color: rgba(28, 26, 23, 0.85) !important;
+}
+
+/* Same idea for the split export button's two halves. */
+.sim-export-caret {
+  border-left-color: rgba(242, 235, 227, 0.16) !important;
+}
+
+/* ── Popups are shadows, not frames ───────────────────────────────────────── */
+
+.pattern-point-bar,
+.pattern-ruler-bar,
+.pattern-tool-settings,
+.pattern-allowance-bar,
+.pattern-block-bar,
+.pattern-avatar-bar,
+.pattern-xray-bar,
+.toolbar-popover,
+.pattern-settings-popover,
+.pattern-tool-flyout-menu,
+.pattern-zoom-menu,
+.pattern-context-menu,
+.pattern-block-menu,
+.pattern-point-overlay,
+.pattern-toolbar-tip,
+.inspector-floating-tip,
+.node-context-menu,
+.piece-context-menu,
+.seam-context-menu,
+.sim-export-menu,
+.cloth-edge-overlay,
+.pattern-import-dialog,
+.studio-modal {
+  border: 0 !important;
+}
+
+/* ── Inspector: foldable ──────────────────────────────────────────────────── */
+
+.inspector-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.inspector-header h3 {
+  margin: 0;
+}
+
+/* Scoped to the inspector: the panel's generic `button` rule paints every one
+   of them accent orange and gives it a top margin, which is right for the
+   action buttons and wrong for a 24 px icon. */
+.studio-inspector .inspector-collapse {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  margin: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.studio-inspector .inspector-collapse:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.studio-inspector .inspector-collapse svg {
+  transition: transform 140ms ease;
+}
+
+/* Destructive actions keep their meaning as a red wash, since the stroke that
+   used to carry it is gone. */
+.studio-inspector button.danger {
+  background: rgba(170, 51, 51, 0.18);
+  color: #ff9a8f;
+}
+
+.studio-inspector button.danger:hover {
+  background: rgba(170, 51, 51, 0.32);
+  color: #fff;
+}
+
+/* Folded: the panel keeps its header row and gives the rest back to the
+   viewport. The chevron turns to point back out. */
+.studio-inspector.is-collapsed.is-fullscreen-docked {
+  flex: 0 0 46px;
+  width: 46px;
+  max-width: 46px;
+  padding: 10px 8px;
+  overflow: hidden;
+}
+
+.studio-inspector.is-collapsed > *:not(.inspector-header) {
+  display: none;
+}
+
+.studio-inspector.is-collapsed .inspector-header {
+  margin: 0;
+  justify-content: center;
+}
+
+.studio-inspector.is-collapsed .inspector-header h3 {
+  display: none;
+}
+
+.studio-inspector.is-collapsed .inspector-collapse svg {
+  transform: rotate(180deg);
+}
+
+/* ── Messages ─────────────────────────────────────────────────────────────
+   The board used to reserve a strip along the bottom for the last message. It
+   is a toast instead: it shows, then leaves. */
+
+.studio-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  z-index: 6000;
+  max-width: min(620px, calc(100vw - 32px));
+  padding: 7px 14px;
+  border-radius: 10px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  background: rgba(28, 26, 23, 0.94);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  color: var(--ink);
+  font: 12px var(--mono);
+  transform: translateX(-50%);
+  pointer-events: none;
+  animation: studio-toast-in 140ms ease-out;
+}
+
+.studio-toast[hidden] {
+  display: none;
+}
+
+@keyframes studio-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
 }

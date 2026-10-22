@@ -197,6 +197,18 @@ export type PatternEditorCallbacks = {
    */
   onPanelMarquee?: (box: { x: number; y: number; w: number; h: number }) => void;
   /**
+   * The rectangle a marquee is drawing right now, in pattern centimetres, and
+   * `null` when it finishes.
+   *
+   * A board reads this to take the frames the rectangle crosses with it: on the
+   * canvas the page and the containers in front of it are one surface, so one
+   * drag should be able to pick up points *and* the nodes they came in.
+   */
+  onMarqueeRect?: (
+    box: { x: number; y: number; w: number; h: number } | null,
+    info: { additive: boolean; panels: boolean }
+  ) => void;
+  /**
    * A drag of whole pieces finished, at the screen point it let go of.
    *
    * Whether that point means "inside a container" or "outside the frame this
@@ -896,7 +908,8 @@ export class PatternEditor {
    * them against. Purely presentational; nothing about it touches the document.
    */
   private hiconOn = false;
-  private zoomBtn!: HTMLButtonElement;
+  private viewBtn!: HTMLButtonElement;
+  private viewMenu!: HTMLElement;
   private zoomMenu!: HTMLElement;
   private zoomInput!: HTMLInputElement;
   private zoomHint!: HTMLElement;
@@ -904,7 +917,7 @@ export class PatternEditor {
   private hiconBtn!: HTMLButtonElement;
   /** The readout last written, so redraw does not rewrite the same numbers. */
   private lastZoomSig = '';
-  private zoomMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
+  private viewMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
   private xrayBtn: HTMLButtonElement;
   private seamLinksBtn: HTMLButtonElement;
   private allowanceBtn: HTMLButtonElement;
@@ -1068,75 +1081,94 @@ export class PatternEditor {
           <span class="pattern-tool-key" aria-hidden="true">R</span>
         </button>
       </div>
-      <div class="pattern-toolbar-spacer" aria-hidden="true"></div>
-      <div class="pattern-tool-flyout pattern-zoom-flyout">
-        <button type="button" data-opt="zoom" class="pattern-zoom-btn" data-tip="Zoom · set the viewport zoom" aria-label="Viewport zoom" aria-haspopup="true" aria-expanded="false">
+      <!-- Everything that changes how the work is *seen* rather than what it is:
+           one menu in the corner, so the rail stays a row of tools. -->
+      <div class="pattern-view-wrap">
+        <button type="button" class="pattern-view-btn" data-view-toggle aria-haspopup="menu" aria-expanded="false" aria-label="View settings" title="View settings">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <circle cx="6.9" cy="6.9" r="4.3" fill="none" stroke="currentColor" stroke-width="1.3"/>
-            <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M10.2 10.2 L14 14"/>
-            <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" d="M4.7 6.9 H9.1 M6.9 4.7 V9.1"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M2.2 4.6h11.6M2.2 8h11.6M2.2 11.4h11.6"/>
+            <circle cx="5.4" cy="4.6" r="1.5" fill="var(--bg-elev)" stroke="currentColor" stroke-width="1.3"/>
+            <circle cx="10.6" cy="8" r="1.5" fill="var(--bg-elev)" stroke="currentColor" stroke-width="1.3"/>
+            <circle cx="6.8" cy="11.4" r="1.5" fill="var(--bg-elev)" stroke="currentColor" stroke-width="1.3"/>
+          </svg>
+          <svg class="pattern-view-caret" width="10" height="10" viewBox="0 0 16 16" aria-hidden="true">
+            <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M3.6 6.2 8 10.4 12.4 6.2"/>
           </svg>
         </button>
-        <div class="pattern-tool-flyout-menu pattern-zoom-menu" hidden role="dialog" aria-label="Viewport zoom">
-          <span class="pattern-zoom-title">Viewport zoom</span>
-          <div class="pattern-zoom-row">
-            <button type="button" data-zoom-act="out" title="Zoom out 1%" aria-label="Zoom out 1%">−</button>
-            <label class="pattern-zoom-field">
-              <input type="number" data-zoom-input min="20" max="1000" step="1" value="100" aria-label="Zoom percent" />
-              <span class="pattern-zoom-unit">%</span>
-            </label>
-            <button type="button" data-zoom-act="in" title="Zoom in 1%" aria-label="Zoom in 1%">+</button>
+        <div class="pattern-view-menu" hidden role="menu" aria-label="View settings">
+          <span class="pattern-view-title">View</span>
+          <div class="pattern-zoom-menu" aria-label="Viewport zoom">
+            <div class="pattern-view-label"><span>Zoom</span><span class="pattern-view-note" data-zoom-hint></span></div>
+            <div class="pattern-zoom-row">
+              <button type="button" data-zoom-act="out" title="Zoom out 1%" aria-label="Zoom out 1%">−</button>
+              <label class="pattern-zoom-field">
+                <input type="number" data-zoom-input min="20" max="1000" step="1" value="100" aria-label="Zoom percent" />
+                <span class="pattern-zoom-unit">%</span>
+              </label>
+              <button type="button" data-zoom-act="in" title="Zoom in 1%" aria-label="Zoom in 1%">+</button>
+            </div>
+            <button type="button" class="pattern-view-row" data-zoom-act="fit">
+              <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+                <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M2.4 6V2.4h3.6M10 2.4h3.6V6M13.6 10v3.6H10M6 13.6H2.4V10"/>
+              </svg>
+              <span class="pattern-view-name">Fit to pattern</span>
+            </button>
+            <button type="button" class="pattern-view-row pattern-zoom-lock" data-zoom-act="lock" title="Hold the zoom level where it is — the wheel and the zoom controls stop moving it" aria-label="Lock zoom" aria-pressed="false">
+              <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+                <rect x="3.4" y="7" width="9.2" height="6.4" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.3"/>
+                <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.6 7 V5.2 a2.4 2.4 0 0 1 4.8 0 V7"/>
+                <circle cx="8" cy="10.3" r="0.95" fill="currentColor"/>
+              </svg>
+              <span class="pattern-view-name">Lock zoom</span>
+            </button>
           </div>
-          <button type="button" class="pattern-zoom-fit" data-zoom-act="fit">Fit to pattern</button>
-          <button type="button" class="pattern-zoom-lock" data-zoom-act="lock" title="Hold the zoom level where it is — the wheel and the zoom controls stop moving it" aria-label="Lock zoom" aria-pressed="false">
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              <rect x="3.4" y="7" width="9.2" height="6.4" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.3"/>
-              <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.6 7 V5.2 a2.4 2.4 0 0 1 4.8 0 V7"/>
-              <circle cx="8" cy="10.3" r="0.95" fill="currentColor"/>
+          <div class="pattern-view-sep" aria-hidden="true"></div>
+          <button type="button" class="pattern-view-row" role="menuitemcheckbox" data-opt="hicon" aria-label="Hicon projection" aria-pressed="false">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1" opacity="0.5" d="M2.4 8.6 H13.6 M2.4 11 H13.6 M6.2 2.9 V12.6 M10.2 3.9 V12.6"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" d="M4.4 12.4 V6.6 L7.6 3.4 L13.2 5.2 V12.4 Z"/>
             </svg>
-            <span>Lock zoom</span>
+            <span class="pattern-view-name">Hicon projection</span>
           </button>
-          <span class="pattern-zoom-hint" data-zoom-hint></span>
+          <button type="button" class="pattern-view-row" role="menuitemcheckbox" data-opt="allowance" aria-label="Seam allowance" aria-pressed="false">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" d="M4.6 1.9 H 11.4 L 14.1 8 L 11.4 14.1 H 4.6 L 1.9 8 Z"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.05" stroke-dasharray="1.7 1.5" stroke-linejoin="round" d="M6.3 4.2 H 9.8 L 11.7 8 L 9.8 11.8 H 6.3 L 4.3 8 Z"/>
+            </svg>
+            <span class="pattern-view-name">Seam allowance</span>
+          </button>
+          <button type="button" class="pattern-view-row" role="menuitemcheckbox" data-opt="seam-links" aria-label="Seam links" aria-pressed="false">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="4.5" cy="5" r="1.4" fill="currentColor"/>
+              <circle cx="11.5" cy="11" r="1.4" fill="currentColor"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 1.5" stroke-linecap="round" d="M5.6 5.8 L10.4 10.2"/>
+            </svg>
+            <span class="pattern-view-name">Seam links</span>
+          </button>
+          <button type="button" class="pattern-view-row" role="menuitemcheckbox" data-opt="xray" aria-label="X-ray" aria-pressed="false">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.3" d="M2.5 8c1.8-3.2 4-4.8 5.5-4.8S11.7 4.8 13.5 8c-1.8 3.2-4 4.8-5.5 4.8S4.3 11.2 2.5 8z"/>
+              <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.2 1" d="M3 11.5 L13 4.5"/>
+            </svg>
+            <span class="pattern-view-name">X-ray</span>
+          </button>
+          <button type="button" class="pattern-view-row" role="menuitemcheckbox" data-opt="avatar" aria-label="Avatar reference" aria-pressed="false">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="8" cy="4.2" r="2.2" fill="currentColor"/>
+              <path fill="currentColor" d="M3.2 13.5c.4-2.8 2.2-4.2 4.8-4.2s4.4 1.4 4.8 4.2H3.2z"/>
+            </svg>
+            <span class="pattern-view-name">Avatar reference</span>
+          </button>
+          <button type="button" class="pattern-view-row active" role="menuitemcheckbox" data-opt="snap" aria-label="Snap" aria-pressed="true">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="currentColor" d="M3 2h4v1.5H4.5V6H3V2zm6 0h4v4h-1.5V3.5H9V2zM3 10h1.5v2.5H7V14H3v-4zm8.5 0H14v4h-4v-1.5h2.5V10z"/>
+              <circle cx="8" cy="8" r="1.6" fill="currentColor"/>
+            </svg>
+            <span class="pattern-view-name">Snap</span>
+          </button>
         </div>
       </div>
-      <button type="button" data-opt="hicon" class="pattern-hicon-btn" data-tip="Hicon projection · white outlines, seam allowance and a stronger grid" aria-label="Hicon projection" aria-pressed="false">
-        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-          <path fill="none" stroke="currentColor" stroke-width="1" opacity="0.5" d="M2.4 8.6 H13.6 M2.4 11 H13.6 M6.2 2.9 V12.6 M10.2 3.9 V12.6"/>
-          <path fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" d="M4.4 12.4 V6.6 L7.6 3.4 L13.2 5.2 V12.4 Z"/>
-        </svg>
-      </button>
-      <button type="button" data-opt="allowance" class="pattern-allowance-btn" data-tip="Seam allowance · show it, and click an edge to set its own" aria-label="Seam allowance" aria-pressed="false">
-        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-          <path fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" d="M4.6 1.9 H 11.4 L 14.1 8 L 11.4 14.1 H 4.6 L 1.9 8 Z"/>
-          <path fill="none" stroke="currentColor" stroke-width="1.05" stroke-dasharray="1.7 1.5" stroke-linejoin="round" d="M6.3 4.2 H 9.8 L 11.7 8 L 9.8 11.8 H 6.3 L 4.3 8 Z"/>
-        </svg>
-      </button>
-      <button type="button" data-opt="seam-links" class="pattern-seam-links-btn" data-tip="Seam links" aria-label="Seam links" aria-pressed="false">
-        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-          <circle cx="4.5" cy="5" r="1.4" fill="currentColor"/>
-          <circle cx="11.5" cy="11" r="1.4" fill="currentColor"/>
-          <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 1.5" stroke-linecap="round" d="M5.6 5.8 L10.4 10.2"/>
-        </svg>
-      </button>
-      <button type="button" data-opt="xray" class="pattern-xray-btn" data-tip="X-ray" aria-label="X-ray">
-        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-          <path fill="none" stroke="currentColor" stroke-width="1.3" d="M2.5 8c1.8-3.2 4-4.8 5.5-4.8S11.7 4.8 13.5 8c-1.8 3.2-4 4.8-5.5 4.8S4.3 11.2 2.5 8z"/>
-          <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/>
-          <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.2 1" d="M3 11.5 L13 4.5"/>
-        </svg>
-      </button>
-      <button type="button" data-opt="avatar" class="pattern-avatar-btn" data-tip="Avatar" aria-label="Avatar">
-        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-          <circle cx="8" cy="4.2" r="2.2" fill="currentColor"/>
-          <path fill="currentColor" d="M3.2 13.5c.4-2.8 2.2-4.2 4.8-4.2s4.4 1.4 4.8 4.2H3.2z"/>
-        </svg>
-      </button>
-      <button type="button" data-opt="snap" class="pattern-snap-btn active" data-tip="Snap" aria-label="Snap">
-        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-          <path fill="currentColor" d="M3 2h4v1.5H4.5V6H3V2zm6 0h4v4h-1.5V3.5H9V2zM3 10h1.5v2.5H7V14H3v-4zm8.5 0H14v4h-4v-1.5h2.5V10z"/>
-          <circle cx="8" cy="8" r="1.6" fill="currentColor"/>
-        </svg>
-      </button>
     `;
     this.root.appendChild(this.toolbar);
     this.svgFileInput = document.createElement('input');
@@ -1155,7 +1187,8 @@ export class PatternEditor {
     this.allowanceBtn = this.toolbar.querySelector(
       'button[data-opt="allowance"]'
     ) as HTMLButtonElement;
-    this.zoomBtn = this.toolbar.querySelector('button[data-opt="zoom"]') as HTMLButtonElement;
+    this.viewBtn = this.toolbar.querySelector('[data-view-toggle]') as HTMLButtonElement;
+    this.viewMenu = this.toolbar.querySelector('.pattern-view-menu') as HTMLElement;
     this.zoomMenu = this.toolbar.querySelector('.pattern-zoom-menu') as HTMLElement;
     this.zoomInput = this.toolbar.querySelector('input[data-zoom-input]') as HTMLInputElement;
     this.zoomHint = this.toolbar.querySelector('[data-zoom-hint]') as HTMLElement;
@@ -1165,6 +1198,7 @@ export class PatternEditor {
     this.hiconBtn = this.toolbar.querySelector('button[data-opt="hicon"]') as HTMLButtonElement;
     this.zoomInput.min = String(MIN_ZOOM_PERCENT);
     this.zoomInput.max = String(MAX_ZOOM_PERCENT);
+    this.bindViewMenu();
     this.bindZoomMenu();
     this.xrayBtn = this.toolbar.querySelector('button[data-opt="xray"]') as HTMLButtonElement;
     this.avatarToggleBtn = this.toolbar.querySelector('button[data-opt="avatar"]') as HTMLButtonElement;
@@ -1210,6 +1244,7 @@ export class PatternEditor {
       if (snap) {
         this.softSnap = !this.softSnap;
         this.snapBtn.classList.toggle('active', this.softSnap);
+        this.snapBtn.setAttribute('aria-pressed', String(this.softSnap));
         this.snapGuides = [];
         this.redraw();
         return;
@@ -2085,10 +2120,10 @@ export class PatternEditor {
         e.preventDefault();
         return;
       }
-      if (!this.zoomMenu.hidden) {
-        // Swallow the key: the popover is what Escape is dismissing, not the
+      if (!this.viewMenu.hidden) {
+        // Swallow the key: the menu is what Escape is dismissing, not the
         // full-screen view it happens to be sitting in.
-        this.hideZoomMenu();
+        this.closeViewMenu();
         e.preventDefault();
         e.stopPropagation();
         return;
@@ -2212,7 +2247,7 @@ export class PatternEditor {
     e.stopPropagation();
     // Taking a tool up is walking back to the canvas: whatever popover was in
     // the way closes, the way Escape would close it.
-    this.hideZoomMenu();
+    this.closeViewMenu();
     this.hideSettingsMenus();
     this.hideContextMenu();
     // Add, Modify, Cut and Ruler come up in whatever mode they are set to: the
@@ -2422,6 +2457,22 @@ export class PatternEditor {
   /** Repaint without touching the pattern — the host moved or changed data. */
   refresh(): void {
     this.redraw();
+  }
+
+  /** The element this editor was mounted in — its host, not the drawing. */
+  element(): HTMLElement {
+    return this.root;
+  }
+
+  /**
+   * Is a pointer gesture under way in this editor?
+   *
+   * A host that also watches the same press needs to know whether the editor took
+   * it: on the canvas, the page sits under the frames, so a drag on empty space is
+   * the page's marquee *unless* the tool in hand is doing something else.
+   */
+  isGestureActive(): boolean {
+    return this.drag !== null;
   }
 
   /**
@@ -3090,10 +3141,10 @@ export class PatternEditor {
     this.zoomLocked = on;
     this.zoomLockBtn.classList.toggle('active', on);
     this.zoomLockBtn.setAttribute('aria-pressed', String(on));
+    // Shut, the menu cannot show the lock, so the button that opens it does.
+    this.viewBtn.classList.toggle('is-locked', on);
+    this.viewBtn.title = on ? 'View settings · zoom locked' : 'View settings';
     this.zoomMenu.classList.toggle('is-locked', on);
-    // The marker on the rail button: the lock lives in the popover, so the
-    // button has to say the level is held even while the popover is shut.
-    this.zoomBtn.classList.toggle('is-locked', on);
     this.zoomInput.disabled = on;
     // The lock row itself stays live — it is the way back out.
     this.zoomMenu.querySelectorAll('button[data-zoom-act]').forEach((btn) => {
@@ -3114,12 +3165,6 @@ export class PatternEditor {
   }
 
   private bindZoomMenu(): void {
-    this.zoomBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.hideToolbarTip();
-      this.toggleZoomMenu(this.zoomMenu.hidden);
-    });
     this.zoomMenu.addEventListener('click', (e) => {
       const act = (e.target as HTMLElement).closest('button[data-zoom-act]')?.getAttribute(
         'data-zoom-act'
@@ -3141,33 +3186,47 @@ export class PatternEditor {
     });
   }
 
-  private toggleZoomMenu(show: boolean): void {
-    this.zoomMenu.hidden = !show;
-    this.zoomBtn.setAttribute('aria-expanded', String(show));
-    if (!show) {
-      this.hideZoomMenu();
+  /**
+   * The view menu in the rail's corner. It stays open while its toggles are
+   * flipped — they are the kind of setting you try two of in a row — and closes
+   * on a press outside, on Escape, or on the button again.
+   */
+  private bindViewMenu(): void {
+    const btn = this.viewBtn;
+    const menu = this.viewMenu;
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.hideToolbarTip();
+      this.setViewMenuOpen(menu.hidden);
+    });
+  }
+
+  private setViewMenuOpen(open: boolean): void {
+    this.viewMenu.hidden = !open;
+    this.viewBtn.setAttribute('aria-expanded', String(open));
+    this.viewBtn.classList.toggle('is-open', open);
+    if (!open) {
+      this.closeViewMenu();
       return;
     }
     this.syncZoomControl();
-    this.zoomInput.focus();
-    this.zoomInput.select();
-    if (!this.zoomMenuDocPointerDown) {
-      // Any press outside the button and its popover puts the popover away.
-      this.zoomMenuDocPointerDown = (e: PointerEvent) => {
-        const target = e.target as Node;
-        if (this.zoomMenu.contains(target) || this.zoomBtn.contains(target)) return;
-        this.hideZoomMenu();
-      };
-      document.addEventListener('pointerdown', this.zoomMenuDocPointerDown, true);
-    }
+    if (this.viewMenuDocPointerDown) return;
+    this.viewMenuDocPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (this.viewMenu.contains(target) || this.viewBtn.contains(target)) return;
+      this.closeViewMenu();
+    };
+    document.addEventListener('pointerdown', this.viewMenuDocPointerDown, true);
   }
 
-  private hideZoomMenu(): void {
-    this.zoomMenu.hidden = true;
-    this.zoomBtn.setAttribute('aria-expanded', 'false');
-    if (this.zoomMenuDocPointerDown) {
-      document.removeEventListener('pointerdown', this.zoomMenuDocPointerDown, true);
-      this.zoomMenuDocPointerDown = null;
+  private closeViewMenu(): void {
+    this.viewMenu.hidden = true;
+    this.viewBtn.setAttribute('aria-expanded', 'false');
+    this.viewBtn.classList.remove('is-open');
+    if (this.viewMenuDocPointerDown) {
+      document.removeEventListener('pointerdown', this.viewMenuDocPointerDown, true);
+      this.viewMenuDocPointerDown = null;
     }
   }
 
@@ -3196,17 +3255,13 @@ export class PatternEditor {
     if (sig === this.lastZoomSig) return;
     this.lastZoomSig = sig;
     this.zoomInput.value = String(pct);
-    this.zoomBtn.dataset.tip = this.zoomLocked
-      ? `Zoom · locked at ${pct}%`
-      : `Zoom · ${pct}% — type a value, or use ⌘/Ctrl-wheel`;
-    this.zoomHint.textContent = this.zoomLocked
-      ? 'Locked — the wheel will not zoom'
-      : 'Percent of the default framing';
+    this.zoomHint.textContent = this.zoomLocked ? 'Locked' : '';
   }
 
   private setXrayEnabled(on: boolean): void {
     this.xrayOn = on;
     this.xrayBtn.classList.toggle('active', on);
+    this.xrayBtn.setAttribute('aria-pressed', String(on));
     this.xrayBar.hidden = !on;
     this.root.classList.toggle('is-xray', on);
     if (on) {
@@ -3290,6 +3345,7 @@ export class PatternEditor {
   private async setAvatarOverlayEnabled(on: boolean): Promise<void> {
     this.avatarOverlayOn = on;
     this.avatarToggleBtn.classList.toggle('active', on);
+    this.avatarToggleBtn.setAttribute('aria-pressed', String(on));
     this.avatarBar.hidden = !on;
     if (!on) {
       this.avatarOverlayPath = '';
@@ -3658,6 +3714,27 @@ export class PatternEditor {
       maxY += pad;
     }
     return { minX, minY, maxX, maxY };
+  }
+
+  /** Tell the host what rectangle is being drawn, or that the drag is over. */
+  private reportMarquee(
+    drag: { start: Vec2; current: Vec2; additive: boolean; panels: boolean } | null
+  ): void {
+    const report = this.cbs.onMarqueeRect;
+    if (!report) return;
+    if (!drag) {
+      report(null, { additive: false, panels: false });
+      return;
+    }
+    report(
+      {
+        x: Math.min(drag.start.x, drag.current.x),
+        y: Math.min(drag.start.y, drag.current.y),
+        w: Math.abs(drag.current.x - drag.start.x),
+        h: Math.abs(drag.current.y - drag.start.y),
+      },
+      { additive: drag.additive, panels: drag.panels }
+    );
   }
 
   private drawMarquee(a: Vec2, b: Vec2, panels: boolean): void {
@@ -8115,6 +8192,7 @@ export class PatternEditor {
         panels: true,
         togglePieceId: piece?.id,
       };
+      this.reportMarquee(this.drag);
       this.svg.setPointerCapture(e.pointerId);
       e.preventDefault();
       this.redraw();
@@ -8363,6 +8441,7 @@ export class PatternEditor {
         additive: e.shiftKey && !(e.metaKey || e.ctrlKey),
         panels: e.metaKey || e.ctrlKey,
       };
+      this.reportMarquee(this.drag);
       this.svg.setPointerCapture(e.pointerId);
       e.preventDefault();
       this.redraw();
@@ -10484,6 +10563,7 @@ export class PatternEditor {
       // them, Cmd winning when both are held.
       this.drag.panels = e.metaKey || e.ctrlKey;
       this.drag.additive = !this.drag.panels && e.shiftKey;
+      this.reportMarquee(this.drag);
       this.redraw();
       return;
     }
@@ -10649,6 +10729,7 @@ export class PatternEditor {
     this.snapGuides = [];
     // Keep history armed through finish handlers; clear at end of up.
     if (finished.type === 'marquee') {
+      this.reportMarquee(null);
       const moved = dist(finished.start, finished.current);
       if (moved < this.hitRadius() * 0.35) {
         // Drawn no further than a click. Cmd/Ctrl on a piece means that one

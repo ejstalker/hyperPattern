@@ -33,6 +33,24 @@ import { ghostInverseMass } from '../../ghostMass';
 import { DEFAULT_MAX_SPEED } from '../../../project/createDefault';
 
 const DELTA_SCALE = 1 << 20;
+
+/** How far apart cloth–cloth contact holds two points, in mesh edges. */
+const DEFAULT_CONTACT_EDGES = 0.5;
+/**
+ * A contact can be no thicker than half an edge.
+ *
+ * Thickness and the seam model have to agree: a seam holds its two rows about a
+ * millimetre and a half apart, so a fabric "two edges thick" cannot have a seam
+ * at all — the stitch pulls the rows together, the contact pushes them apart,
+ * and the pair is dragged around the body for as long as the sim runs. At half
+ * an edge the layers can still pass each other no more than a fold's thickness
+ * while a seam is a seam.
+ */
+const MAX_CONTACT_EDGES = 0.5;
+
+function clampContactEdges(edges: number): number {
+  return Math.min(MAX_CONTACT_EDGES, Math.max(0.05, edges));
+}
 /**
  * Slower sew so panels wrap around the body instead of tunneling through it.
  * Seam clamp-safety comes from the attach kernel's per-pass `maxClose` budget,
@@ -166,7 +184,7 @@ export class XpbdGpuEngine implements ClothSimulator {
   private bendCompliance = 1e-3;
   /** Provot max edge length as a multiple of rest; ≤ 1 disables. */
   private maxStretch = 1.12;
-  private diameterScalar = 1.5;
+  private diameterScalar = DEFAULT_CONTACT_EDGES;
   private totalMass = 100;
   private maxSpeed: number;
   private friction: number;
@@ -206,8 +224,6 @@ export class XpbdGpuEngine implements ClothSimulator {
   private seamInitialBuf!: GPUBuffer;
   private indicesBuf!: GPUBuffer;
   private normalsAccumBuf!: GPUBuffer;
-  /** Packed one-ring CSR: offsets[0..n] followed by the neighbor list. */
-  private oneRingBuf!: GPUBuffer;
   private obstaclesBuf!: GPUBuffer;
   private renderPosBuf!: GPUBuffer;
   private renderNrmBuf!: GPUBuffer;
@@ -258,6 +274,8 @@ export class XpbdGpuEngine implements ClothSimulator {
   private cellCursorBuf!: GPUBuffer;
   private particleIdsBuf!: GPUBuffer;
   private particleHashBuf!: GPUBuffer;
+  /** CSR of the particles each point is sewn to: offsets[0..n] then the list. */
+  private sewnBuf!: GPUBuffer;
   private tableSize = 4096;
   private maxNeighbors = 64;
 
@@ -279,7 +297,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.stretchCompliance = stretchComplianceFromParams(params);
     this.bendCompliance = bendComplianceFromParams(params);
     this.maxStretch = params.maxStretch ?? this.maxStretch;
-    this.diameterScalar = params.particleDiameterScalar ?? this.diameterScalar;
+    this.diameterScalar = clampContactEdges(params.particleDiameterScalar ?? this.diameterScalar);
     this.maxSpeed = params.maxSpeed ?? DEFAULT_MAX_SPEED;
     this.friction = params.contactFriction ?? 0.45;
     this.enableSelfCollision = params.enableSelfCollision ?? false;
@@ -457,16 +475,6 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.indicesBuf = this.createBuf(this.indices.byteLength || 4, usage, 'xpbd-indices');
     this.writeBuf(this.indicesBuf, this.indices);
 
-    {
-      const off = this.topo.oneRingOffsets;
-      const nbr = this.topo.oneRingNeighbors;
-      const packed = new Uint32Array(off.length + nbr.length);
-      packed.set(off, 0);
-      packed.set(nbr, off.length);
-      this.oneRingBuf = this.createBuf(packed.byteLength, usage, 'xpbd-1ring');
-      this.writeBuf(this.oneRingBuf, packed);
-    }
-
     this.obstaclesBuf = this.createBuf(28 * 4 * 4, usage, 'xpbd-obstacles');
     this.renderPosBuf = this.createBuf(
       n * 12,
@@ -535,6 +543,28 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.cellCursorBuf = this.createBuf(this.tableSize * 4, usage, 'xpbd-cell-cursor');
     this.particleIdsBuf = this.createBuf(n * 4, usage, 'xpbd-part-ids');
     this.particleHashBuf = this.createBuf(n * 4, usage, 'xpbd-part-hash');
+
+    {
+      const nbrs: number[][] = Array.from({ length: n }, () => []);
+      for (const [a, b] of this.seamPairs) {
+        nbrs[a]!.push(b);
+        nbrs[b]!.push(a);
+      }
+      const offsets = new Uint32Array(n + 1);
+      let total = 0;
+      for (let i = 0; i < n; i++) {
+        offsets[i] = total;
+        total += nbrs[i]!.length;
+      }
+      const list = new Uint32Array(total);
+      let at = 0;
+      for (let i = 0; i < n; i++) for (const j of nbrs[i]!) list[at++] = j;
+      const packed = new Uint32Array(offsets.length + list.length);
+      packed.set(offsets, 0);
+      packed.set(list, offsets.length);
+      this.sewnBuf = this.createBuf(packed.byteLength, usage, 'xpbd-sewn');
+      this.writeBuf(this.sewnBuf, packed);
+    }
   }
 
   /** Upload the packed (inverse mass, edge length) buffer used by collision. */
@@ -670,13 +700,10 @@ export class XpbdGpuEngine implements ClothSimulator {
         pass.dispatchWorkgroups(groups(n));
       }
 
-      if (this.enableSelfCollision) {
-        // Rebuild the spatial hash from the just-predicted positions each substep
-        // so the cell lists match what the collision kernel reads.
-        this.dispatchHashBuild(pass);
-        this.dispatchSelfCollision(pass);
-        this.dispatchApplyDeltas(pass);
-      }
+      // One hash per substep, built from the positions the iteration loop will
+      // work on: the constraint passes move points by a fraction of a cell, so
+      // the buckets stay good enough for every iteration's contact pass.
+      if (this.enableSelfCollision) this.dispatchHashBuild(pass, this.predictedBuf);
 
       for (let it = 0; it < this.iterations; it++) {
         this.dispatchStretch(pass, invH2);
@@ -684,6 +711,14 @@ export class XpbdGpuEngine implements ClothSimulator {
         this.dispatchAttach(pass, seamProgress, h);
         // Extra stretch pass resists seam crumpling / self-intersection.
         if (wrapping) this.dispatchStretch(pass, invH2);
+        // Cloth–cloth contact is a constraint like the rest, and is solved with
+        // them for that reason: it has to be part of the configuration the
+        // iteration converges to, or every solve hands the fabric back to the
+        // one that follows it and the cloth never comes to rest.
+        if (this.enableSelfCollision) {
+          this.dispatchSelfCollision(pass, h);
+          this.dispatchApplyDeltas(pass, h);
+        }
       }
 
       // Provot strain limiting — keeps soft-compliance cloth from stretching
@@ -737,6 +772,8 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.dispatchStitchVelocity(pass, seamProgress);
 
       // Body/floor contact after finalize so sew can't pull through the avatar.
+      // It goes last of all: separating two layers can push one of them into the
+      // body, and the body is the one surface the cloth may never be inside.
       this.dispatchCollideSdf(pass, h);
     }
 
@@ -871,8 +908,8 @@ export class XpbdGpuEngine implements ClothSimulator {
     }
   }
 
-  /** Counting-sort spatial hash over the current predicted positions. */
-  private dispatchHashBuild(pass: GPUComputePassEncoder): void {
+  /** Counting-sort spatial hash over the positions the collision kernel reads. */
+  private dispatchHashBuild(pass: GPUComputePassEncoder, positions: GPUBuffer): void {
     const uData = new ArrayBuffer(16);
     const f = new Float32Array(uData);
     const u32 = new Uint32Array(uData);
@@ -884,7 +921,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     // `layout: 'auto'` prunes bindings an entry point doesn't statically use, so
     // each hash entry point needs a bind group that exactly matches its layout.
     const buffers: Record<number, GPUBuffer> = {
-      1: this.predictedBuf,
+      1: positions,
       2: this.cellStartBuf,
       3: this.cellCountBuf,
       4: this.cellCursorBuf,
@@ -1030,12 +1067,18 @@ export class XpbdGpuEngine implements ClothSimulator {
     pass.dispatchWorkgroups(groups(this.nParticles));
   }
 
-  private dispatchApplyDeltas(pass: GPUComputePassEncoder): void {
+  private dispatchApplyDeltas(pass: GPUComputePassEncoder, h: number): void {
     const uData = new ArrayBuffer(16);
     const f = new Float32Array(uData);
     const u32 = new Uint32Array(uData);
     u32[0] = this.nParticles;
     f[2] = 1.0;
+    // How far one pass may separate a pair: a fraction of an edge (the same shape
+    // of cap the body contact uses), and never more than a substep of travel at
+    // the velocity clamp — a correction past that is one `finalize` refuses to
+    // commit, which leaves the particle holding the speed instead of the place.
+    f[3] = Math.min(0.25 * this.topo.avgEdgeLength, this.maxSpeed * h) /
+      Math.max(this.topo.avgEdgeLength, 1e-6);
     const u = this.uniform('apply', uData);
     pass.setPipeline(this.pipelines.applyDeltas);
     pass.setBindGroup(
@@ -1044,12 +1087,13 @@ export class XpbdGpuEngine implements ClothSimulator {
         { binding: 0, resource: { buffer: u } },
         { binding: 1, resource: { buffer: this.predictedBuf } },
         { binding: 2, resource: { buffer: this.deltaBuf } },
+        { binding: 3, resource: { buffer: this.massEdgeBuf } },
       ])
     );
     pass.dispatchWorkgroups(groups(this.nParticles));
   }
 
-  private dispatchSelfCollision(pass: GPUComputePassEncoder): void {
+  private dispatchSelfCollision(pass: GPUComputePassEncoder, h: number): void {
     const uData = new ArrayBuffer(32);
     const f = new Float32Array(uData);
     const u32 = new Uint32Array(uData);
@@ -1058,8 +1102,14 @@ export class XpbdGpuEngine implements ClothSimulator {
     f[2] = 1 / Math.max(this.particleDiameter, 1e-4);
     f[3] = this.diameterScalar;
     f[4] = DELTA_SCALE;
-    f[5] = this.friction;
+    // Friction acts on the slip of a whole substep; this pass runs once per
+    // iteration, so both the Coulomb bound and the slip budget are shared out
+    // between them. Re-applying a full substep's worth each time shoves the pair
+    // back further than it slipped and the contact buzzes instead of gripping.
+    const passes = Math.max(1, this.iterations);
+    f[5] = this.friction / passes;
     u32[6] = this.maxNeighbors;
+    f[7] = h / passes;
     const u = this.uniform('selfcol', uData);
     pass.setPipeline(this.pipelines.collideParticles);
     pass.setBindGroup(
@@ -1069,10 +1119,11 @@ export class XpbdGpuEngine implements ClothSimulator {
         { binding: 1, resource: { buffer: this.predictedBuf } },
         { binding: 2, resource: { buffer: this.initialBuf } },
         { binding: 3, resource: { buffer: this.massEdgeBuf } },
-        { binding: 4, resource: { buffer: this.oneRingBuf } },
-        { binding: 5, resource: { buffer: this.cellStartBuf } },
-        { binding: 6, resource: { buffer: this.particleIdsBuf } },
+        { binding: 4, resource: { buffer: this.cellStartBuf } },
+        { binding: 5, resource: { buffer: this.particleIdsBuf } },
+        { binding: 6, resource: { buffer: this.velocitiesBuf } },
         { binding: 7, resource: { buffer: this.deltaBuf } },
+        { binding: 8, resource: { buffer: this.sewnBuf } },
       ])
     );
     pass.dispatchWorkgroups(groups(this.nParticles));
@@ -1343,6 +1394,15 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.syncStrainColors();
   }
 
+  /**
+   * Contact thickness, clamped and kept in step with the hash cell size (the
+   * search cell is the contact distance, so the two may never drift apart).
+   */
+  private setContactThickness(scalar: number | undefined): void {
+    this.diameterScalar = clampContactEdges(scalar ?? this.diameterScalar);
+    this.particleDiameter = this.topo.avgEdgeLength * this.diameterScalar;
+  }
+
   applyParams(params: SimParams): void {
     this.substeps = params.substeps ?? this.substeps;
     this.iterations = params.constraintIterations ?? this.iterations;
@@ -1355,7 +1415,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.stretchCompliance = stretchComplianceFromParams(params);
     this.bendCompliance = bendComplianceFromParams(params);
     this.maxStretch = params.maxStretch ?? this.maxStretch;
-    this.diameterScalar = params.particleDiameterScalar ?? this.diameterScalar;
+    this.diameterScalar = clampContactEdges(params.particleDiameterScalar ?? this.diameterScalar);
 
     const mass = Math.max(1e-3, params.mass);
     if (Math.abs(mass - this.totalMass) > 1e-6) {
@@ -1833,6 +1893,14 @@ export class XpbdGpuEngine implements ClothSimulator {
     return this.cpuPos.length ? this.cpuPos : null;
   }
 
+  getRestPositionsSnapshot(): Float32Array | null {
+    return this.cpuInitial.length ? this.cpuInitial : null;
+  }
+
+  getTriangleIndices(): Uint32Array {
+    return this.indices;
+  }
+
   getNormalBuffer(): GPUBuffer {
     return this.renderNrmBuf;
   }
@@ -1883,7 +1951,6 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.seamInitialBuf,
       this.indicesBuf,
       this.normalsAccumBuf,
-      this.oneRingBuf,
       this.obstaclesBuf,
       this.renderPosBuf,
       this.renderNrmBuf,
@@ -1901,6 +1968,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.cellCursorBuf,
       this.particleIdsBuf,
       this.particleHashBuf,
+      this.sewnBuf,
     ];
     for (const b of bufs) b?.destroy();
     this.flushTransientUniforms();

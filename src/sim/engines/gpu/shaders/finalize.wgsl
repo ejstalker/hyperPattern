@@ -21,21 +21,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
   let p = positions[i].xyz;
-  var q = predicted[i].xyz;
-  var delta = q - p;
+  var delta = predicted[i].xyz - p;
   let dlen = length(delta);
   // Clamp constraint-induced travel this substep so sew/stretch can't teleport
-  // through the avatar or crumple into self-intersections.
+  // through the avatar or crumple into self-intersections. A truncated
+  // correction is not travel: the speed is read off what the cloth actually
+  // took, so a particle held still by its constraints is at rest rather than
+  // standing there holding the speed of a falling one.
   let maxDelta = max(params.maxSpeed * (1.0 / max(params.invH, 1e-4)), 1e-5);
   if (dlen > maxDelta && dlen > 1e-8) {
-    // Over budget: the cloth is being held back by its constraints, not moving
-    // freely, so this truncated correction is not travel and must not become
-    // speed. Adopting it instead leaves a gathered seam saturated at the
-    // velocity clamp, walking the cloth down the body for minutes on end. Keep
-    // the motion it already had, damped.
-    positions[i] = vec4<f32>(p + delta * (maxDelta / dlen), 0.0);
-    velocities[i] = vec4<f32>(velocities[i].xyz * params.velRetain, 0.0);
-    return;
+    delta = delta * (maxDelta / dlen);
   }
   var v = delta * params.invH;
   v = v * params.velRetain;
@@ -44,5 +39,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     v = v * (params.maxSpeed / speed);
   }
   velocities[i] = vec4<f32>(v, 0.0);
-  positions[i] = vec4<f32>(q, 0.0);
+  positions[i] = vec4<f32>(p + delta, 0.0);
 }

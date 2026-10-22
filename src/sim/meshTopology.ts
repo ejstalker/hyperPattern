@@ -188,6 +188,28 @@ function buildOneRing(numParticles: number, edges: Array<[number, number]>): {
 }
 
 /**
+ * Re-wind the mesh's triangles for the world they are laid out in.
+ *
+ * Pattern space is a drafting canvas: x right, y *down*. The layout above maps
+ * it to world (x, ·, −y) — a mirror — and a mirror reverses handedness, so every
+ * triangle that was wound front-first in the pattern arrives back-to-front in
+ * the scene. Nothing noticed for a long time because the drapes are drawn with
+ * culling off and the mistake is invisible until you read the mesh out: the
+ * exported OBJ's fabric has its normals pointing into the body. Reversing each
+ * triangle here, once, is what makes the cloth's outside its front face — for
+ * the renderer's normals and for every export.
+ */
+function windOutward(triangles: ArrayLike<number>): Uint32Array {
+  const indices = new Uint32Array(triangles.length);
+  for (let t = 0; t + 2 < triangles.length; t += 3) {
+    indices[t] = triangles[t]!;
+    indices[t + 1] = triangles[t + 2]!;
+    indices[t + 2] = triangles[t + 1]!;
+  }
+  return indices;
+}
+
+/**
  * Shared mesh → particle/constraint topology for CPU and GPU engines.
  */
 export function buildClothTopology(
@@ -365,7 +387,7 @@ export function buildClothTopology(
     inverseMasses,
     radii,
     edgeLengths,
-    indices: new Uint32Array(triangles),
+    indices: windOutward(triangles),
     vertexPieceIds: pieceIds,
     stretch,
     bend,

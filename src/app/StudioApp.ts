@@ -47,8 +47,24 @@ import {
   type PatternDetail,
   type PatternEditorContainer,
 } from '../pattern/PatternEditor';
+import {
+  clipboardPasteCount,
+  copyNodes,
+  copyPieces,
+  describeClipboard,
+  getClipboard,
+  noteClipboardPaste,
+  pasteNodes,
+  pastePieces,
+  parseClipboardPayload,
+  serializeClipboard,
+  setClipboard,
+  type ClipboardPayload,
+  type NodeClipboard,
+  type PieceClipboard,
+} from '../project/clipboard';
 import { remapSeamAllowance, sameSeamBindingPair } from '../pattern/geometry';
-import { DEFAULT_SEAM_GAP_CM } from '../mesh/triangulate';
+import { DEFAULT_SEAM_GAP_CM, resolveSeamParticlePairs } from '../mesh/triangulate';
 import { generateBlockPieces } from '../pattern/blocks/generate';
 import { getBlockDefinition } from '../pattern/blocks/registry';
 import {
@@ -85,6 +101,9 @@ import {
 import { MeshPreview } from '../mesh/MeshPreview';
 import { quat, vec3 } from 'gl-matrix';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
+import { buildObj, downloadFile, downloadTextFile, objFileName, type ObjPart } from '../export/objExport';
+import { buildBlenderPack, blenderPackFileName, type BlenderPackSeam } from '../export/blenderPack';
+import { SimExportControl } from './SimExportControl';
 import type { PlacementCommit } from '../sim/placementGesture';
 import { quatToEulerDeg, resolvePieceQuat } from '../sim/pieceTransforms';
 import { Environment, loadEnvironmentSettings } from '../render/environment';
@@ -142,6 +161,21 @@ const CONTAINER_CHROME_SETTLE_MS = 140;
 const ZOOM_GESTURE_SETTLE_MS = 140;
 
 /**
+ * How long the "+ 3d container" prompt waits after the pointer leaves the terminal
+ * it belongs to. Long enough to cross the gap — the prompt sits beside the port,
+ * not on it — short enough that moving on feels like it dismissed itself.
+ */
+const DRAPE_OFFER_LINGER_MS = 220;
+
+/** How many other projects the file menu offers to jump back to. */
+const DOC_MENU_RECENT = 6;
+
+/** "Oct 20" — enough to tell one recent project from another in a menu row. */
+function shortProjectDate(timestamp: number): string {
+  return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+/**
  * How much of a pattern to draw, measured by how big a centimetre is on screen:
  * full detail above 2 px, silhouettes down to 0.9 px, and nothing but the frame's
  * own ground below that. At the canvas's own drafting scale (6.5 canvas units per
@@ -154,12 +188,9 @@ const CONTAINER_DETAIL_PREVIEW_PX_PER_CM = 0.9;
 const CONTAINER_CULL_MARGIN_PX = 256;
 import {
   createIcons,
-  FilePlus2,
-  Folder,
+  Menu,
   Redo2,
-  Ruler,
   Undo2,
-  UserRound,
 } from 'lucide';
 import {
   DEFAULT_AUTOSAVE_MINUTES,
@@ -178,6 +209,7 @@ import {
   setAutosaveIntervalMinutes,
 } from '../project/projectLibrary';
 import { HistoryManager } from '../project/history/HistoryManager';
+import { attachDrapeAnchor, canAttach3dContainer, DRAPE_NODE_HEIGHT, DRAPE_NODE_WIDTH } from './attachDrape';
 import {
   BoardZoomGesture,
   formatLayerTransform,
@@ -261,6 +293,10 @@ export class StudioApp {
   private toolbar: HTMLElement;
   private studioBody: HTMLElement;
   private inspector: HTMLElement;
+  private toastEl: HTMLElement;
+  /** Folded to a rail? Kept across re-renders and node selections. */
+  private inspectorCollapsed = false;
+  private toastTimer = 0;
   private editors = new Map<string, PatternEditor>();
   /** The page itself: a pattern editor under the frames (see `mountCanvasSurface`). */
   private canvasEditor: PatternEditor | null = null;
@@ -270,6 +306,8 @@ export class StudioApp {
   private transformRuntimes = new Map<string, Transform3dRuntime>();
   /** The play/pause button per drape, and the state it was last drawn in. */
   private simTransports = new Map<string, SimTransport>();
+  /** The export split button per drape; it owns a document listener to dispose. */
+  private simExports = new Map<string, SimExportControl>();
   private transformInspectorPieceId: string | null = null;
   private device: GPUDevice | null = null;
   /**
@@ -311,6 +349,14 @@ export class StudioApp {
     base: string[];
     moved: boolean;
   } | null = null;
+  /**
+   * The page's marquee, while it is drawing, as the node ids it started from.
+   *
+   * The page's editor owns the rectangle (it is the surface the drag is on), and
+   * the board answers it here by also taking the frames the rectangle crosses —
+   * one drag over the canvas picks up work *and* the nodes it sits in.
+   */
+  private pageMarqueeBase: string[] | null = null;
   private wireDrag: WireDrag | null = null;
   private resizingNode: {
     id: string;
@@ -338,6 +384,11 @@ export class StudioApp {
   private frozenPageOrigin: { x: number; y: number } | null = null;
   /** When the last zoom step was applied, for telling a run of them from one. */
   private lastZoomFlushAt = Number.NEGATIVE_INFINITY;
+  /** The "+ 3d container" prompt for a container's free output, and its target. */
+  private drapeOffer: { button: HTMLButtonElement; nodeId: string; patternId: string } | null = null;
+  /** The prompt element itself, made once and reused — see `drapeOfferButton`. */
+  private drapeOfferButtonEl: HTMLButtonElement | null = null;
+  private drapeOfferTimer: ReturnType<typeof setTimeout> | null = null;
   /** Per node, the chrome that has to be told the board's zoom — see `cacheBoardZoomChrome`. */
   private boardChrome = new Map<string, HTMLElement[]>();
   /** The zoom those elements were last given, so a pan does not rewrite it. */
@@ -385,6 +436,7 @@ export class StudioApp {
     this.project = ensureVisibleConnections(createDefaultProject());
     root.innerHTML = `
       <div class="studio">
+        <div class="studio-scrim" aria-hidden="true"></div>
         <header class="studio-toolbar" id="toolbar"></header>
         <div class="studio-body">
           <div class="studio-board-wrap" id="boardWrap">
@@ -393,7 +445,7 @@ export class StudioApp {
           </div>
           <aside class="studio-inspector" id="inspector"></aside>
         </div>
-        <div class="studio-status" id="status"></div>
+        <div class="studio-toast" id="toast" role="status" aria-live="polite" hidden></div>
         <div class="studio-modal-root" id="modalRoot" hidden></div>
         <input type="file" id="importFile" accept="application/json,.json,.patterncanvas,application/zip" hidden />
         <input type="file" id="imageFile" accept="image/*" multiple hidden />
@@ -404,10 +456,12 @@ export class StudioApp {
     this.board = root.querySelector('#board')!;
     this.wiresSvg = root.querySelector('#wires')!;
     this.inspector = root.querySelector('#inspector')!;
+    this.toastEl = root.querySelector('#toast')!;
     this.modalRoot = root.querySelector('#modalRoot')!;
     this.importFileInput = root.querySelector('#importFile')!;
     this.imageFileInput = root.querySelector('#imageFile')!;
     this.buildToolbar();
+    this.trackToolbarHeight();
     this.bindImportFile();
     this.bindImageImport();
     this.bindBoardPan();
@@ -416,6 +470,8 @@ export class StudioApp {
     this.bindUndoHotkey();
     this.bindFrameResizeModifier();
     this.bindImagePasteAndDrop();
+    this.bindClipboardShortcuts();
+    this.trackActiveEditorPress();
     window.addEventListener('resize', () => this.drawWires());
   }
 
@@ -844,9 +900,16 @@ export class StudioApp {
       const isZ = key === 'z';
       const isY = key === 'y';
       const isD = key === 'd';
-      if (!isZ && !isY && !isD) return;
+      const isS = key === 's';
+      if (!isZ && !isY && !isD && !isS) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      // Save: ⌘/Ctrl+S — takes over the browser's "save this page".
+      if (isS && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        void this.persistLocal({ label: 'Saved' });
+        return;
+      }
       // Duplicate selected node: ⌘/Ctrl+D
       if (isD && !e.shiftKey && !e.altKey) {
         e.preventDefault();
@@ -904,6 +967,8 @@ export class StudioApp {
   private bindImagePasteAndDrop(): void {
     window.addEventListener('paste', (e) => {
       if (this.isTextEditingTarget(e.target)) return;
+      // A pattern copied out of this app is not an image file and lands as nodes
+      // or pieces — see `bindClipboardShortcuts`. This listener is only the bytes.
       const files = this.imageFilesFromClipboard(e.clipboardData);
       if (files.length === 0) return;
       e.preventDefault();
@@ -1126,9 +1191,9 @@ export class StudioApp {
    * one-shot sync would leave the units label showing the placeholder's unit.
    */
   private syncProjectChrome(): void {
-    const input = this.toolbar.querySelector('#projectName') as HTMLInputElement | null;
-    if (input) input.value = this.project.name;
-    this.updateUnitButton();
+    const name = this.toolbar.querySelector('#activeName');
+    if (name) name.textContent = this.project.name;
+    this.updateUnitRows();
   }
 
   private bindImportFile(): void {
@@ -1618,38 +1683,74 @@ export class StudioApp {
     });
   }
 
+  /**
+   * Messages used to live in a permanent strip under the board. It cost 25px of
+   * canvas at all times to say "Auto-saved" — so the strip is gone and a message
+   * is a toast that appears, then gets out of the way.
+   */
   private setStatus(msg: string): void {
-    const el = document.getElementById('status');
-    if (el) el.textContent = msg;
+    window.clearTimeout(this.toastTimer);
+    if (!msg) {
+      this.toastEl.hidden = true;
+      this.toastEl.textContent = '';
+      return;
+    }
+    this.toastEl.textContent = msg;
+    this.toastEl.hidden = false;
+    this.toastTimer = window.setTimeout(() => {
+      this.toastEl.hidden = true;
+    }, 4200);
   }
 
+  /**
+   * The toolbar floats over the board, so the rail and the canvas overlays have
+   * to start below it — and its height changes when the buttons wrap. Publish
+   * the height as a variable and let the stylesheet position against it, rather
+   * than hard-coding a number that is wrong as soon as the window narrows.
+   */
+  private trackToolbarHeight(): void {
+    const studio = this.toolbar.parentElement;
+    if (!studio) return;
+    const publish = (): void => {
+      studio.style.setProperty('--toolbar-height', `${this.toolbar.getBoundingClientRect().height}px`);
+    };
+    publish();
+    new ResizeObserver(publish).observe(this.toolbar);
+  }
+
+  /**
+   * The page's own chrome: a menu button and the name of the file it is showing,
+   * over a gradient rather than in a bar. Everything the bar used to carry is a
+   * row in the menu, which is where "new project / save / units" belongs once you
+   * are looking at the canvas rather than at the application.
+   */
   private buildToolbar(): void {
     this.toolbar.innerHTML = `
-      <button type="button" data-act="new" title="New project" aria-label="New project"><i data-lucide="file-plus-2" aria-hidden="true"></i></button>
-      <button type="button" data-act="projects" title="Projects" aria-label="Projects"><i data-lucide="folder" aria-hidden="true"></i></button>
-      <div class="toolbar-sep"></div>
-      <input class="project-name" id="projectName" value="" aria-label="Project name" />
-      <div class="toolbar-sep"></div>
-      <button type="button" data-act="undo" disabled title="Nothing to undo" aria-label="Undo"><i data-lucide="undo-2" aria-hidden="true"></i></button>
-      <button type="button" data-act="redo" disabled title="Nothing to redo" aria-label="Redo"><i data-lucide="redo-2" aria-hidden="true"></i></button>
-      <div class="toolbar-sep"></div>
-      <button type="button" data-act="avatars" title="Avatars: measurements + generated 3D models" aria-label="Avatars"><i data-lucide="user-round" aria-hidden="true"></i></button>
-      <div class="toolbar-sep"></div>
-      <div class="toolbar-flyout">
-        <button type="button" data-act="unit" title="Display units" aria-label="Display units" aria-haspopup="true" aria-expanded="false"><i data-lucide="ruler" aria-hidden="true"></i></button>
-        <div class="toolbar-popover unit-popover" hidden role="dialog" aria-label="Display units">
-          <span class="toolbar-popover-title">Display units</span>
-          <button type="button" data-unit="cm" role="menuitemradio">Centimetres <span class="toolbar-popover-code">cm</span></button>
-          <button type="button" data-unit="in" role="menuitemradio">Inches <span class="toolbar-popover-code">in</span></button>
-        </div>
+      <button type="button" class="menu-toggle" data-act="menu" aria-label="Project menu" aria-haspopup="menu" aria-expanded="false" title="Project menu">
+        <i data-lucide="menu" aria-hidden="true"></i>
+      </button>
+      <button type="button" class="active-file" id="activeNameBtn" title="Click to rename this project">
+        <span class="active-file-name" id="activeName"></span>
+      </button>
+      <div class="doc-menu">
+        <button type="button" class="doc-caret" data-doc-toggle aria-haspopup="menu" aria-expanded="false" aria-label="File menu" title="Save, rename, or open another project">
+          <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M3.6 6.2 8 10.4 12.4 6.2"/></svg>
+        </button>
+        <div class="doc-popover" hidden role="menu" aria-label="File"></div>
+      </div>
+      <div class="toolbar-popover app-menu" id="appMenu" hidden role="menu" aria-label="Application">
+        <button type="button" data-act="undo" role="menuitem" disabled>Undo<span class="app-menu-key">⌘Z</span></button>
+        <button type="button" data-act="redo" role="menuitem" disabled>Redo<span class="app-menu-key">⇧⌘Z</span></button>
+        <div class="app-menu-sep"></div>
+        <button type="button" data-act="avatars" role="menuitem">Avatars…</button>
+        <div class="app-menu-sep"></div>
+        <span class="app-menu-label">Display units</span>
+        <button type="button" data-unit="cm" role="menuitemradio">Centimetres<span class="app-menu-key">cm</span></button>
+        <button type="button" data-unit="in" role="menuitemradio">Inches<span class="app-menu-key">in</span></button>
       </div>
     `;
     this.syncProjectChrome();
     this.updateHistoryButtons();
-    this.toolbar.querySelector('#projectName')!.addEventListener('change', (e) => {
-      this.pushUndo();
-      this.project.name = (e.target as HTMLInputElement).value;
-    });
     this.toolbar.addEventListener('click', (e) => {
       const unitChoice = (e.target as HTMLElement).closest(
         'button[data-unit]'
@@ -1662,60 +1763,51 @@ export class StudioApp {
       if (!btn || btn.disabled) return;
       void this.onToolbar(btn.dataset.act!);
     });
-    this.bindUnitPopover();
-    this.updateUnitButton();
+    this.bindAppMenu();
+    this.bindDocMenu();
+    this.bindDocMenuDismiss();
+    this.bindTitleRename();
+    this.updateUnitRows();
     // Swap every <i data-lucide="…"> for its inline SVG.
-    createIcons({
-      icons: {
-        FilePlus2,
-        Folder,
-        Undo2,
-        Redo2,
-        Ruler,
-        UserRound,
-      },
+    createIcons({ icons: { Menu, Undo2, Redo2 } });
+  }
+
+  /** The menu closes on the things a menu is expected to close on. */
+  private bindAppMenu(): void {
+    const menu = this.appMenu();
+    if (!menu) return;
+    document.addEventListener('pointerdown', (e) => {
+      if (menu.hidden) return;
+      const target = e.target as Node;
+      if (menu.contains(target) || this.toolbar.contains(target)) return;
+      this.setAppMenuOpen(false);
     });
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !menu.hidden) this.setAppMenuOpen(false);
+    });
+    window.addEventListener('resize', () => this.setAppMenuOpen(false));
+  }
+
+  private appMenu(): HTMLElement | null {
+    return this.toolbar.querySelector('.app-menu') as HTMLElement | null;
+  }
+
+  private setAppMenuOpen(open: boolean): void {
+    const menu = this.appMenu();
+    const toggle = this.toolbar.querySelector('button[data-act="menu"]') as HTMLButtonElement | null;
+    if (!menu || !toggle) return;
+    menu.hidden = !open;
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.classList.toggle('is-open', open);
   }
 
   /**
-   * The banner ruler button opens a small popover rather than toggling: the unit
-   * is a setting with two named values, and a button that silently flips between
-   * them reads as "toggle something" — the popover says which one is live.
+   * Both units spelled out on the menu's rows, with the live one marked — the
+   * unit is a setting with two named values, so it reads better as a choice than
+   * as a button that silently flips when pressed.
    */
-  private bindUnitPopover(): void {
-    const btn = this.toolbar.querySelector('button[data-act="unit"]') as HTMLButtonElement;
-    const popover = this.unitPopover()!;
-    // The toggle itself runs through the toolbar's delegated click handler
-    // (`onToolbar('unit')`), so the button does not get a second listener.
-    document.addEventListener('pointerdown', (e) => {
-      if (popover.hidden) return;
-      const target = e.target as Node;
-      if (popover.contains(target) || btn.contains(target)) return;
-      this.setUnitPopoverOpen(false);
-    });
-    window.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && !popover.hidden) this.setUnitPopoverOpen(false);
-    });
-    window.addEventListener('resize', () => this.setUnitPopoverOpen(false));
-  }
-
-  private unitPopover(): HTMLElement | null {
-    return this.toolbar.querySelector('.unit-popover') as HTMLElement | null;
-  }
-
-  private setUnitPopoverOpen(open: boolean): void {
-    const popover = this.unitPopover();
-    const btn = this.toolbar.querySelector('button[data-act="unit"]') as HTMLButtonElement | null;
-    if (!popover || !btn) return;
-    popover.hidden = !open;
-    btn.setAttribute('aria-expanded', String(open));
-  }
-
-  /** Both units spelled out on the popover's rows; the live one is marked. */
-  private updateUnitButton(): void {
-    const btn = this.toolbar.querySelector('button[data-act="unit"]') as HTMLButtonElement | null;
-    if (btn) btn.title = `Display units: ${this.project.displayUnit} · click to choose`;
-    this.unitPopover()
+  private updateUnitRows(): void {
+    this.appMenu()
       ?.querySelectorAll('button[data-unit]')
       .forEach((row) => {
         const el = row as HTMLButtonElement;
@@ -1727,17 +1819,20 @@ export class StudioApp {
 
   /** Display units are document data, so every canvas follows and the file records it. */
   private setDisplayUnit(unit: 'cm' | 'in'): void {
-    this.setUnitPopoverOpen(false);
+    this.setAppMenuOpen(false);
     if (this.project.displayUnit === unit) return;
     this.pushUndo();
     this.project.displayUnit = unit;
-    this.updateUnitButton();
+    this.updateUnitRows();
     this.editors.forEach((ed) => ed.setUnit(unit));
     this.meshPreviews.forEach((p) => p.setUnit(unit));
     this.markDirty();
   }
 
   private async onToolbar(act: string): Promise<void> {
+    // Every row here acts on the document, so the menu gets out of the way
+    // first — the toggle is the only one that is about the menu itself.
+    if (act !== 'menu') this.setAppMenuOpen(false);
     switch (act) {
       case 'undo':
         this.performUndo();
@@ -1751,12 +1846,15 @@ export class StudioApp {
       case 'projects':
         this.openProjectsModal();
         break;
+      case 'save':
+        await this.persistLocal({ label: 'Saved' });
+        break;
+      case 'menu':
+        this.setAppMenuOpen(this.appMenu()?.hidden ?? true);
+        break;
       case 'measurements':
       case 'avatars':
         this.openAvatarEditor();
-        break;
-      case 'unit':
-        this.setUnitPopoverOpen(this.unitPopover()?.hidden ?? true);
         break;
     }
   }
@@ -1804,6 +1902,7 @@ export class StudioApp {
       <p class="node-context-title">${
         many ? this.escapeHtml(`${count} nodes selected`) : this.escapeHtml(this.nodeLabel(node))
       }</p>
+      <button type="button" role="menuitem" data-node-act="copy">Copy<span class="app-menu-key">⌘C</span></button>
       <button type="button" role="menuitem" data-node-act="duplicate">Duplicate ${
         many ? `${count} nodes` : 'node'
       }</button>
@@ -1823,7 +1922,9 @@ export class StudioApp {
       e.stopPropagation();
       const act = btn.dataset.nodeAct;
       this.closeNodeMenu();
-      if (act === 'duplicate') {
+      if (act === 'copy') {
+        this.copySelection();
+      } else if (act === 'duplicate') {
         this.duplicateNodeGroup(this.selectedNodeIds, { offsetX: 32, offsetY: 32 });
       } else if (act === 'delete') {
         this.deleteSelectedNodes();
@@ -1844,6 +1945,10 @@ export class StudioApp {
       <button type="button" role="menuitem" data-board-act="sim">New drape <span class="board-menu-kind">3D</span></button>
       <button type="button" role="menuitem" data-board-act="text">Note</button>
       <button type="button" role="menuitem" data-board-act="image">Image reference…</button>
+      <div class="app-menu-sep"></div>
+      <button type="button" role="menuitem" data-board-act="paste"${
+        getClipboard() ? '' : ' disabled'
+      }>Paste<span class="app-menu-key">⌘V</span></button>
     `;
     menu.addEventListener('pointerdown', (e) => e.stopPropagation());
     menu.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -1869,6 +1974,8 @@ export class StudioApp {
       } else if (act === 'image') {
         // The picker writes into the same input paste and drop use.
         this.imageFileInput.click();
+      } else if (act === 'paste') {
+        this.pasteClipboard({ clientX, clientY });
       }
     });
     this.mountBoardPopover(menu, clientX, clientY);
@@ -1902,8 +2009,18 @@ export class StudioApp {
     // layout would not be where the pointer is. End the gesture and let it be
     // exact. Capture phase, because a node stops its own presses on the way up.
     wrap.addEventListener('pointerdown', () => this.endZoomGesture(), true);
+    // Any press elsewhere dismisses the prompt, including one that starts a drag
+    // from the terminal itself. Capture phase, before the port reads the press.
+    wrap.addEventListener(
+      'pointerdown',
+      (e) => {
+        if (this.drapeOffer && e.target !== this.drapeOffer.button) this.hideDrapeOffer();
+      },
+      true
+    );
     wrap.addEventListener('pointerdown', (e) => {
-      if ((e.target as HTMLElement).closest('.canvas-node')) return;
+      const target = e.target as HTMLElement;
+      if (target.closest('.canvas-node')) return;
       if (e.button === 1 || (e.button === 0 && e.altKey)) {
         this.panning = true;
         this.panLast = { x: e.clientX, y: e.clientY };
@@ -1912,13 +2029,17 @@ export class StudioApp {
         return;
       }
       if (e.button !== 0) return;
-      // ⌘/Ctrl on empty board: rectangle-select nodes (as on the 2D canvas,
-      // where ⌘/Ctrl is the panel-marquee modifier too).
-      if (e.metaKey || e.ctrlKey) {
-        this.beginNodeMarquee(e);
-        return;
-      }
-      if (this.selectedNodeIds.length > 0) this.clearNodeSelection();
+      // A press on a control is a press on the control: the rail and the ribbons
+      // stand over the page, and none of them is a place to start a selection.
+      if (target.closest('button, input, textarea, select, label, [role="menu"]')) return;
+      // The page's own editor reads the press first (it is nearer the pointer), so
+      // if it has taken it — drawing, dragging a point, or drawing its own
+      // rectangle — the press is the page's and this handler has nothing to add.
+      if (this.canvasEditor?.isGestureActive()) return;
+      // Otherwise an empty-canvas drag selects nodes, with or without ⌘/Ctrl: the
+      // page's tools may have nothing to do here, and a drag on bare canvas
+      // meaning "select" is the same gesture the 2D view already offers.
+      this.beginNodeMarquee(e);
     });
     // Suppress browser middle-click autoscroll affordance on the board.
     wrap.addEventListener('auxclick', (e) => {
@@ -2206,6 +2327,9 @@ export class StudioApp {
   }
 
   private applyBoardTransform(): void {
+    // The prompt is pinned to the terminal on screen, so anything that moves the
+    // board moves the terminal out from under it.
+    this.hideDrapeOffer();
     const { panX, panY, zoom } = this.project.canvas;
     this.board.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
     this.applyBoardZoomChrome(zoom);
@@ -2254,6 +2378,7 @@ export class StudioApp {
     this.teardownSims();
     this.board.innerHTML = '';
     this.editors.clear();
+    for (const preview of this.meshPreviews.values()) preview.destroy();
     this.meshPreviews.clear();
     this.simTransports.clear();
     this.boardChrome.clear();
@@ -2295,7 +2420,7 @@ export class StudioApp {
       onRulerChange: () => this.markDirty(),
       getMeasurementLibrary: () => cachedMeasurementLibrary(),
       onGroupIntoContainer: (pieceIds) => this.groupCanvasPiecesIntoContainer(pieceIds),
-      onPanelMarquee: (box) => this.selectContainersInCanvasRect(box),
+      onMarqueeRect: (box, info) => this.mirrorPageMarquee(box, info),
       onPiecesDropped: (drop) => this.handOverDroppedPieces(null, drop),
     });
     this.canvasSurface = host;
@@ -2440,26 +2565,44 @@ export class StudioApp {
   }
 
   /**
-   * A panel marquee on the canvas also picks up the frames it crossed: on the
-   * page, "everything in this rectangle" means containers too.
+   * The page's marquee, turned into a node selection.
+   *
+   * On the canvas the page and the frames standing on it are one surface, so a
+   * rectangle drawn on the page takes the nodes it crosses as well as the work
+   * inside them: what the drag covers is what you get, whichever of the two it
+   * started on. The rectangle itself is the editor's — it is drawn where the drag
+   * is, at the pattern's own scale — so the board only answers it.
    */
-  private selectContainersInCanvasRect(box: {
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-  }): void {
+  private mirrorPageMarquee(
+    box: { x: number; y: number; w: number; h: number } | null,
+    info: { additive: boolean; panels: boolean }
+  ): void {
+    if (!box) {
+      if (this.pageMarqueeBase === null) return;
+      this.pageMarqueeBase = null;
+      this.renderInspector();
+      this.setStatus(
+        this.selectedNodeIds.length > 1 ? `${this.selectedNodeIds.length} nodes selected` : ''
+      );
+      return;
+    }
+    // Shift keeps what was already picked; anything else starts the selection over.
+    if (!info.additive) this.pageMarqueeBase = [];
+    else if (this.pageMarqueeBase === null) this.pageMarqueeBase = [...this.selectedNodeIds];
     const topLeft = canvasAtCm(this.project, box.x, box.y);
     const bottomRight = canvasAtCm(this.project, box.x + box.w, box.y + box.h);
-    const hits = nodesInBoardRect(this.project.canvas.nodes, {
-      x: Math.min(topLeft.x, bottomRight.x),
-      y: Math.min(topLeft.y, bottomRight.y),
-      width: Math.abs(bottomRight.x - topLeft.x),
-      height: Math.abs(bottomRight.y - topLeft.y),
-    });
-    if (hits.length === 0) return;
-    const merged = new Set([...this.selectedNodeIds, ...hits.map((node) => node.id)]);
-    this.selectNodes([...merged], hits[hits.length - 1]!.id);
+    const hits = nodesInBoardRect(
+      this.project.canvas.nodes,
+      {
+        x: Math.min(topLeft.x, bottomRight.x),
+        y: Math.min(topLeft.y, bottomRight.y),
+        width: Math.abs(bottomRight.x - topLeft.x),
+        height: Math.abs(bottomRight.y - topLeft.y),
+      },
+      (node) => this.isEmbeddedNode(node)
+    ).map((node) => node.id);
+    this.applyNodeSelection([...this.pageMarqueeBase, ...hits]);
+    this.layoutNodes();
   }
 
   private findNodeEl(nodeId: string): HTMLElement | null {
@@ -3014,6 +3157,207 @@ export class StudioApp {
     }
   }
 
+  /**
+   * The title is also the rename field: click it and it turns into one, in
+   * place, with the old name selected so a click and a type is all a rename
+   * takes. Enter or a click elsewhere keeps it, Escape puts the old name back.
+   * The file menu's Rename field does the same job from a distance.
+   */
+  private bindTitleRename(): void {
+    const btn = this.toolbar.querySelector('#activeNameBtn') as HTMLButtonElement | null;
+    if (!btn) return;
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.beginTitleRename(btn);
+    });
+  }
+
+  private beginTitleRename(btn: HTMLButtonElement): void {
+    if (this.toolbar.querySelector('.active-file-input')) return;
+    const input = document.createElement('input');
+    input.className = 'active-file-input';
+    input.value = this.project.name;
+    input.setAttribute('aria-label', 'Project name');
+    input.spellcheck = false;
+    // The field takes the button's width, so the row does not jump.
+    input.style.width = `${Math.max(120, Math.round(btn.getBoundingClientRect().width))}px`;
+    btn.hidden = true;
+    btn.after(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = (commit: boolean): void => {
+      if (done) return;
+      done = true;
+      const name = input.value;
+      input.remove();
+      btn.hidden = false;
+      if (commit) this.renameProject(name);
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        finish(true);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false);
+      }
+    });
+    input.addEventListener('blur', () => finish(true));
+  }
+
+  /** One rename path: history, the document, and every mirror of its name. */
+  private renameProject(raw: string): void {
+    const name = raw.trim();
+    if (!name || name === this.project.name) return;
+    this.pushUndo();
+    this.project.name = name;
+    this.markDirty();
+    this.syncProjectChrome();
+  }
+
+  /**
+   * The file menu beside the fullscreen title.
+   *
+   * It sits there rather than in the hamburger because it acts on the document
+   * in front of you: this is where the document is named, so it is where you
+   * save it, rename it, or step back to one you were in a minute ago.
+   */
+  private bindDocMenu(): void {
+    const menu = this.toolbar.querySelector('.doc-menu') as HTMLElement | null;
+    const toggle = menu?.querySelector('[data-doc-toggle]') as HTMLButtonElement | null;
+    const popover = menu?.querySelector('.doc-popover') as HTMLElement | null;
+    if (!menu || !toggle || !popover) return;
+
+    toggle.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (menu.classList.contains('is-open')) this.closeDocMenu(menu);
+      else void this.openDocMenu(menu);
+    });
+    popover.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest(
+        'button[data-doc-act]'
+      ) as HTMLButtonElement | null;
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const act = btn.dataset.docAct;
+      const projectId = btn.dataset.projectId;
+      this.closeDocMenu(menu);
+      if (act === 'save') {
+        void this.persistLocal({ label: 'Saved' });
+      } else if (act === 'new') {
+        this.openNewProjectPrompt();
+      } else if (act === 'projects') {
+        this.openProjectsModal();
+      } else if (act === 'open' && projectId) {
+        void (async () => {
+          const project = await getSavedProject(projectId);
+          if (!project) return;
+          // The overlay belongs to a node of the project we are leaving.
+          this.closeNodeFullscreen();
+          this.switchToProject(project);
+          this.setStatus(`Loaded “${project.name}”`);
+        })();
+      }
+    });
+    popover.addEventListener('change', (e) => {
+      const input = e.target as HTMLInputElement;
+      if (!input.matches('[data-doc-rename]')) return;
+      const before = this.project.name;
+      this.renameProject(input.value);
+      if (this.project.name === before) input.value = before;
+    });
+    popover.addEventListener('pointerdown', (e) => e.stopPropagation());
+  }
+
+  /** Fill the file menu for the document in hand, then show it. */
+  private async openDocMenu(menu: HTMLElement): Promise<void> {
+    const toggle = menu.querySelector('[data-doc-toggle]') as HTMLButtonElement | null;
+    const popover = menu.querySelector('.doc-popover') as HTMLElement | null;
+    if (!toggle || !popover) return;
+
+    const saved = await listSavedProjects();
+    const recent = saved
+      .filter((project) => project.id !== this.project.id)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, DOC_MENU_RECENT);
+    const recentRows = recent.length
+      ? recent
+          .map(
+            (project) =>
+              `<button type="button" role="menuitem" data-doc-act="open" data-project-id="${
+                project.id
+              }"><span class="doc-name">${this.escapeHtml(
+                project.name
+              )}</span><span class="app-menu-key">${shortProjectDate(
+                project.updatedAt
+              )}</span></button>`
+          )
+          .join('')
+      : '<span class="doc-empty">No other saved projects yet</span>';
+
+    popover.innerHTML = `
+      <label class="app-menu-field">
+        <span class="app-menu-field-label">Rename</span>
+        <input class="project-name" data-doc-rename aria-label="Project name" value="${this.escapeHtml(
+          this.project.name
+        )}" />
+      </label>
+      <div class="app-menu-sep"></div>
+      <button type="button" role="menuitem" data-doc-act="save">Save<span class="app-menu-key">⌘S</span></button>
+      <button type="button" role="menuitem" data-doc-act="new">New project</button>
+      <div class="app-menu-sep"></div>
+      <span class="app-menu-label">Open recent</span>
+      ${recentRows}
+      <div class="app-menu-sep"></div>
+      <button type="button" role="menuitem" data-doc-act="projects">Projects…</button>
+    `;
+    popover.hidden = false;
+    menu.classList.add('is-open');
+    toggle.setAttribute('aria-expanded', 'true');
+  }
+
+  private closeDocMenu(menu: HTMLElement): void {
+    menu.classList.remove('is-open');
+    const popover = menu.querySelector('.doc-popover') as HTMLElement | null;
+    if (popover) popover.hidden = true;
+    menu.querySelector('[data-doc-toggle]')?.setAttribute('aria-expanded', 'false');
+  }
+
+  /** Outside press, Escape and a resize all put the file menu away. */
+  private bindDocMenuDismiss(): void {
+    const open = (): HTMLElement | null =>
+      document.querySelector('.doc-menu.is-open') as HTMLElement | null;
+    document.addEventListener('pointerdown', (e) => {
+      const menu = open();
+      if (!menu || menu.contains(e.target as Node)) return;
+      this.closeDocMenu(menu);
+    });
+    // Capture, and immediate, so Escape closes the menu rather than the overlay
+    // behind it: both listeners sit on `window`, and only this one may act.
+    window.addEventListener(
+      'keydown',
+      (e) => {
+        if (e.key !== 'Escape') return;
+        const menu = open();
+        if (!menu) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        this.closeDocMenu(menu);
+      },
+      true
+    );
+    window.addEventListener('resize', () => {
+      const menu = open();
+      if (menu) this.closeDocMenu(menu);
+    });
+  }
+
   private syncFullscreenTabs(el: HTMLElement, activeId: string): void {
     const chrome = el.querySelector('.node-chrome');
     const title = el.querySelector('.node-title') as HTMLElement | null;
@@ -3550,7 +3894,10 @@ export class StudioApp {
       viewY: view.viewY,
       frameWidthCm: node.width / view.cmScale,
       frameHeightCm: node.height / view.cmScale,
-      clip: containerClips(node),
+      // Clipping is a property of the container as it sits on the board: it is
+      // how a window onto a pattern behaves next to its neighbours. Opened up,
+      // the container *is* the workspace, so its frame must not cut the view.
+      clip: expanded ? false : containerClips(node),
       locked: !expanded,
       // On the board the page's grid is behind the frame and shows through it, so
       // the frame must not draw a second one; opened up, it has to draw its own.
@@ -4028,6 +4375,7 @@ export class StudioApp {
       body.classList.add('sim-body');
       body.appendChild(canvas);
       this.mountSimTransport(node.simId, body);
+      this.mountSimExport(node.simId, body);
       // runtime attached after GPU init
       (el as HTMLElement & { _simCanvas?: HTMLCanvasElement; _simHost?: HTMLElement })._simCanvas =
         canvas;
@@ -4183,6 +4531,9 @@ export class StudioApp {
 
     if (node.type === 'patternFrame') {
       addPort('out', 'pattern', node.patternId);
+      const out = el.querySelector(':scope > .node-port-out');
+      out?.addEventListener('pointerenter', () => this.offerDrapeAttachment(node));
+      out?.addEventListener('pointerleave', () => this.scheduleDrapeOfferHide());
     } else if (node.type === 'meshFrame') {
       addPort('in', 'mesh', node.meshId);
       addPort('out', 'mesh', node.meshId);
@@ -4868,6 +5219,135 @@ export class StudioApp {
   }
 
   /**
+   * Export the drape as an OBJ, bottom-right of the viewport.
+   *
+   * One file, two objects: the avatar it is draped on and the cloth as it stands
+   * right now, so the shape can leave the studio and be looked at — or printed,
+   * or measured — elsewhere. Positions come from the same CPU mirror the
+   * viewport draws from, so what you export is what you see, mid-drag included.
+   */
+  private mountSimExport(simId: string, body: HTMLElement): void {
+    this.simExports.set(
+      simId,
+      new SimExportControl(body, {
+        onExportObj: () => this.exportDrapeObj(simId),
+        onExportPack: () => this.exportBlenderPack(simId),
+      })
+    );
+  }
+
+  /** Everything an OBJ export needs, in the units the exporter writes. */
+  private drapeExportParts(simId: string): { sim: SimInstance | undefined; parts: ObjPart[] } {
+    const runtime = this.simRuntimes.get(simId);
+    const sim = this.project.sims.find((s) => s.id === simId);
+    const parts: ObjPart[] = [];
+
+    const avatar = runtime?.getAvatarBody() ?? null;
+    if (avatar) {
+      const bake = avatar.getCollisionBakeData();
+      parts.push({ name: 'avatar', positions: bake.positions, indices: bake.indices });
+    }
+    const cloth = runtime?.getCloth() ?? null;
+    const positions = cloth?.getPositionsSnapshot?.() ?? null;
+    const indices = cloth?.getTriangleIndices?.() ?? null;
+    if (positions && indices) {
+      parts.push({ name: `cloth_${sim?.name ?? 'drape'}`, positions, indices });
+    }
+    return { sim, parts };
+  }
+
+  private exportDrapeObj(simId: string): void {
+    const { sim, parts } = this.drapeExportParts(simId);
+    if (parts.length === 0) {
+      this.setStatus('Nothing to export from this drape yet');
+      return;
+    }
+    const fileName = objFileName(sim?.name ?? 'drape');
+    downloadTextFile(buildObj(parts), fileName);
+    const triangles = parts.reduce((sum, part) => sum + Math.floor(part.indices.length / 3), 0);
+    this.setStatus(
+      `Exported ${fileName} — ${parts.length === 2 ? 'avatar and cloth' : 'cloth'}, ${triangles.toLocaleString()} triangles in metres`
+    );
+  }
+
+  /**
+   * The Blender pack: the garment at its layout pose, the body, the seam map and
+   * a `bpy` script that builds a Cloth setup from them.
+   *
+   * The layout pose is the point — Blender reads frame 1 as the fabric's rest
+   * shape, so a pack of the draped pose would ask Blender to start from a
+   * crumple. This is the same split the studio itself makes between a rebuilt
+   * drape and a simulated one.
+   */
+  private exportBlenderPack(simId: string): void {
+    const runtime = this.simRuntimes.get(simId);
+    const cloth = runtime?.getCloth() ?? null;
+    const rest = cloth?.getRestPositionsSnapshot?.() ?? null;
+    const indices = cloth?.getTriangleIndices?.() ?? null;
+    if (!cloth || !rest || !indices) {
+      this.setStatus('Nothing to export from this drape yet');
+      return;
+    }
+
+    const sim = this.project.sims.find((s) => s.id === simId);
+    const mesh = this.meshForSim(simId);
+    const pattern = this.patternForSim(simId);
+    const avatar = runtime?.getAvatarBody() ?? null;
+    const bake = avatar?.getCollisionBakeData() ?? null;
+
+    // Seam pairs with the gathered side's crowd floor, recomputed from the
+    // pattern and the mesh the cloth was built from — the same call the solver
+    // makes, so the pack cannot drift from what the viewport is doing.
+    const pairs = mesh?.geometry && pattern ? resolveSeamParticlePairs(pattern, mesh.geometry) : [];
+    const seams: BlenderPackSeam[] = pairs.map((pair) => ({
+      i: pair.a,
+      j: pair.b,
+      restMetres: pair.restCm * 0.01,
+      gatherI: pair.crowdA,
+      gatherJ: pair.crowdB,
+    }));
+
+    const pieceIds = cloth.getVertexPieceIds();
+    const ghosted = new Set(cloth.getGhostedPieceIds?.() ?? []);
+    const frozen = new Set(cloth.getFrozenPieceIds());
+    const pins: number[] = [];
+    for (let i = 0; i < pieceIds.length; i++) {
+      if (frozen.has(pieceIds[i]!)) pins.push(i);
+    }
+    const pieceNames: Record<string, string> = {};
+    for (const piece of pattern?.pieces ?? []) pieceNames[piece.id] = piece.name;
+
+    const pack = buildBlenderPack({
+      projectName: this.project.name,
+      drapeName: sim?.name ?? 'Drape',
+      patternName: pattern?.name ?? 'Pattern',
+      meshName: mesh?.name ?? 'Mesh',
+      cloth: { positions: rest, indices, pieceIds },
+      avatar: bake ? { positions: bake.positions, indices: bake.indices } : null,
+      seams,
+      pins,
+      pieceNames,
+      excludePieces: [...ghosted],
+      sim: {
+        substeps: sim?.params.substeps ?? 8,
+        constraintIterations: sim?.params.constraintIterations,
+        mass: sim?.params.mass ?? 100,
+        contactFriction: sim?.params.contactFriction,
+        gravity: sim?.params.gravity,
+        maxSpeed: sim?.params.maxSpeed,
+        engine: sim?.params.engine,
+      },
+    });
+
+    const fileName = blenderPackFileName(sim?.name ?? 'drape');
+    downloadFile(new Blob([pack.zip.slice()]), fileName, 'application/zip');
+    this.setStatus(
+      `Exported ${fileName} — ${pack.summary.vertices.toLocaleString()} vertices, ` +
+        `${pack.summary.seams.toLocaleString()} seam pairs, ${Math.round(pack.summary.bytes / 1024)} kB`
+    );
+  }
+
+  /**
    * Which of the three things a drape can be doing right now.
    *
    * There is no `running` flag to read: a sim is live exactly when it is the
@@ -5306,9 +5786,14 @@ export class StudioApp {
     // the per-frame repaint it exists to avoid.
     if (this.zoomGesture.active) return;
     for (const editor of this.editors.values()) editor.settleContainer();
+    // A mesh preview paints into a canvas, so how big the board draws it is a
+    // reason to re-rasterise it too.
+    for (const preview of this.meshPreviews.values()) preview.refreshResolution();
   }
 
   private drawWires(): void {
+    // The prompt is about a terminal's state, and that is what the wires say.
+    this.hideDrapeOffer();
     // Anything that redraws the wires is a change to the board, and a frozen view
     // cannot describe a board that has moved on: end the gesture first. The
     // gesture's own end draws them itself, so this is a second pass over the same
@@ -5434,10 +5919,53 @@ export class StudioApp {
     const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
     if (!node) {
       this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom. Shift- or ⌘/Ctrl-click a node, or ⌘/Ctrl-drag the board, to select several at once, then ⌘/Ctrl+D to duplicate the whole set — links between the copies stay between the copies. ⌫ / Delete removes the selection.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · Shift-click pieces to multi-select (drag or rotate the group around their shared pivot) · empty drag to orbit · Shift-drag empty space to raise/lower orbit · Move/Rotate toggle · R = 90° local X · Snap to quadrant reveals the two 2 × 8 grids: click a piece, then click a cell to centre it there · wheel zoom.<br/>Sim: drag fabric to move · Shift-click to multi-select · Play to simulate drape · Draw pattern points shows the pattern's anchor points on the fabric — click one to edit it in a small overlay (Cancel/Apply above it; Apply remeshes and rebuilds the drape).</p>`;
+      this.decorateInspector();
       return;
     }
     this.renderNodeInspector(node);
     this.prependSelectionNotice();
+    this.decorateInspector();
+  }
+
+  /**
+   * Put a collapse control beside the panel's title.
+   *
+   * The docked inspector is a full-height column in the expanded node, so folding
+   * it is the only way to give that width back to the viewport without leaving
+   * the node. Done here rather than in every `renderNodeInspector` branch: each
+   * branch writes its own `<h3>`, and this wraps whichever one arrived.
+   */
+  private decorateInspector(): void {
+    const title = this.inspector.querySelector(':scope > h3');
+    if (!title) return;
+    const header = document.createElement('div');
+    header.className = 'inspector-header';
+    title.replaceWith(header);
+    header.appendChild(title);
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'inspector-collapse';
+    toggle.innerHTML =
+      '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M10 3.5 5.5 8 10 12.5"/></svg>';
+    toggle.addEventListener('click', () => this.setInspectorCollapsed(!this.inspectorCollapsed));
+    header.appendChild(toggle);
+    this.inspector.classList.toggle('is-collapsed', this.inspectorCollapsed);
+    this.syncInspectorCollapseLabel(toggle);
+  }
+
+  /** Fold the panel to a rail, or open it again. */
+  private setInspectorCollapsed(collapsed: boolean): void {
+    this.inspectorCollapsed = collapsed;
+    this.inspector.classList.toggle('is-collapsed', collapsed);
+    const toggle = this.inspector.querySelector<HTMLButtonElement>('.inspector-collapse');
+    if (toggle) this.syncInspectorCollapseLabel(toggle);
+  }
+
+  private syncInspectorCollapseLabel(toggle: HTMLButtonElement): void {
+    const collapsed = this.inspectorCollapsed;
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+    toggle.setAttribute('aria-label', collapsed ? 'Expand the panel' : 'Collapse the panel');
+    toggle.title = collapsed ? 'Expand panel' : 'Collapse panel';
   }
 
   /** A group selection: name the set and offer the two group actions. */
@@ -6037,7 +6565,11 @@ export class StudioApp {
 
     const gone = new Set(nodes.map((n) => n.id));
     this.project.canvas.nodes = this.project.canvas.nodes.filter((n) => !gone.has(n.id));
-    for (const id of gone) this.boardChrome.delete(id);
+    for (const id of gone) {
+      this.boardChrome.delete(id);
+      this.meshPreviews.get(id)?.destroy();
+      this.meshPreviews.delete(id);
+    }
 
     for (const node of nodes) {
       if (node.type === 'simViewport') {
@@ -6052,6 +6584,8 @@ export class StudioApp {
           rt?.cloth?.destroy();
           this.simRuntimes.delete(simId);
           this.simTransports.delete(simId);
+          this.simExports.get(simId)?.dispose();
+          this.simExports.delete(simId);
           this.project.sims = this.project.sims.filter((s) => s.id !== simId);
           this.project.assignments = this.project.assignments.filter((a) => a.simId !== simId);
           this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
@@ -6193,6 +6727,188 @@ export class StudioApp {
     }
     this.layoutNodes();
     this.drawWires();
+  }
+
+  /**
+   * Which pattern editor was worked in last: `'canvas'`, a node id, or `null`
+   * once a press lands anywhere else. ⌘C reads the selection of the surface you
+   * last touched, which is the only thing "what is selected" can mean when the
+   * page, a container and the board are all on screen at once.
+   */
+  private activeEditorKey: string | null = null;
+
+  private trackActiveEditorPress(): void {
+    document.addEventListener(
+      'pointerdown',
+      (e) => {
+        const el = (e.target as Element | null)?.closest?.('.pattern-editor') as HTMLElement | null;
+        this.activeEditorKey = el ? this.editorKeyForElement(el) : null;
+      },
+      true
+    );
+  }
+
+  private editorKeyForElement(el: HTMLElement): string | null {
+    if (this.canvasEditor?.element() === el) return 'canvas';
+    for (const [key, editor] of this.editors) {
+      if (editor.element() === el) return key;
+    }
+    return null;
+  }
+
+  /** The editor ⌘C / ⌘V act on: the last one worked in, else the board's page. */
+  private activeEditor(): PatternEditor | null {
+    if (this.activeEditorKey === 'canvas') return this.canvasEditor;
+    if (this.activeEditorKey) return this.editors.get(this.activeEditorKey) ?? this.canvasEditor;
+    return this.canvasEditor;
+  }
+
+  /**
+   * What copy takes.
+   *
+   * Working inside a container — opened full screen, or a frame on the board — is
+   * working on that pattern, so the picked pieces are the selection. Anywhere
+   * else the board's nodes are, and the page's own points are the fallback when
+   * nothing on the board is picked. That also settles the one gesture that picks
+   * both: a rectangle dragged across the canvas takes the frames it crossed and
+   * the page's work, and copying it copies the frames.
+   */
+  private selectionForCopy(): ClipboardPayload | null {
+    const editor = this.activeEditor();
+    const pattern = editor?.getPattern() ?? null;
+    const pieceIds = editor?.getSelectedPieces() ?? [];
+    const inContainer = this.activeEditorKey !== null && this.activeEditorKey !== 'canvas';
+    if (inContainer && pattern && pieceIds.length > 0) return copyPieces(pattern, pieceIds);
+    if (this.selectedNodeIds.length > 0) return copyNodes(this.project, this.selectedNodeIds);
+    if (pattern && pieceIds.length > 0) return copyPieces(pattern, pieceIds);
+    return null;
+  }
+
+  /** Put the current selection on the clipboard. Returns it, or null for none. */
+  private copySelection(announce = true): ClipboardPayload | null {
+    const payload = this.selectionForCopy();
+    if (!payload) {
+      if (announce) this.setStatus('Nothing selected to copy');
+      return null;
+    }
+    setClipboard(payload);
+    if (announce) this.setStatus(describeClipboard(payload));
+    return payload;
+  }
+
+  /** Paste whatever the clipboard holds into the document in front of you. */
+  private pasteClipboard(at?: { clientX?: number; clientY?: number }): void {
+    const payload = getClipboard();
+    if (!payload) {
+      this.setStatus('Nothing on the clipboard');
+      return;
+    }
+    if (payload.type === 'pieces') this.pastePiecesInto(payload);
+    else this.pasteNodesInto(payload, at);
+  }
+
+  /**
+   * Paste copied nodes onto the board, at the pointer (or the middle of the
+   * view), stepped by how many times this clipboard has been pasted so a run of
+   * pastes does not stack into one pile.
+   */
+  private pasteNodesInto(
+    payload: NodeClipboard,
+    at?: { clientX?: number; clientY?: number }
+  ): void {
+    const point = this.boardPointFromClient(at?.clientX, at?.clientY);
+    const nudge = 24 * clipboardPasteCount();
+    const zIndex =
+      this.project.canvas.nodes.reduce((top, node) => Math.max(top, node.zIndex), 0) + 1;
+    this.closeNodeMenu();
+    this.pushUndo();
+    const ids = pasteNodes(this.project, payload, {
+      x: point.x + nudge,
+      y: point.y + nudge,
+      zIndex,
+      newId: (prefix) => uid(prefix),
+    });
+    if (ids.length === 0) {
+      this.setStatus('Nothing to paste');
+      return;
+    }
+    noteClipboardPaste();
+    for (const id of ids) {
+      const node = this.project.canvas.nodes.find((n) => n.id === id);
+      if (node) this.mountNode(node);
+    }
+    this.selectNodes(ids, ids[ids.length - 1]);
+    this.layoutNodes();
+    this.syncEmbeddedNodes();
+    this.drawWires();
+    this.markDirty();
+    const message = ids.length === 1 ? 'Pasted 1 node' : `Pasted ${ids.length} nodes`;
+    // A pasted drape or transform needs its GPU pass before it can be trusted.
+    void this.initGpuAndSims().then(() => this.setStatus(message));
+  }
+
+  /** Paste copied pieces into the pattern in front of you, nudged clear of the original. */
+  private pastePiecesInto(payload: PieceClipboard): void {
+    const editor = this.activeEditor();
+    const pattern = editor?.getPattern();
+    if (!editor || !pattern) {
+      this.setStatus('Open a pattern to paste pieces into');
+      return;
+    }
+    this.pushUndo();
+    const step = 8 * (clipboardPasteCount() + 1);
+    const ids = pastePieces(pattern, payload, {
+      dx: step,
+      dy: step,
+      newId: (prefix) => uid(prefix),
+    });
+    if (ids.length === 0) {
+      this.setStatus('Nothing to paste');
+      return;
+    }
+    noteClipboardPaste();
+    // The editor holds this document by reference, so the new pieces are already
+    // in it — it only has to be told to draw them, then to pick them up.
+    editor.setSelectedPieces(ids, ids[ids.length - 1]);
+    editor.refresh();
+    this.invalidateMeshesForPattern(pattern.id);
+    this.markDirty();
+    this.setStatus(ids.length === 1 ? 'Pasted 1 piece' : `Pasted ${ids.length} pieces`);
+  }
+
+  /**
+   * ⌘C / ⌘V, and the system clipboard underneath them.
+   *
+   * The payload travels as text in the clipboard, so a copy survives a reload and
+   * can be pasted into another window; the module-level clipboard is there so an
+   * ordinary copy-and-paste inside this window never depends on a permission.
+   */
+  private bindClipboardShortcuts(): void {
+    const customType = 'application/x-hyperpattern+json';
+    window.addEventListener('copy', (e) => {
+      if (this.isTextEditingTarget(e.target)) return;
+      const payload = this.copySelection();
+      if (!payload || !e.clipboardData) return;
+      const text = serializeClipboard(payload);
+      e.clipboardData.setData('text/plain', text);
+      try {
+        e.clipboardData.setData(customType, text);
+      } catch {
+        /* custom types are a nicety; text/plain is the contract */
+      }
+      e.preventDefault();
+    });
+    window.addEventListener('paste', (e) => {
+      if (this.isTextEditingTarget(e.target)) return;
+      const payload =
+        parseClipboardPayload(e.clipboardData?.getData(customType)) ??
+        parseClipboardPayload(e.clipboardData?.getData('text/plain'));
+      if (!payload) return;
+      e.preventDefault();
+      // The text may have come from another window, so the two stay in step.
+      setClipboard(payload);
+      this.pasteClipboard();
+    });
   }
 
   private duplicateSelectedNode(): void {
@@ -6629,7 +7345,135 @@ export class StudioApp {
   }
 
   /** Drop a 3D drape viewport on the board, centred on the point it was asked for. */
-  private addSimViewport(at?: { clientX: number; clientY: number }): void {
+  /**
+   * Offer to grow a 3D container from a container's free output terminal.
+   *
+   * Hovering the terminal is the whole gesture: a 2D container is the root of a
+   * chain, and a drape is the one thing you would want next — the same thing
+   * dragging that terminal onto a drape does, without the drag. Nothing is offered
+   * once the output feeds something, since it already has its chain.
+   */
+  private offerDrapeAttachment(node: CanvasNode): void {
+    const el = this.findNodeEl(node.id);
+    const port = el?.querySelector<HTMLElement>(':scope > .node-port-out') ?? null;
+    if (!port) return;
+    const canOffer = canAttach3dContainer({
+      nodeType: node.type,
+      direction: port.dataset.portDirection ?? '',
+      kind: port.dataset.portKind ?? '',
+      connected: port.classList.contains('is-connected'),
+      wiring: this.wireDrag !== null,
+      embedded: this.isEmbeddedNode(node),
+    });
+    if (!canOffer) {
+      this.hideDrapeOffer();
+      return;
+    }
+    const patternId = node.type === 'patternFrame' ? node.patternId : null;
+    if (!patternId) return;
+
+    this.cancelDrapeOfferHide();
+    const button = this.drapeOfferButton();
+    this.drapeOffer = { button, nodeId: node.id, patternId };
+    const wrap = document.getElementById('boardWrap');
+    const wrapRect = wrap?.getBoundingClientRect();
+    const portRect = port.getBoundingClientRect();
+    if (!wrapRect) return;
+    button.style.left = `${Math.round(portRect.right - wrapRect.left + 10)}px`;
+    button.style.top = `${Math.round(portRect.top - wrapRect.top + portRect.height / 2)}px`;
+    button.hidden = false;
+    button.setAttribute(
+      'aria-label',
+      `Add a 3D container wired to ${
+        this.project.patterns.find((p) => p.id === patternId)?.name ?? 'this container'
+      }`
+    );
+  }
+
+  private drapeOfferButton(): HTMLButtonElement {
+    if (this.drapeOfferButtonEl?.isConnected) return this.drapeOfferButtonEl;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'drape-offer';
+    button.hidden = true;
+    button.textContent = '+ 3d container';
+    button.title = 'Add a 3D container here, wired to this container';
+    // A press on the prompt is not a press on the board: it must not start a wire
+    // drag, a pan, or a marquee.
+    button.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    button.addEventListener('pointerenter', () => this.cancelDrapeOfferHide());
+    button.addEventListener('pointerleave', () => this.scheduleDrapeOfferHide());
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.attachDrapeOffer();
+    });
+    this.boardWrap().appendChild(button);
+    this.drapeOfferButtonEl = button;
+    return button;
+  }
+
+  private boardWrap(): HTMLElement {
+    return document.getElementById('boardWrap') as HTMLElement;
+  }
+
+  /** The pointer left the terminal on its way to the prompt, or the other way. */
+  private scheduleDrapeOfferHide(): void {
+    this.cancelDrapeOfferHide();
+    this.drapeOfferTimer = setTimeout(() => {
+      this.drapeOfferTimer = null;
+      this.hideDrapeOffer();
+    }, DRAPE_OFFER_LINGER_MS);
+  }
+
+  private cancelDrapeOfferHide(): void {
+    if (this.drapeOfferTimer === null) return;
+    clearTimeout(this.drapeOfferTimer);
+    this.drapeOfferTimer = null;
+  }
+
+  private hideDrapeOffer(): void {
+    this.cancelDrapeOfferHide();
+    const offer = this.drapeOffer;
+    this.drapeOffer = null;
+    if (offer) offer.button.hidden = true;
+  }
+
+  /** The prompt was clicked: make the drape, wired to the container it came from. */
+  private attachDrapeOffer(): void {
+    const offer = this.drapeOffer;
+    this.hideDrapeOffer();
+    if (!offer) return;
+    const node = this.project.canvas.nodes.find((candidate) => candidate.id === offer.nodeId);
+    const el = this.findNodeEl(offer.nodeId);
+    const port = el?.querySelector<HTMLElement>(':scope > .node-port-out') ?? null;
+    if (!node || !port) return;
+    const wrapRect = this.boardWrap().getBoundingClientRect();
+    const portRect = port.getBoundingClientRect();
+    if (!wrapRect) return;
+    const anchor = attachDrapeAnchor(
+      { right: portRect.right, top: portRect.top, height: portRect.height },
+      this.project.canvas.zoom,
+      { width: DRAPE_NODE_WIDTH, height: DRAPE_NODE_HEIGHT },
+      { left: wrapRect.left, top: wrapRect.top, right: wrapRect.right, bottom: wrapRect.bottom }
+    );
+    this.pushUndo();
+    this.addSimViewport(anchor, { patternId: offer.patternId });
+    const name = this.project.patterns.find((p) => p.id === offer.patternId)?.name;
+    this.setStatus(
+      name
+        ? `3D container attached to ${name} — it carries its own remesh and transform stages`
+        : '3D container attached'
+    );
+  }
+
+  private addSimViewport(
+    at?: { clientX: number; clientY: number },
+    options: { patternId?: string } = {}
+  ): void {
     const simId = uid('sim');
     const sim: SimInstance = {
       id: simId,
@@ -6640,8 +7484,8 @@ export class StudioApp {
       dropped: false,
     };
     this.project.sims.push(sim);
-    const width = 420;
-    const height = 320;
+    const width = DRAPE_NODE_WIDTH;
+    const height = DRAPE_NODE_HEIGHT;
     const anchor = this.boardPointFromClient(at?.clientX, at?.clientY);
     const node: SimViewportNode = {
       type: 'simViewport',
@@ -6656,9 +7500,12 @@ export class StudioApp {
     this.project.canvas.nodes.push(node);
     this.mountNode(node);
     this.selectNodes([node.id]);
-    // A drape carries its own remesh + transform stages; wire in the first
-    // pattern so the fullscreen tab strip is complete straight away.
-    const pattern = this.project.patterns[0];
+    // A drape carries its own remesh + transform stages; wire in a pattern so the
+    // fullscreen tab strip is complete straight away — the one it was asked for,
+    // or the page's for a drape dropped from the Add menu.
+    const pattern = options.patternId
+      ? this.project.patterns.find((candidate) => candidate.id === options.patternId)
+      : this.project.patterns[0];
     if (pattern) {
       this.connectPatternToSim(pattern, sim);
     } else {

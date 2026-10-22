@@ -85,6 +85,10 @@ export interface ClothSimulator extends ClothRenderExtras {
   setDragging(dragging: boolean): void;
   /** Latest particle positions (xyz interleaved, world units) for overlays, or null. */
   getPositionsSnapshot?(): Float32Array | null;
+  /** The flat layout the cloth was rebuilt from — its rest shape, for export. */
+  getRestPositionsSnapshot?(): Float32Array | null;
+  /** Triangle indices into those positions, for exporting the cloth as a mesh. */
+  getTriangleIndices?(): Uint32Array | null;
 
   getModelMatrix(): mat4;
   getPositionBuffer(): GPUBuffer;
