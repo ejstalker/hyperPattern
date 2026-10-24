@@ -3510,6 +3510,12 @@ export class PatternEditor {
       // all the chrome.
       const mark = detail === 'preview' ? 'silhouette' : 'outline';
       for (const piece of this.pattern.pieces) this.drawPiece(piece, mark);
+      // The rectangle is the gesture in hand, not chrome: dropping it would make
+      // a drag on a zoomed-out canvas look like it did nothing at all. It is the
+      // only preview that can reach here, since every other tool draws at `full`.
+      if (this.drag?.type === 'marquee') {
+        this.drawMarquee(this.drag.start, this.drag.current, this.drag.panels);
+      }
       return;
     }
 
