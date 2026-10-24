@@ -35,6 +35,7 @@ import type {
   ProjectDocument,
   SeamEdgeRef,
   SimInstance,
+  SectionNode,
   SimViewportNode,
   TextAnnotationNode,
   Transform3dNode,
@@ -47,6 +48,24 @@ import {
   type PatternDetail,
   type PatternEditorContainer,
 } from '../pattern/PatternEditor';
+import {
+  DEFAULT_TEXT_BACKGROUND,
+  DEFAULT_TEXT_COLOR,
+  TEXT_FONT_FAMILIES,
+  TEXT_WEIGHTS,
+  cssFont,
+  layoutTextLines,
+  renderTextMask,
+  textMaskToPieces,
+  textStyleOf,
+  type TextStyle,
+} from './textObject';
+import {
+  isSection,
+  sectionChildren,
+  sectionsForNode,
+  withSectionContents,
+} from '../project/sections';
 import {
   clipboardPasteCount,
   copyNodes,
@@ -169,6 +188,25 @@ const DRAPE_OFFER_LINGER_MS = 220;
 
 /** How many other projects the file menu offers to jump back to. */
 const DOC_MENU_RECENT = 6;
+
+/**
+ * A CSS colour as the `#rrggbb` a colour input insists on.
+ *
+ * The bar's swatches are native colour pickers, and one cannot show `transparent`
+ * or a named colour; the text object still stores whatever CSS says, so the input
+ * gets a nearest approximation of it and the value is only written back when the
+ * picker is actually used.
+ */
+function toHexColor(value: string, fallback: string): string {
+  if (/^#[0-9a-f]{6}$/i.test(value)) return value;
+  if (typeof document === 'undefined') return fallback;
+  const probe = document.createElement('canvas').getContext('2d');
+  if (!probe) return fallback;
+  probe.fillStyle = fallback;
+  probe.fillStyle = value;
+  const parsed = String(probe.fillStyle);
+  return /^#[0-9a-f]{6}$/i.test(parsed) ? parsed : fallback;
+}
 
 /** "Oct 20" — enough to tell one recent project from another in a menu row. */
 function shortProjectDate(timestamp: number): string {
@@ -391,6 +429,8 @@ export class StudioApp {
   private drapeOfferTimer: ReturnType<typeof setTimeout> | null = null;
   /** Per node, the chrome that has to be told the board's zoom — see `cacheBoardZoomChrome`. */
   private boardChrome = new Map<string, HTMLElement[]>();
+  /** Section labels, which sit beside their frames rather than inside them. */
+  private sectionLabels = new Map<string, HTMLElement>();
   /** The zoom those elements were last given, so a pan does not rewrite it. */
   private chromeVarZoom: number | null = null;
   /** Frames that were off the canvas when the board last moved — see `syncContainerDetail`. */
@@ -430,6 +470,8 @@ export class StudioApp {
   /** Guard so mirrored 2D ↔ 3D selection does not feed back on itself. */
   private splitSelectionSyncing = false;
   private imageFileInput: HTMLInputElement;
+  /** The Figma-style bar that styles the text object in hand, bottom centre. */
+  private textBar: HTMLElement;
   private resizeShiftKey = false;
 
   private constructor(root: HTMLElement) {
@@ -445,6 +487,7 @@ export class StudioApp {
           </div>
           <aside class="studio-inspector" id="inspector"></aside>
         </div>
+        <div class="text-style-bar" id="textStyleBar" role="toolbar" aria-label="Text style" hidden></div>
         <div class="studio-toast" id="toast" role="status" aria-live="polite" hidden></div>
         <div class="studio-modal-root" id="modalRoot" hidden></div>
         <input type="file" id="importFile" accept="application/json,.json,.patterncanvas,application/zip" hidden />
@@ -457,6 +500,7 @@ export class StudioApp {
     this.wiresSvg = root.querySelector('#wires')!;
     this.inspector = root.querySelector('#inspector')!;
     this.toastEl = root.querySelector('#toast')!;
+    this.textBar = root.querySelector('#textStyleBar')!;
     this.modalRoot = root.querySelector('#modalRoot')!;
     this.importFileInput = root.querySelector('#importFile')!;
     this.imageFileInput = root.querySelector('#imageFile')!;
@@ -472,6 +516,7 @@ export class StudioApp {
     this.bindImagePasteAndDrop();
     this.bindClipboardShortcuts();
     this.trackActiveEditorPress();
+    this.buildTextStyleBar();
     window.addEventListener('resize', () => this.drawWires());
   }
 
@@ -744,8 +789,8 @@ export class StudioApp {
       }
       if (node.type === 'text') {
         const el = this.findNodeEl(node.id);
-        const ta = el?.querySelector('textarea') as HTMLTextAreaElement | null;
-        if (ta && ta.value !== node.text) ta.value = node.text;
+        const content = el?.querySelector<HTMLElement>('.node-text-content');
+        if (content && content.textContent !== node.text) content.textContent = node.text;
       }
     }
 
@@ -1902,6 +1947,11 @@ export class StudioApp {
       <p class="node-context-title">${
         many ? this.escapeHtml(`${count} nodes selected`) : this.escapeHtml(this.nodeLabel(node))
       }</p>
+      ${
+        node.type === 'text'
+          ? '<button type="button" role="menuitem" data-node-act="rasterize">Rasterize to pieces</button>'
+          : ''
+      }
       <button type="button" role="menuitem" data-node-act="copy">Copy<span class="app-menu-key">⌘C</span></button>
       <button type="button" role="menuitem" data-node-act="duplicate">Duplicate ${
         many ? `${count} nodes` : 'node'
@@ -1922,7 +1972,9 @@ export class StudioApp {
       e.stopPropagation();
       const act = btn.dataset.nodeAct;
       this.closeNodeMenu();
-      if (act === 'copy') {
+      if (act === 'rasterize' && node.type === 'text') {
+        this.rasterizeTextNode(node);
+      } else if (act === 'copy') {
         this.copySelection();
       } else if (act === 'duplicate') {
         this.duplicateNodeGroup(this.selectedNodeIds, { offsetX: 32, offsetY: 32 });
@@ -1943,7 +1995,8 @@ export class StudioApp {
       <p class="node-context-title">Add to canvas</p>
       <button type="button" role="menuitem" data-board-act="pattern">New pattern <span class="board-menu-kind">2D</span></button>
       <button type="button" role="menuitem" data-board-act="sim">New drape <span class="board-menu-kind">3D</span></button>
-      <button type="button" role="menuitem" data-board-act="text">Note</button>
+      <button type="button" role="menuitem" data-board-act="text">Text</button>
+      <button type="button" role="menuitem" data-board-act="section">Section</button>
       <button type="button" role="menuitem" data-board-act="image">Image reference…</button>
       <div class="app-menu-sep"></div>
       <button type="button" role="menuitem" data-board-act="paste"${
@@ -1968,9 +2021,15 @@ export class StudioApp {
       } else if (act === 'sim') {
         this.pushUndo();
         this.addSimViewport(at);
+      } else if (act === 'section') {
+        const point = this.boardPointFromClient(at.clientX, at.clientY);
+        const cm = canvasCmScale(this.project);
+        this.addSection({ x: point.x / cm, y: point.y / cm, w: 0, h: 0 });
       } else if (act === 'text') {
-        this.pushUndo();
-        this.addTextNote(at);
+        // A click-placed text object: it sizes itself to what is typed.
+        const point = this.boardPointFromClient(at.clientX, at.clientY);
+        const cm = canvasCmScale(this.project);
+        this.addTextObject({ x: point.x / cm, y: point.y / cm, w: 0, h: 0 });
       } else if (act === 'image') {
         // The picker writes into the same input paste and drop use.
         this.imageFileInput.click();
@@ -2104,7 +2163,12 @@ export class StudioApp {
       }
       // A move or a resize is a document edit: without this it would only reach
       // the file on the next autosave.
-      if (this.draggingNodes || this.resizingNode) this.markDirty();
+      if (this.draggingNodes || this.resizingNode) {
+        this.markDirty();
+        // A section holds what is inside it, so a drag or a resize can change what
+        // it holds without touching the section at all — say so as it happens.
+        this.refreshSectionTally();
+      }
       this.panning = false;
       this.draggingNodes = null;
       this.resizingNode = null;
@@ -2377,6 +2441,7 @@ export class StudioApp {
     this.closeNodeFullscreen();
     this.teardownSims();
     this.board.innerHTML = '';
+    this.sectionLabels.clear();
     this.editors.clear();
     for (const preview of this.meshPreviews.values()) preview.destroy();
     this.meshPreviews.clear();
@@ -2421,6 +2486,8 @@ export class StudioApp {
       getMeasurementLibrary: () => cachedMeasurementLibrary(),
       onGroupIntoContainer: (pieceIds) => this.groupCanvasPiecesIntoContainer(pieceIds),
       onMarqueeRect: (box, info) => this.mirrorPageMarquee(box, info),
+      onAddObject: (kind, box) =>
+        kind === 'section' ? this.addSection(box) : this.addTextObject(box),
       onPiecesDropped: (drop) => this.handOverDroppedPieces(null, drop),
     });
     this.canvasSurface = host;
@@ -2603,6 +2670,7 @@ export class StudioApp {
     ).map((node) => node.id);
     this.applyNodeSelection([...this.pageMarqueeBase, ...hits]);
     this.layoutNodes();
+    this.syncTextStyleBar();
   }
 
   private findNodeEl(nodeId: string): HTMLElement | null {
@@ -2633,6 +2701,7 @@ export class StudioApp {
       el.style.width = `${node.width}px`;
       el.style.height = `${node.height}px`;
       el.classList.toggle('selected', this.isNodeSelected(node.id));
+      if (isSection(node)) this.placeSectionLabel(node);
       el.classList.toggle(
         'sim-active',
         node.type === 'simViewport' && (node as SimViewportNode).simId === this.project.activeSimId
@@ -3928,6 +3997,10 @@ export class StudioApp {
    * under whichever neighbour happened to be stacked next.
    */
   private nodeZIndex(node: CanvasNode): number {
+    // A section is the ground the board stands on: it always paints behind every
+    // other node, however its own layer number reads, and its own order among
+    // sections is all its z-index is used for.
+    if (isSection(node)) return node.zIndex - 1000;
     return node.type === 'patternFrame' && !containerClips(node)
       ? node.zIndex + 1000
       : node.zIndex;
@@ -4101,7 +4174,13 @@ export class StudioApp {
     }
     this.pushUndo();
 
-    let targets = this.selectedNodeIds.slice();
+    // A section is moved by moving everything inside it: the objects belong to it
+    // by virtue of where they are, so they travel with it and stay in it.
+    let targets = withSectionContents(
+      this.project.canvas.nodes,
+      this.selectedNodeIds,
+      (entry) => this.isEmbeddedNode(entry)
+    );
     // Option/Alt-drag: leave the originals in place and drag duplicates.
     if (e.altKey) {
       const copies = this.duplicateNodeGroup(targets, {
@@ -4211,7 +4290,10 @@ export class StudioApp {
     let chrome: HTMLElement | null = null;
 
     // Image refs are chrome-less: drag the image itself (no title / fullscreen).
-    if (node.type !== 'image') {
+    // Sections are too — a section has no view to open and its name is its own
+    // element on the board (see `mountSectionLabel`), so a header would only be a
+    // second title bar with a full-screen button that has nothing to show.
+    if (node.type !== 'image' && node.type !== 'section') {
       chrome = document.createElement('div');
       chrome.className = 'node-chrome';
       // Only the close / fullscreen button lives in the header; the node's own
@@ -4441,14 +4523,33 @@ export class StudioApp {
           { once: true }
         );
       }
+    } else if (node.type === 'section') {
+      // A section is nothing but a frame: its label is mounted beside it on the
+      // board (see `mountSectionLabel`), because the frame has to paint behind
+      // every node and its label has to paint over every node.
     } else if (node.type === 'text') {
-      chrome!.querySelector('.node-title')!.textContent = 'Note';
-      const ta = document.createElement('textarea');
-      ta.value = node.text;
-      ta.addEventListener('input', () => {
-        node.text = ta.value;
+      chrome!.querySelector('.node-title')!.textContent = this.textNodeLabel(node);
+      const content = document.createElement('div');
+      content.className = 'node-text-content';
+      content.contentEditable = 'true';
+      content.spellcheck = false;
+      content.setAttribute('role', 'textbox');
+      content.setAttribute('aria-multiline', 'true');
+      content.textContent = node.text;
+      this.applyTextNodeStyle(node, content);
+      content.addEventListener('input', () => {
+        node.text = content.textContent ?? '';
+        this.fitTextNode(node, content);
+        chrome!.querySelector('.node-title')!.textContent = this.textNodeLabel(node);
+        this.syncTextStyleBar();
+        this.markDirty();
       });
-      body.appendChild(ta);
+      // Typing is the point of the object, so the editor keeps its own presses.
+      content.addEventListener('pointerdown', (e) => e.stopPropagation());
+      body.appendChild(content);
+      // The box is a function of the text from the first paint: an auto-width
+      // object is only as wide as what it says.
+      queueMicrotask(() => this.fitTextNode(node, content));
       // A note is dragged by the border around its text rather than by a bar: the
       // band is invisible and only 12px thick, so the middle of the note stays a
       // place to type. Four strips rather than one ring, so each carries the move
@@ -4469,6 +4570,7 @@ export class StudioApp {
 
     this.mountNodePorts(el, node);
     this.board.appendChild(el);
+    if (isSection(node)) this.mountSectionLabel(node);
     this.cacheBoardZoomChrome(node.id, el);
   }
 
@@ -4494,6 +4596,65 @@ export class StudioApp {
     const value = String(this.project.canvas.zoom);
     for (const element of chrome) element.style.setProperty('--board-zoom', value);
     this.chromeVarZoom = this.project.canvas.zoom;
+  }
+
+  /**
+   * A section's name, as its own element beside the frame.
+   *
+   * It cannot live inside the section: the frame has to paint behind every node
+   * (so the canvas stays canvas), and anything inside it would be behind them
+   * too — including the label, which has to be the one thing you can always
+   * click. So it is a sibling, pinned to the frame's top-left corner and layered
+   * over the board.
+   */
+  private mountSectionLabel(node: SectionNode): void {
+    const label = document.createElement('div');
+    label.className = 'node-section-label';
+    label.dataset.sectionId = node.id;
+    label.textContent = node.label;
+    label.title = 'Double-click to rename · drag to move the section and everything in it';
+    // A press drags the section; a second press in the same breath renames it.
+    // Counted here rather than left to `dblclick`, which never arrives: a press
+    // on a draggable thing has its default taken away, and the click that a
+    // double-click is built from goes with it.
+    let lastPress = 0;
+    label.addEventListener('pointerdown', (e) => {
+      if ((e.target as HTMLElement).isContentEditable) return;
+      const now = performance.now();
+      if (e.button === 0 && now - lastPress < 450) {
+        lastPress = 0;
+        e.preventDefault();
+        e.stopPropagation();
+        this.renameSection(node, label);
+        return;
+      }
+      lastPress = now;
+      this.beginNodeDrag(node, e);
+      // The label is a sibling of the frame, not inside it, so the board would
+      // otherwise read this press as "empty canvas" and start a marquee over the
+      // drag that is already under way.
+      e.stopPropagation();
+    });
+    // The frame itself is see-through, so its label is also where the section is
+    // right-clicked for its menu.
+    label.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.showNodeMenu(node, e.clientX, e.clientY);
+    });
+    this.board.appendChild(label);
+    this.sectionLabels.set(node.id, label);
+    this.placeSectionLabel(node);
+  }
+
+  /** Pin a section's label to its frame's top-left corner. */
+  private placeSectionLabel(node: SectionNode): void {
+    const label = this.sectionLabels.get(node.id);
+    if (!label) return;
+    label.style.left = `${node.x}px`;
+    label.style.top = `${node.y}px`;
+    label.style.setProperty('--board-zoom', String(this.project.canvas.zoom));
+    label.classList.toggle('selected', this.isNodeSelected(node.id));
   }
 
   private mountNodePorts(el: HTMLElement, node: CanvasNode): void {
@@ -5916,6 +6077,7 @@ export class StudioApp {
 
   private renderInspector(): void {
     this.hideInspectorTip();
+    this.syncTextStyleBar();
     const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
     if (!node) {
       this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom. Shift- or ⌘/Ctrl-click a node, or ⌘/Ctrl-drag the board, to select several at once, then ⌘/Ctrl+D to duplicate the whole set — links between the copies stay between the copies. ⌫ / Delete removes the selection.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · Shift-click pieces to multi-select (drag or rotate the group around their shared pivot) · empty drag to orbit · Shift-drag empty space to raise/lower orbit · Move/Rotate toggle · R = 90° local X · Snap to quadrant reveals the two 2 × 8 grids: click a piece, then click a cell to centre it there · wheel zoom.<br/>Sim: drag fabric to move · Shift-click to multi-select · Play to simulate drape · Draw pattern points shows the pattern's anchor points on the fabric — click one to edit it in a small overlay (Cancel/Apply above it; Apply remeshes and rebuilds the drape).</p>`;
@@ -6442,12 +6604,51 @@ export class StudioApp {
       return;
     }
 
-    if (node.type === 'text') {
+    if (isSection(node)) {
+      const held = sectionChildren(
+        this.project.canvas.nodes,
+        node,
+        (entry) => this.isEmbeddedNode(entry)
+      );
+      const names = held.map((child) => this.nodeLabel(child)).slice(0, 8);
       this.inspector.innerHTML = `
-        <h3>Note</h3>
-        <p class="muted">Edit text directly on the canvas.</p>
+        <h3>${this.escapeHtml(node.label || 'Section')}</h3>
+        <p class="muted">A section is a visual group. Anything dragged inside it joins it, and moving, copying or deleting the section takes it along.</p>
+        <label>Label <input id="sectionLabel" value="${this.escapeHtml(node.label)}" /></label>
+        <p class="muted">${
+          held.length === 0
+            ? 'Nothing inside it yet.'
+            : `${held.length} object${held.length === 1 ? '' : 's'}: ${this.escapeHtml(
+                names.join(', ')
+              )}${held.length > names.length ? '…' : ''}`
+        }</p>
         ${this.deleteButtonHtml()}
       `;
+      this.inspector.querySelector('#sectionLabel')?.addEventListener('change', (e) => {
+        const value = (e.target as HTMLInputElement).value.trim();
+        if (!value || value === node.label) return;
+        this.pushUndo();
+        node.label = value;
+        const label = this.findNodeEl(node.id)?.querySelector('.node-section-label');
+        if (label) label.textContent = value;
+        this.markDirty();
+        this.renderInspector();
+      });
+      this.bindDeleteButton(node.id);
+      return;
+    }
+
+    if (node.type === 'text') {
+      this.inspector.innerHTML = `
+        <h3>Text</h3>
+        <p class="muted">Type directly on the canvas. Style it, its fill and its padding from the bar at the bottom of the window.</p>
+        <p class="muted">A text object is not pattern work — nothing can be sewn or meshed from it. Rasterize it into pieces to make it one, with a piece per character.</p>
+        <button type="button" id="textRasterize">Rasterize to pieces</button>
+        ${this.deleteButtonHtml()}
+      `;
+      this.inspector.querySelector('#textRasterize')?.addEventListener('click', () => {
+        this.rasterizeTextNode(node);
+      });
       this.bindDeleteButton(node.id);
       return;
     }
@@ -6557,7 +6758,13 @@ export class StudioApp {
    * the document behind a node is only dropped once the last node using it goes.
    */
   private deleteNodes(nodeIds: readonly string[]): void {
-    const nodes = nodeIds
+    // A section is the group, so deleting it deletes what it holds — the same
+    // reading of "the section" that copy and move use.
+    const nodes = withSectionContents(
+      this.project.canvas.nodes,
+      nodeIds,
+      (entry) => this.isEmbeddedNode(entry)
+    )
       .map((id) => this.project.canvas.nodes.find((n) => n.id === id))
       .filter((n): n is CanvasNode => !!n);
     if (nodes.length === 0) return;
@@ -6779,7 +6986,14 @@ export class StudioApp {
     const pieceIds = editor?.getSelectedPieces() ?? [];
     const inContainer = this.activeEditorKey !== null && this.activeEditorKey !== 'canvas';
     if (inContainer && pattern && pieceIds.length > 0) return copyPieces(pattern, pieceIds);
-    if (this.selectedNodeIds.length > 0) return copyNodes(this.project, this.selectedNodeIds);
+    if (this.selectedNodeIds.length > 0) {
+      const ids = withSectionContents(
+        this.project.canvas.nodes,
+        this.selectedNodeIds,
+        (node) => this.isEmbeddedNode(node)
+      );
+      return copyNodes(this.project, ids);
+    }
     if (pattern && pieceIds.length > 0) return copyPieces(pattern, pieceIds);
     return null;
   }
@@ -6936,7 +7150,13 @@ export class StudioApp {
       announce?: boolean;
     } = {}
   ): CanvasNode[] {
-    const plan = planNodeDuplicates(this.project, nodeIds, uid);
+    // The section and its contents travel together, and the copies land inside the
+    // copy, because where an object is *is* the membership.
+    const plan = planNodeDuplicates(
+      this.project,
+      withSectionContents(this.project.canvas.nodes, nodeIds, (n) => this.isEmbeddedNode(n)),
+      uid
+    );
     if (plan.sources.length === 0) return [];
     if (opts.recordUndo !== false) this.pushUndo();
     const copies: CanvasNode[] = [];
@@ -7000,7 +7220,9 @@ export class StudioApp {
       case 'image':
         return node.label ?? 'Image';
       case 'text':
-        return 'Note';
+        return this.textNodeLabel(node);
+      case 'section':
+        return node.label || 'Section';
     }
   }
 
@@ -7174,15 +7396,24 @@ export class StudioApp {
       }
       case 'text': {
         node = {
-          type: 'text',
+          ...structuredClone(src),
+          id: uid('node'),
+          x: src.x + ox,
+          y: src.y + oy,
+          zIndex,
+        };
+        break;
+      }
+      case 'section': {
+        node = {
+          type: 'section',
           id: uid('node'),
           x: src.x + ox,
           y: src.y + oy,
           width: src.width,
           height: src.height,
           zIndex,
-          text: src.text,
-          fontSize: src.fontSize,
+          label: src.label,
         };
         break;
       }
@@ -7515,23 +7746,467 @@ export class StudioApp {
     this.drawWires();
   }
 
-  private addTextNote(at?: { clientX: number; clientY: number }): void {
-    const width = 280;
-    const height = 80;
-    const anchor = this.boardPointFromClient(at?.clientX, at?.clientY);
+  /**
+   * A text object where the Add tool asked for one: a dragged box wraps and a
+   * click sizes itself to what is typed. Both are geometry in canvas units —
+   * the box the drag drew, or a default paragraph — and the tool goes back to
+   * Move, because typing into what you just made is the next thing you do.
+   */
+  private addTextObject(box: { x: number; y: number; w: number; h: number }): void {
+    const topLeft = canvasAtCm(this.project, box.x, box.y);
+    const dragged = box.w > 0.5 && box.h > 0.5;
+    const width = dragged ? box.w * canvasCmScale(this.project) : 260;
+    const height = dragged ? box.h * canvasCmScale(this.project) : 44;
     const node: TextAnnotationNode = {
       type: 'text',
       id: uid('node'),
-      x: Math.round(anchor.x - width / 2),
-      y: Math.round(anchor.y - height / 2),
-      width,
-      height,
+      x: Math.round(topLeft.x),
+      y: Math.round(topLeft.y),
+      width: Math.round(width),
+      height: Math.round(height),
       zIndex: this.project.canvas.nodes.length + 1,
-      text: 'New note',
-      fontSize: 14,
+      text: 'Text',
+      fontSize: 28,
+      fontFamily: TEXT_FONT_FAMILIES[0],
+      fontWeight: 400,
+      lineHeight: 1.3,
+      align: 'left',
+      color: DEFAULT_TEXT_COLOR,
+      background: DEFAULT_TEXT_BACKGROUND,
+      padding: 8,
+      autoWidth: !dragged,
     };
+    this.pushUndo();
     this.project.canvas.nodes.push(node);
     this.mountNode(node);
     this.selectNodes([node.id]);
+    this.canvasEditor?.setTool('move');
+    // Put the caret in the new object: it is a placeholder until it says
+    // something, and selecting it alone would not make that obvious.
+    const content = this.findNodeEl(node.id)?.querySelector<HTMLElement>('.node-text-content');
+    if (content) {
+      content.focus();
+      const range = document.createRange();
+      range.selectNodeContents(content);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }
+    this.markDirty();
+    this.setStatus('Text — style it from the bar below');
+  }
+
+  /**
+   * A section where the Add tool asked for one.
+   *
+   * Nothing is "put into" it: a section holds whatever lies inside it, worked out
+   * from the board every time it matters (see `sections.ts`). So the drag that
+   * makes it is also the gesture that gathers what it lands on — if the objects
+   * were already there, they are in it the moment the rectangle closes round them.
+   */
+  private addSection(box: { x: number; y: number; w: number; h: number }): void {
+    const topLeft = canvasAtCm(this.project, box.x, box.y);
+    const dragged = box.w > 0.5 && box.h > 0.5;
+    const scale = canvasCmScale(this.project);
+    const width = Math.round(dragged ? box.w * scale : 480);
+    const height = Math.round(dragged ? box.h * scale : 320);
+    const node: SectionNode = {
+      type: 'section',
+      id: uid('node'),
+      x: Math.round(topLeft.x),
+      y: Math.round(topLeft.y),
+      width,
+      height,
+      // Behind everything: a section is the ground its objects stand on.
+      zIndex: this.project.canvas.nodes.reduce((low, entry) => Math.min(low, entry.zIndex), 0) - 1,
+      label: `Section ${this.project.canvas.nodes.filter(isSection).length + 1}`,
+    };
+    this.pushUndo();
+    this.project.canvas.nodes.push(node);
+    this.mountNode(node);
+    this.selectNodes([node.id]);
+    this.canvasEditor?.setTool('move');
+    this.markDirty();
+    const held = sectionChildren(
+      this.project.canvas.nodes,
+      node,
+      (entry) => this.isEmbeddedNode(entry)
+    ).length;
+    this.setStatus(
+      held > 0
+        ? `Section — holding ${held} object${held === 1 ? '' : 's'}`
+        : 'Section — drag objects into it and they join it'
+    );
+  }
+
+  /**
+   * Rename a section in place, the way a Figma section renames: the label becomes
+   * a field, Enter or a click elsewhere keeps it, Escape puts the old one back.
+   */
+  private renameSection(node: SectionNode, label: HTMLElement): void {
+    if (label.isContentEditable) return;
+    const before = node.label;
+    label.contentEditable = 'true';
+    label.spellcheck = false;
+    label.focus();
+    const range = document.createRange();
+    range.selectNodeContents(label);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    let done = false;
+    const finish = (commit: boolean): void => {
+      if (done) return;
+      done = true;
+      label.contentEditable = 'false';
+      const next = (label.textContent ?? '').trim();
+      if (commit && next && next !== before) {
+        this.pushUndo();
+        node.label = next;
+        this.markDirty();
+        this.renderInspector();
+      } else {
+        label.textContent = before;
+      }
+      label.blur();
+    };
+    label.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        finish(true);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false);
+      }
+    });
+    label.addEventListener('blur', () => finish(true), { once: true });
+  }
+
+  /**
+   * Bring the section the board is working in up to date.
+   *
+   * Membership is geometry, so it changes when *other* things move. Anything that
+   * shifts a node calls this: the selected section's panel is re-rendered and the
+   * status line carries its tally, which is the answer to "did that land inside?".
+   */
+  private refreshSectionTally(): void {
+    const section = this.project.canvas.nodes.find(
+      (node): node is SectionNode => isSection(node) && this.isNodeSelected(node.id)
+    );
+    if (!section) {
+      if (this.project.canvas.nodes.some(isSection)) this.renderInspector();
+      return;
+    }
+    const held = sectionChildren(
+      this.project.canvas.nodes,
+      section,
+      (entry) => this.isEmbeddedNode(entry)
+    ).length;
+    this.renderInspector();
+    this.setStatus(
+      held === 0
+        ? `${section.label} — nothing inside it yet`
+        : `${section.label} — holding ${held} object${held === 1 ? '' : 's'}`
+    );
+  }
+
+  /** The node's own styling, written onto the element that draws it. */
+  private applyTextNodeStyle(node: TextAnnotationNode, el: HTMLElement): void {
+    const style = textStyleOf(node);
+    el.style.fontFamily = `"${style.fontFamily}", sans-serif`;
+    el.style.fontSize = `${style.fontSize}px`;
+    el.style.fontWeight = String(style.fontWeight);
+    el.style.fontStyle = style.fontStyle;
+    el.style.lineHeight = String(style.lineHeight);
+    el.style.letterSpacing = `${style.letterSpacing}px`;
+    el.style.textAlign = style.align;
+    el.style.color = style.color;
+    el.style.background = style.background;
+    el.style.padding = `${style.padding}px`;
+    el.style.width = style.autoWidth ? 'max-content' : '100%';
+    el.style.whiteSpace = style.autoWidth ? 'pre' : 'pre-wrap';
+  }
+
+  /**
+   * A text object's box is what its text needs: an auto-width object grows with
+   * its longest line, and every object grows downwards as lines are added.
+   */
+  private fitTextNode(node: TextAnnotationNode, el?: HTMLElement | null): void {
+    const content =
+      el ?? this.findNodeEl(node.id)?.querySelector<HTMLElement>('.node-text-content');
+    if (!content) return;
+    const style = textStyleOf(node);
+    // `scrollWidth` is layout size, so the board's zoom does not enter into it.
+    const width = style.autoWidth
+      ? Math.ceil(content.scrollWidth + 2)
+      : Math.max(40, Math.round(node.width));
+    const height = Math.ceil(content.scrollHeight + 2);
+    if (width === Math.round(node.width) && height === Math.round(node.height)) return;
+    node.width = width;
+    node.height = height;
+    this.layoutNodes();
+  }
+
+  /**
+   * Turn a text object into pattern work: one piece per character.
+   *
+   * The glyph outlines belong to the font, not to the document, so they are read
+   * off a rasterized copy of the laid-out text and traced — see `textObject.ts`.
+   * The pieces land in the page's own pattern, exactly where the text stood, so
+   * the drawing does not move when the object becomes editable geometry; the text
+   * node goes away, because it is now that geometry.
+   *
+   * A rectangle of text (a dragged box that wraps) comes back as pieces, not as a
+   * paragraph: each character is its own outline, and the line breaks are gone
+   * with the object. That is the same trade a rasterizing pass makes anywhere.
+   */
+  private rasterizeTextNode(node: TextAnnotationNode): void {
+    if (node.type !== 'text') return;
+    // Twelve pixels per canvas unit: fine enough that the traced outline is the
+    // glyph's own shape rather than a staircase at its edge.
+    const mask = renderTextMask(node, { scale: 12 });
+    if (!mask) {
+      this.setStatus('Could not read the text to rasterize it');
+      return;
+    }
+    const pattern = rootPattern(this.project);
+    const pieces = textMaskToPieces(
+      mask,
+      { x: node.x, y: node.y, cmScale: canvasCmScale(this.project) },
+      { name: node.text.trim().slice(0, 12) || 'Text' }
+    );
+    if (pieces.length === 0) {
+      this.setStatus('Nothing to rasterize — the text is empty');
+      return;
+    }
+    this.pushUndo();
+    pattern.pieces.push(...pieces);
+    this.project.canvas.nodes = this.project.canvas.nodes.filter((entry) => entry.id !== node.id);
+    this.removeNodeEl(node.id);
+    this.editors.delete(node.id);
+    this.applyNodeSelection([]);
+    this.invalidateMeshesForPattern(pattern.id);
+    this.drawWires();
+    this.renderInspector();
+    this.markDirty();
+    void this.persistLocal({ quiet: true });
+    // The pieces are page work now: pick them up in the page's own editor so the
+    // next thing typed or dragged is about them.
+    this.canvasEditor?.setSelectedPieces(pieces.map((piece) => piece.id));
+    this.canvasEditor?.refresh();
+    const name = this.textNodeLabel(node);
+    this.setStatus(
+      `Rasterized “${name}” into ${pieces.length} piece${pieces.length === 1 ? '' : 's'}`
+    );
+  }
+
+  /** Take one node's element off the board, chrome and all. */
+  private removeNodeEl(nodeId: string): void {
+    this.findNodeEl(nodeId)?.remove();
+    this.sectionLabels.get(nodeId)?.remove();
+    this.sectionLabels.delete(nodeId);
+    this.boardChrome.delete(nodeId);
+  }
+
+  /**
+   * The text style bar: Figma's bottom-of-the-window strip, for the one text
+   * object in hand.
+   *
+   * It is built once and reused — the controls keep their focus while you drag a
+   * colour picker, which a bar rebuilt per keystroke would not — and it is only
+   * on screen while a single text node is selected. Every control writes to the
+   * node and then re-applies the style, so what is on screen and what is stored
+   * cannot drift apart.
+   */
+  private buildTextStyleBar(): void {
+    const fontOptions = TEXT_FONT_FAMILIES.map(
+      (family) => `<option value="${family}">${family}</option>`
+    ).join('');
+    const weightOptions = TEXT_WEIGHTS.map(
+      (weight) => `<option value="${weight.value}">${weight.label}</option>`
+    ).join('');
+    const alignButton = (align: string, label: string, icon: string) =>
+      `<button type="button" data-text-align="${align}" title="${label}" aria-label="${label}">${icon}</button>`;
+    this.textBar.innerHTML = `
+      <label class="text-style-field" title="Font">
+        <span class="text-style-label">Font</span>
+        <select data-text-field="fontFamily">${fontOptions}</select>
+      </label>
+      <label class="text-style-field text-style-size" title="Size">
+        <span class="text-style-label">Size</span>
+        <input type="number" data-text-field="fontSize" min="4" max="400" step="1" />
+      </label>
+      <label class="text-style-field" title="Weight">
+        <span class="text-style-label">Weight</span>
+        <select data-text-field="fontWeight">${weightOptions}</select>
+      </label>
+      <button type="button" class="text-style-toggle" data-text-toggle="italic" title="Italic" aria-label="Italic"><span class="text-style-italic">I</span></button>
+      <div class="text-style-group" role="group" aria-label="Paragraph alignment">
+        ${alignButton('left', 'Align left', '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M2.5 3.5h11M2.5 8h7M2.5 12.5h11"/></svg>')}
+        ${alignButton('center', 'Align centre', '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M2.5 3.5h11M4.5 8h7M2.5 12.5h11"/></svg>')}
+        ${alignButton('right', 'Align right', '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M2.5 3.5h11M6.5 8h7M2.5 12.5h11"/></svg>')}
+        ${alignButton('justify', 'Justify', '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M2.5 3.5h11M2.5 8h11M2.5 12.5h11"/></svg>')}
+      </div>
+      <label class="text-style-field text-style-narrow" title="Line height">
+        <span class="text-style-label">Line</span>
+        <input type="number" data-text-field="lineHeight" min="0.6" max="4" step="0.05" />
+      </label>
+      <label class="text-style-field text-style-narrow" title="Letter spacing">
+        <span class="text-style-label">Space</span>
+        <input type="number" data-text-field="letterSpacing" min="-20" max="80" step="0.5" />
+      </label>
+      <label class="text-style-field text-style-narrow" title="Padding">
+        <span class="text-style-label">Pad</span>
+        <input type="number" data-text-field="padding" min="0" max="200" step="1" />
+      </label>
+      <label class="text-style-field text-style-swatch" title="Text colour">
+        <span class="text-style-label">Text</span>
+        <input type="color" data-text-field="color" />
+      </label>
+      <label class="text-style-field text-style-swatch" title="Background colour">
+        <span class="text-style-label">Fill</span>
+        <input type="color" data-text-field="background" />
+      </label>
+      <button type="button" class="text-style-toggle" data-text-bg="none" title="No background" aria-label="No background">None</button>
+    `;
+    this.textBar.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.textBar.addEventListener('input', (e) => {
+      const target = e.target as HTMLInputElement | HTMLSelectElement;
+      if (target.matches('input[data-text-field], select[data-text-field]')) {
+        this.applyTextBarField(target.dataset.textField!, target.value);
+      } else if (target.matches('input[data-text-bg]')) {
+        this.applyTextBarField('background', target.value);
+      }
+    });
+    this.textBar.addEventListener('change', (e) => {
+      const target = e.target as HTMLInputElement | HTMLSelectElement;
+      if (target.matches('input[data-text-field], select[data-text-field]')) {
+        this.applyTextBarField(target.dataset.textField!, target.value, true);
+      }
+    });
+    this.textBar.addEventListener('click', (e) => {
+      const target = e.target as HTMLElement;
+      const align = target.closest('button[data-text-align]') as HTMLButtonElement | null;
+      if (align) {
+        this.applyTextBarField('align', align.dataset.textAlign!);
+        return;
+      }
+      const toggle = target.closest('button[data-text-toggle]') as HTMLButtonElement | null;
+      if (toggle) {
+        const node = this.selectedTextNode();
+        if (!node) return;
+        this.applyTextBarField('fontStyle', node.fontStyle === 'italic' ? 'normal' : 'italic');
+        return;
+      }
+      const none = target.closest('button[data-text-bg]') as HTMLButtonElement | null;
+      if (none) this.applyTextBarField('background', DEFAULT_TEXT_BACKGROUND);
+    });
+  }
+
+  /** The one text object the bar is for, or null when the selection is anything else. */
+  private selectedTextNode(): TextAnnotationNode | null {
+    if (this.selectedNodeIds.length !== 1) return null;
+    const node = this.project.canvas.nodes.find((entry) => entry.id === this.selectedNodeIds[0]);
+    return node && node.type === 'text' ? node : null;
+  }
+
+  /** Show the bar for that text object, or put it away. */
+  private syncTextStyleBar(): void {
+    const node = this.selectedTextNode();
+    if (!node) {
+      if (!this.textBar.hidden) this.textBar.hidden = true;
+      return;
+    }
+    if (this.textBar.hidden) this.textBar.hidden = false;
+    const style = textStyleOf(node);
+    const set = (field: string, value: string) => {
+      const el = this.textBar.querySelector<HTMLInputElement | HTMLSelectElement>(
+        `[data-text-field="${field}"]`
+      );
+      if (el && el.value !== value) el.value = value;
+    };
+    set('fontFamily', style.fontFamily);
+    set('fontSize', String(style.fontSize));
+    set('fontWeight', String(style.fontWeight));
+    set('lineHeight', String(style.lineHeight));
+    set('letterSpacing', String(style.letterSpacing));
+    set('padding', String(style.padding));
+    set('color', toHexColor(style.color, DEFAULT_TEXT_COLOR));
+    set('background', toHexColor(style.background, '#000000'));
+    this.textBar
+      .querySelectorAll<HTMLButtonElement>('[data-text-align]')
+      .forEach((button) =>
+        button.classList.toggle('is-active', button.dataset.textAlign === style.align)
+      );
+    this.textBar
+      .querySelector('[data-text-toggle="italic"]')
+      ?.classList.toggle('is-active', style.fontStyle === 'italic');
+    this.textBar
+      .querySelector('[data-text-bg="none"]')
+      ?.classList.toggle('is-active', style.background === 'transparent');
+  }
+
+  /**
+   * One control changed: write it to the node, re-apply its style, and let the
+   * box re-measure itself. `commit` is for the events that end a gesture — the
+   * history snapshot is taken once per edit rather than once per pixel of a
+   * colour drag.
+   */
+  private applyTextBarField(field: string, raw: string, commit = false): void {
+    const node = this.selectedTextNode();
+    if (!node) return;
+    if (commit) this.pushUndo();
+    const number = Number.parseFloat(raw);
+    switch (field) {
+      case 'fontFamily':
+        node.fontFamily = raw;
+        break;
+      case 'fontSize':
+        if (Number.isFinite(number)) node.fontSize = Math.max(4, Math.min(400, number));
+        break;
+      case 'fontWeight':
+        if (Number.isFinite(number)) node.fontWeight = number;
+        break;
+      case 'fontStyle':
+        node.fontStyle = raw === 'italic' ? 'italic' : 'normal';
+        break;
+      case 'lineHeight':
+        if (Number.isFinite(number)) node.lineHeight = Math.max(0.6, Math.min(4, number));
+        break;
+      case 'letterSpacing':
+        if (Number.isFinite(number)) node.letterSpacing = Math.max(-20, Math.min(80, number));
+        break;
+      case 'padding':
+        if (Number.isFinite(number)) node.padding = Math.max(0, Math.min(200, number));
+        break;
+      case 'align':
+        node.align = raw === 'center' || raw === 'right' || raw === 'justify' ? raw : 'left';
+        break;
+      case 'color':
+        node.color = raw;
+        break;
+      case 'background':
+        node.background = raw;
+        break;
+      default:
+        return;
+    }
+    const content = this.findNodeEl(node.id)?.querySelector<HTMLElement>('.node-text-content');
+    if (content) {
+      this.applyTextNodeStyle(node, content);
+      this.fitTextNode(node, content);
+    }
+    this.syncTextStyleBar();
+    this.markDirty();
+  }
+
+  /** What the node's chip says: its first line, short enough to read. */
+  private textNodeLabel(node: TextAnnotationNode): string {
+    const first = node.text.split('\n').find((line) => line.trim()) ?? '';
+    const trimmed = first.trim();
+    if (!trimmed) return 'Text';
+    return trimmed.length > 28 ? `${trimmed.slice(0, 27)}…` : trimmed;
   }
 }

@@ -514,11 +514,56 @@ export type ImageNode = CanvasNodeBase & {
   naturalAspect?: number;
 };
 
+/**
+ * A text object on the canvas.
+ *
+ * It is a *canvas* object, not a pattern one: nothing in the pattern knows about
+ * it, and it cannot be sewn or meshed until it is rasterized into pieces (see
+ * `rasterizeText`). Everything here is in canvas units — the same units the node's
+ * box is measured in — so the text zooms with the board like any other work.
+ */
+/**
+ * A section: a big visual group, the way Figma draws one.
+ *
+ * It is a label and a rectangle, nothing more. What it *holds* is worked out from
+ * where the objects are (see `sections.ts`) rather than stored, so the grouping
+ * can never disagree with the board: drag something in and it is in, drag it out
+ * and it is not. A section paints behind everything, never clips and takes no
+ * pointer but on its label and its corners, so the canvas it covers is still
+ * canvas.
+ */
+export type SectionNode = CanvasNodeBase & {
+  type: 'section';
+  label: string;
+};
+
 export type TextAnnotationNode = CanvasNodeBase & {
   type: 'text';
   text: string;
   fontSize: number;
+  /** Font family as a CSS name; the studio's own families are offered first. */
+  fontFamily?: string;
+  fontWeight?: number;
+  fontStyle?: 'normal' | 'italic';
+  /** Multiplier of the font size. */
+  lineHeight?: number;
+  /** Canvas units between characters. */
+  letterSpacing?: number;
+  align?: TextAlign;
+  /** Text colour, as a CSS colour. */
+  color?: string;
+  /** Fill behind the text; `'transparent'` for none. */
+  background?: string;
+  /** Inset between the box and the text, canvas units on every side. */
+  padding?: number;
+  /**
+   * The box is as wide as the text: a click-placed object grows and shrinks with
+   * what is typed into it. A dragged-out box has a width of its own and wraps.
+   */
+  autoWidth?: boolean;
 };
+
+export type TextAlign = 'left' | 'center' | 'right' | 'justify';
 
 export type CanvasNode =
   | PatternFrameNode
@@ -526,7 +571,8 @@ export type CanvasNode =
   | Transform3dNode
   | SimViewportNode
   | ImageNode
-  | TextAnnotationNode;
+  | TextAnnotationNode
+  | SectionNode;
 
 export type MeshSimAssignment = {
   id: string;

@@ -1144,6 +1144,31 @@ optgroup {
 
 /* Tool settings: what the tool in hand is set to, in the top-left slot the
    point settings use — the two are never up together. */
+/*
+ * Above the board's scrim.
+ *
+ * The gradient that keeps the floating top bar legible runs over the whole
+ * window, so anything that lives on the canvas is dimmed by it — including the
+ * ribbons, which are chrome and should read as such. The page deliberately is
+ * not a stacking context (its popovers have to clear the frames), so raising
+ * these z-indexes puts them straight over the scrim without lifting the
+ * drawing with them.
+ */
+.pattern-point-bar,
+.pattern-ruler-bar,
+.pattern-tool-settings,
+.pattern-allowance-bar,
+.pattern-block-bar,
+.pattern-avatar-bar,
+.pattern-xray-bar {
+  z-index: 26;
+}
+
+/* A popover hung off a ribbon has to clear the ribbon it belongs to. */
+.pattern-settings-popover {
+  z-index: 27;
+}
+
 .pattern-tool-settings {
   top: var(--node-top-inset, 8px);
   left: 8px;
@@ -4532,17 +4557,236 @@ optgroup {
   left: 0;
 }
 
-.node-text textarea {
-  width: 100%;
-  height: 100%;
-  border: none;
-  resize: none;
-  /* At least the grab band's width, so no line of text sits under it. */
-  padding: 14px;
-  background: transparent;
+/* ── Sections ───────────────────────────────────────────────────────────────
+   Figma's section, on the board: a large tinted frame with its name above it.
+   It is ground, not furniture — it paints behind every node, never clips and
+   takes no pointer but on its label and its corners, so the canvas it covers is
+   still canvas to draw and drop on. */
+.canvas-node.node-section {
+  background: rgba(242, 235, 227, 0.035);
+  border: 1px solid rgba(242, 235, 227, 0.14);
+  border-radius: 14px;
+  box-shadow: none;
+  min-width: 0;
+  min-height: 0;
+  pointer-events: none;
+}
+
+.canvas-node.node-section.selected {
+  border-color: var(--accent);
+  background: rgba(196, 92, 38, 0.06);
+}
+
+.canvas-node.node-section > .node-body {
+  position: static;
+  background: none;
+  border-radius: 14px;
+}
+
+/* The label sits above the frame, outside it, exactly where it does in Figma —
+   and on its own layer, because a section's frame paints behind every node while
+   its name has to stay clickable over all of them. */
+.node-section-label {
+  position: absolute;
+  z-index: 9999;
+  transform: translateY(calc(-100% - 4px / var(--board-zoom, 1)));
+  max-width: 60vw;
+  padding: 2px 6px;
+  border-radius: 5px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  /* Counter-scaled, like every other chip on the board, so it stays readable at
+     any zoom while its corner stays on the frame's. */
+  font: 600 calc(11px / var(--board-zoom, 1)) var(--font);
+  letter-spacing: 0.01em;
+  pointer-events: auto;
+  cursor: move;
+  user-select: none;
+}
+
+.node-section-label:hover,
+.node-section-label.selected {
   color: var(--ink);
-  font: inherit;
-  font-size: 14px;
+}
+
+.node-section-label[contenteditable='true'] {
+  cursor: text;
+  user-select: text;
+  background: rgba(0, 0, 0, 0.45);
+  color: var(--ink);
+  outline: 1px solid var(--accent);
+}
+
+/* Its corners are handles like any other node's, which is the one place the
+   section takes the pointer over its own rectangle. */
+.canvas-node.node-section > .resize-handle {
+  pointer-events: auto;
+}
+
+/* ── Text objects ───────────────────────────────────────────────────────────
+   A text object is a canvas object, like a frame or an image: the browser draws
+   it in the font it names, and the box around it is the box its text needs. The
+   element is the text, so the styling on it *is* what the document stores — see
+   `applyTextNodeStyle`. */
+.canvas-node.node-text {
+  background: none;
+  border: 1px solid transparent;
+  box-shadow: none;
+  min-width: 0;
+  min-height: 0;
+}
+
+.canvas-node.node-text.selected {
+  border-color: var(--accent);
+}
+
+.canvas-node.node-text .node-text-content {
+  outline: none;
+  cursor: text;
+  /* The element's own box is the text: no flex growth, no min-height. */
+  display: block;
+  overflow-wrap: break-word;
+  tab-size: 4;
+}
+
+.canvas-node.node-text .node-text-content::selection {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* ── The text bar ───────────────────────────────────────────────────────────
+   Figma's strip along the bottom of the window, and for the same reason: it is
+   the one place that is always free, whichever corner the object is in. */
+.text-style-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 52px;
+  transform: translateX(-50%);
+  z-index: 34;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100vw - 24px);
+  padding: 6px 7px;
+  border-radius: var(--palette-radius);
+  background: var(--palette-bg);
+  box-shadow: var(--palette-shadow);
+  font: 11px var(--font);
+  color: var(--ink);
+}
+
+.text-style-bar[hidden] {
+  display: none !important;
+}
+
+.text-style-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 5px;
+  height: 26px;
+  border-radius: 7px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.text-style-field:hover {
+  background: var(--hover);
+}
+
+.text-style-label {
+  font: 600 9.5px var(--font);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.text-style-field select,
+.text-style-field input {
+  height: 20px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--ink);
+  font: 11.5px var(--font);
+}
+
+.text-style-field select {
+  max-width: 104px;
+}
+
+.text-style-size input,
+.text-style-narrow input {
+  width: 46px;
+  font-variant-numeric: tabular-nums;
+}
+
+.text-style-swatch input[type='color'] {
+  width: 24px;
+  height: 20px;
+  padding: 0;
+  border-radius: 5px;
+  background: none;
+  cursor: pointer;
+}
+
+.text-style-swatch input[type='color']::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.text-style-swatch input[type='color']::-webkit-color-swatch {
+  border: 1px solid rgba(242, 235, 227, 0.25);
+  border-radius: 5px;
+}
+
+.text-style-group {
+  display: flex;
+  gap: 1px;
+  padding: 1px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.text-style-bar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: 11px var(--font);
+}
+
+.text-style-bar button:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.text-style-bar button.is-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.text-style-italic {
+  font-style: italic;
+  font-size: 12.5px;
+}
+
+.text-style-bar .text-style-toggle[data-text-bg='none'] {
+  padding: 0 8px;
+}
+
+/* The frame the Add tool draws for a text object, until it becomes one. */
+.pattern-text-preview {
+  fill: rgba(196, 92, 38, 0.08);
+  stroke: var(--accent);
+  pointer-events: none;
 }
 
 .studio-inspector {

@@ -204,6 +204,15 @@ export type PatternEditorCallbacks = {
    * canvas the page and the containers in front of it are one surface, so one
    * drag should be able to pick up points *and* the nodes they came in.
    */
+  /**
+   * The Add tool's Text or Section mode let go of the canvas: place one covering
+   * this box, in pattern centimetres. A click rather than a drag reports a box
+   * with no size, which means "wherever I clicked, at its own natural size".
+   *
+   * Only hosts that can own such an object pass this — the page does, a container
+   * full of pattern work does not — and the modes are hidden where it is missing.
+   */
+  onAddObject?: (kind: PlacedObjectKind, box: ObjectBoxPlace) => void;
   onMarqueeRect?: (
     box: { x: number; y: number; w: number; h: number } | null,
     info: { additive: boolean; panels: boolean }
@@ -344,8 +353,21 @@ export type PatternTool =
   | 'sew'
   | 'ruler';
 
-/** What the Add tool is drawing: a pen stroke, a rectangle, or a circle. */
-export type AddMode = 'pen' | 'rect' | 'circle';
+/**
+ * What the Add tool is drawing: a pen stroke, a rectangle, a circle, or a box for
+ * an object the host owns.
+ *
+ * Text and sections are not pattern work — they are canvas objects — so the editor
+ * only draws the box and asks the host to place it. Those modes are offered only
+ * where a host says it can take one.
+ */
+export type AddMode = 'pen' | 'rect' | 'circle' | 'text' | 'section';
+
+/** What an object box is for: the kinds of canvas object a host can place. */
+export type PlacedObjectKind = 'text' | 'section';
+
+/** A box dragged out on the canvas: pattern centimetres, `w`/`h` 0 for a click. */
+export type ObjectBoxPlace = { x: number; y: number; w: number; h: number };
 
 /** What the Modify tool is doing, and what its ribbon and bar show. */
 export type ModifyMode = 'extrude' | 'join' | 'bridge';
@@ -444,6 +466,12 @@ const ADD_MODES: ReadonlyArray<{ mode: AddMode; label: string; tip: string }> = 
   { mode: 'pen', label: 'Pen', tip: 'Add · Pen — click points down, close on the first' },
   { mode: 'rect', label: 'Rectangle', tip: 'Add · Rectangle — drag out a rectangular panel' },
   { mode: 'circle', label: 'Circle', tip: 'Add · Circle — drag out a round piece' },
+  { mode: 'text', label: 'Text', tip: 'Add · Text — click for a text object, or drag out its box' },
+  {
+    mode: 'section',
+    label: 'Section',
+    tip: 'Add · Section — drag out a group: anything inside it joins it',
+  },
 ];
 
 /**
@@ -555,6 +583,13 @@ type DragKind =
       current: Vec2;
       /** Shift locks rectangle to square; ignored for circle (always circular). */
       lockAspect: boolean;
+    }
+  | {
+      /** The Add tool's Text / Section mode: the box the host is asked to fill. */
+      type: 'objectBox';
+      kind: PlacedObjectKind;
+      start: Vec2;
+      current: Vec2;
     }
   | {
       type: 'extrudeEdge';
@@ -1299,10 +1334,15 @@ export class PatternEditor {
       <div class="pattern-settings-set" data-settings-for="add" hidden>
         <span class="pattern-settings-title">Add</span>
         <div class="pattern-settings-group" role="group" aria-label="Add mode">
-          ${ADD_MODES.map(
+          ${ADD_MODES.filter(
             (entry) =>
-              `<button type="button" data-add-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
-          ).join('')}
+              (entry.mode !== 'text' && entry.mode !== 'section') || this.cbs.onAddObject
+          )
+            .map(
+              (entry) =>
+                `<button type="button" data-add-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
+            )
+            .join('')}
         </div>
         <div class="pattern-settings-menu">
           <button type="button" class="pattern-settings-open" data-menu-open="block" title="Draft a piece from the block library" aria-haspopup="true" aria-expanded="false">Block… <span aria-hidden="true">▾</span></button>
@@ -3523,6 +3563,10 @@ export class PatternEditor {
       this.drawShapePreview(this.drag);
     }
 
+    if (this.drag?.type === 'objectBox') {
+      this.drawObjectBoxPreview(this.drag);
+    }
+
     if (this.drag?.type === 'cutLine' || this.drag?.type === 'cutCircle') {
       this.drawCutPreview(this.drag);
     } else if (this.tool === 'cut' && this.cutMode === 'curve') {
@@ -3781,6 +3825,25 @@ export class PatternEditor {
     };
   }
 
+  /**
+   * The text box being dragged out: the frame the host will fill, drawn to the
+   * same measure as the draw preview it stands in for.
+   */
+  private drawObjectBoxPreview(drag: Extract<DragKind, { type: 'objectBox' }>): void {
+    const box = this.shapeBoxFromDrag(drag.start, drag.current, false);
+    if (box.w < 1e-6 && box.h < 1e-6) return;
+    const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    rect.setAttribute('x', String(box.x));
+    rect.setAttribute('y', String(box.y));
+    rect.setAttribute('width', String(box.w));
+    rect.setAttribute('height', String(box.h));
+    rect.setAttribute('class', 'pattern-text-preview');
+    rect.setAttribute('stroke-width', String(this.px(1.5)));
+    rect.setAttribute('stroke-dasharray', `${this.px(5)} ${this.px(3)}`);
+    rect.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(rect);
+  }
+
   private drawShapePreview(drag: Extract<DragKind, { type: 'drawShape' }>): void {
     const lock = drag.shape === 'circle' || drag.lockAspect;
     const box = this.shapeBoxFromDrag(drag.start, drag.current, lock);
@@ -3807,6 +3870,22 @@ export class PatternEditor {
       ell.setAttribute('pointer-events', 'none');
       this.svg.appendChild(ell);
     }
+  }
+
+  /**
+   * Hand the box to the host. A press that did not move is a click, and a click
+   * means "text that sizes itself", not "a box one pixel wide".
+   */
+  private finishObjectBox(drag: Extract<DragKind, { type: 'objectBox' }>): void {
+    const report = this.cbs.onAddObject;
+    if (!report) return;
+    const moved = dist(drag.start, drag.current);
+    if (moved < this.hitRadius() * 0.5) {
+      report(drag.kind, { x: drag.start.x, y: drag.start.y, w: 0, h: 0 });
+      return;
+    }
+    const box = this.shapeBoxFromDrag(drag.start, drag.current, false);
+    report(drag.kind, { x: box.x, y: box.y, w: box.w, h: box.h });
   }
 
   private finishDrawShape(drag: Extract<DragKind, { type: 'drawShape' }>): void {
@@ -8266,6 +8345,15 @@ export class PatternEditor {
         this.onPenDown(e, p);
         return;
       }
+      // Text and sections are canvas objects rather than pattern work: drag out
+      // the box and hand it over, and let the host take the tool back afterwards.
+      if (this.addMode === 'text' || this.addMode === 'section') {
+        this.drag = { type: 'objectBox', kind: this.addMode, start: p, current: p };
+        this.svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        this.redraw();
+        return;
+      }
       this.drag = {
         type: 'drawShape',
         shape: this.addMode,
@@ -10575,6 +10663,12 @@ export class PatternEditor {
       return;
     }
 
+    if (this.drag.type === 'objectBox') {
+      this.drag.current = p;
+      this.redraw();
+      return;
+    }
+
     if (this.drag.type === 'extrudeEdge') {
       const lock = axisLockFromDelta(p.x - this.drag.start.x, p.y - this.drag.start.y, e.shiftKey);
       this.drag.current = {
@@ -10759,6 +10853,12 @@ export class PatternEditor {
         this.setSelection(this.pointsInRect(finished.start, finished.current));
       }
       this.endHistoryGesture();
+      this.redraw();
+      return;
+    }
+
+    if (finished.type === 'objectBox') {
+      this.finishObjectBox(finished);
       this.redraw();
       return;
     }
