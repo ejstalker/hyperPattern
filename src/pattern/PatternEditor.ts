@@ -956,6 +956,14 @@ export class PatternEditor {
   private xrayBtn: HTMLButtonElement;
   private seamLinksBtn: HTMLButtonElement;
   private allowanceBtn: HTMLButtonElement;
+  private grainBtn: HTMLButtonElement;
+  /**
+   * The grainline every piece is drafted with, drawn on the sheet. Off to begin
+   * with: a new piece is marked up in the data, but a dashed line down its
+   * middle is the first thing a draughtsperson would ask about, so it has to be
+   * asked for.
+   */
+  private grainOn = false;
   private allowanceBar: HTMLElement;
   private allowancePieceInput!: HTMLInputElement;
   private allowanceEdgeInput!: HTMLInputElement;
@@ -1172,6 +1180,13 @@ export class PatternEditor {
             </svg>
             <span class="pattern-view-name">Seam allowance</span>
           </button>
+          <button type="button" class="pattern-view-row" role="menuitemcheckbox" data-opt="grain" aria-label="Grainlines" aria-pressed="false">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 1.5" d="M8 2.8 V 13.2"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" d="M6.4 4.4 L8 2.8 L9.6 4.4 M6.4 11.6 L8 13.2 L9.6 11.6"/>
+            </svg>
+            <span class="pattern-view-name">Grainlines</span>
+          </button>
           <button type="button" class="pattern-view-row" role="menuitemcheckbox" data-opt="seam-links" aria-label="Seam links" aria-pressed="false">
             <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
               <circle cx="4.5" cy="5" r="1.4" fill="currentColor"/>
@@ -1222,6 +1237,7 @@ export class PatternEditor {
     this.allowanceBtn = this.toolbar.querySelector(
       'button[data-opt="allowance"]'
     ) as HTMLButtonElement;
+    this.grainBtn = this.toolbar.querySelector('button[data-opt="grain"]') as HTMLButtonElement;
     this.viewBtn = this.toolbar.querySelector('[data-view-toggle]') as HTMLButtonElement;
     this.viewMenu = this.toolbar.querySelector('.pattern-view-menu') as HTMLElement;
     this.zoomMenu = this.toolbar.querySelector('.pattern-zoom-menu') as HTMLElement;
@@ -1252,6 +1268,13 @@ export class PatternEditor {
       ) as HTMLButtonElement | null;
       if (allowanceBtn) {
         this.setSeamAllowanceEnabled(!this.allowanceOn);
+        return;
+      }
+      const grainBtn = (e.target as HTMLElement).closest(
+        'button[data-opt="grain"]'
+      ) as HTMLButtonElement | null;
+      if (grainBtn) {
+        this.setGrainEnabled(!this.grainOn);
         return;
       }
       const seamLinksBtn = (e.target as HTMLElement).closest(
@@ -3204,6 +3227,17 @@ export class PatternEditor {
     this.redraw();
   }
 
+  /**
+   * Show or hide the grainlines. The marks are in the document either way — this
+   * is only whether the sheet carries them.
+   */
+  private setGrainEnabled(on: boolean): void {
+    this.grainOn = on;
+    this.grainBtn.classList.toggle('active', on);
+    this.grainBtn.setAttribute('aria-pressed', String(on));
+    this.redraw();
+  }
+
   private bindZoomMenu(): void {
     this.zoomMenu.addEventListener('click', (e) => {
       const act = (e.target as HTMLElement).closest('button[data-zoom-act]')?.getAttribute(
@@ -5076,7 +5110,7 @@ export class PatternEditor {
       this.svg.appendChild(label);
     }
 
-    if (piece.grainline) {
+    if (piece.grainline && this.grainOn) {
       const g = document.createElementNS('http://www.w3.org/2000/svg', 'line');
       g.setAttribute('x1', String(piece.grainline.from.x));
       g.setAttribute('y1', String(piece.grainline.from.y));
