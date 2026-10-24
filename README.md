@@ -1,12 +1,12 @@
 ### INTRO
 
-![[screenshot01.png]]
+![The hyperPattern board: pattern containers, remesh previews, Transform 3D layouts and drape viewports wired together](./docs/screenshot01.png)
 
 HyperPattern aspires to be an accessible-ish, open-source tool for drafting and simulating draping for one of one garmets. So think making clothes for yourself, costumes, DIY, weird art projects, etc rather than producing a design spec for mass production (as you can already do pretty well with Fabra). I also like procedural art and design and want to support that direction of work by eventually bringing some of what I saw graphics software do in the 2010's for procedural 3d design in motion graphics (Cinema4d, Houdini) to garmet design. 
 
 I'm also interested in it having more of a viewer-oriented mode for embedding in online museum catalogs, etc (like the V&A) to better understand old clothing patterns and garmets, as well as easily copy pieces of them into your own work. I love seeing people recreate old clothes in MD/CLO.
 
-![[screenshot02.png]]
+![A circle-skirt panel drafted beside its drape, in the split pattern and drape view](./docs/screenshot02.png)
 
 The draping part of this needs a very fast, browser-compatible GPU cloth sim, which is pretty niche and usually not free. Fortunately, someone has written an open source one ([Velvet](https://github.com/vitalight/Velvet)) in C++/CUDA, and Deepseek was able to port it to WebGPU. There is also a CPU based engine as a fallback for driver issues but it is too slow for most tasks and will likely get dropped at some point.
 
