@@ -3,10 +3,11 @@ import type { MeshGeometry, PatternDocument, SimParams } from '../project/types'
 import type { ClothSimulator, DrapeEngineKind } from './ClothSimulator';
 import { CpuMassSpringEngine } from './engines/CpuMassSpringEngine';
 import { XpbdGpuEngine } from './engines/gpu/XpbdGpuEngine';
+import { DEFAULT_DRAPE_ENGINE } from '../project/createDefault';
 
 export function resolveEngineKind(params: SimParams, force?: DrapeEngineKind): DrapeEngineKind {
   if (force) return force;
-  return params.engine ?? 'cpu-mass-spring';
+  return params.engine ?? DEFAULT_DRAPE_ENGINE;
 }
 
 /**

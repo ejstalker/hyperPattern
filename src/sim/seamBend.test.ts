@@ -141,7 +141,9 @@ describe('seam fold resistance (solver)', () => {
     const { mesh, pattern } = sewnPair();
     return new PatternCloth(
       mesh,
-      { ...DEFAULT_SIM_PARAMS, gravity: 0, bendSpringScale },
+      // Explicit, not inherited: this test is about the fold constraint, and it
+      // must not change behaviour when the app's default step counts do.
+      { ...DEFAULT_SIM_PARAMS, gravity: 0, bendSpringScale, substeps: 24, constraintIterations: 6 },
       fakeDevice(),
       fakeAvatar(),
       pattern

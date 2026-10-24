@@ -1,5 +1,6 @@
 import type {
   BezierPoint,
+  DrapeEngineKind,
   MeshDocument,
   PatternDocument,
   PatternPiece,
@@ -39,11 +40,20 @@ export const MAX_SPEED_MAX = 30;
 /**
  * Where the control starts.
  *
- * A garment hem crossing its own length under the default gravity is going about
- * 8–12 u/s, so the ceiling has to sit above that or every drape is retarded
- * rather than merely prevented from exploding.
+ * Deliberately low. The clamp is the one knob that turns a violent substep into
+ * a calm one, and a settled drape that is free to reach 8–12 u/s keeps ringing
+ * long after it should be still. Two keeps a hem coming down while capping the
+ * speeds that read as crawl; raise it when a drape feels sluggish.
  */
-export const DEFAULT_MAX_SPEED = 12;
+export const DEFAULT_MAX_SPEED = 2;
+
+/**
+ * The backend a new drape starts on.
+ *
+ * GPU unless the driver cannot run it — the CPU mass-spring engine is the
+ * fallback for driver trouble, and is too slow for a garment of any size.
+ */
+export const DEFAULT_DRAPE_ENGINE: DrapeEngineKind = 'gpu-xpbd';
 
 /** Bounds of the Gravity control, in world units per second squared (10 = 1 m/s²). */
 export const GRAVITY_MIN = 0;
@@ -107,10 +117,13 @@ export const DEFAULT_SIM_PARAMS: SimParams = {
   wind: [0, 0, 0],
   fluidDensity: 1.225,
   dragCoeff: 1.0,
-  engine: 'cpu-mass-spring',
-  /** Prefer more CPU substeps for fidelity (GPU inspector can lower). */
-  substeps: 24,
-  constraintIterations: 6,
+  engine: DEFAULT_DRAPE_ENGINE,
+  /**
+   * XPBD steps and iterations per frame. The CPU engine wants far more of both
+   * (24 / 6) to hold a drape together, which is why it is only the fallback.
+   */
+  substeps: 8,
+  constraintIterations: 4,
   stretchCompliance: 0,
   bendCompliance: DEFAULT_BEND_COMPLIANCE,
   bendSpringScale: DEFAULT_BEND_SPRING_SCALE,

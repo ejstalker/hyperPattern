@@ -10,6 +10,7 @@ import {
   DEFAULT_MESH_FRAME_WIDTH,
   DEFAULT_MESH_FRAME_HEIGHT,
   DEFAULT_MAX_SPEED,
+  DEFAULT_DRAPE_ENGINE,
   DEFAULT_BEND_SPRING_SCALE,
   GRAVITY_MIN,
   GRAVITY_MAX,
@@ -6277,7 +6278,7 @@ export class StudioApp {
       const sim = this.project.sims.find((s) => s.id === node.simId)!;
       const p = sim.params;
       const mesh = this.meshForSim(sim.id);
-      const engine = p.engine ?? 'cpu-mass-spring';
+      const engine = p.engine ?? DEFAULT_DRAPE_ENGINE;
       const isGpu = engine === 'gpu-xpbd';
       const tip = (name: string, text: string, value: string, valueId: string) =>
         this.paramTip(name, text, value, valueId);

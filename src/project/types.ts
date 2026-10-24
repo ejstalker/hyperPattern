@@ -336,7 +336,7 @@ export type SimParams = {
   wind: [number, number, number];
   fluidDensity: number;
   dragCoeff: number;
-  /** Drape backend; defaults to cpu-mass-spring when omitted. */
+  /** Drape backend; defaults to `DEFAULT_DRAPE_ENGINE` (GPU) when omitted. */
   engine?: DrapeEngineKind;
   /**
    * Integration substeps per frame (CPU mass-spring + GPU XPBD).
@@ -386,7 +386,7 @@ export type SimParams = {
   /**
    * Clamp particle speed (world units/s) after each CPU substep / GPU finalize.
    * Bounds of the control are `MAX_SPEED_MIN`–`MAX_SPEED_MAX` (0.5–30) with a
-   * default of `DEFAULT_MAX_SPEED` (12) in `createDefault`.
+   * default of `DEFAULT_MAX_SPEED` (2) in `createDefault`.
    */
   maxSpeed?: number;
 };
