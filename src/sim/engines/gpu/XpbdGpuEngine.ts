@@ -33,6 +33,8 @@ import { ghostInverseMass } from '../../ghostMass';
 import { DEFAULT_MAX_SPEED } from '../../../project/createDefault';
 import { perSubstepRetain } from '../../velocityDamping';
 import { relaxContactPush } from '../../contactRelax';
+import { stitchOverlayPairs } from '../../seamOverlay';
+import { seamBandMask, seamVelocityRetain } from '../../seamDamping';
 
 const DELTA_SCALE = 1 << 20;
 
@@ -231,6 +233,12 @@ export class XpbdGpuEngine implements ClothSimulator {
   private seamBendLambdaBuf!: GPUBuffer;
   private seamBendSlackBuf!: GPUBuffer;
   private seamBendColorOffsets: Uint32Array = new Uint32Array([0]);
+  /**
+   * Particles within a couple of edges of a stitch — the seam allowance, where
+   * the stitch, the contact and the bend cannot all be satisfied at once. Their
+   * velocity is damped every frame (see `seamDamping`).
+   */
+  private seamBand: Uint8Array | null = null;
   /** Pairwise sew constraints: indices (i,j), target rest, initial distance. */
   private seamIdxBuf!: GPUBuffer;
   private seamRestBuf!: GPUBuffer;
@@ -614,6 +622,13 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.sewnBuf = this.createBuf(packed.byteLength, usage, 'xpbd-sewn');
       this.writeBuf(this.sewnBuf, packed);
     }
+
+    this.seamBand = seamBandMask(
+      n,
+      this.topo.oneRingOffsets,
+      this.topo.oneRingNeighbors,
+      this.seamPairs
+    );
   }
 
   /** Upload the packed (inverse mass, edge length) buffer used by collision. */
@@ -1249,6 +1264,9 @@ export class XpbdGpuEngine implements ClothSimulator {
   /** Same contact model as CPU PatternCloth — stable on SDF / triangle avatar. */
   private applyCpuCollision(): void {
     const edge = this.topo.avgEdgeLength;
+    // One frame of seam viscosity, sized by the frame it is being applied over.
+    const bandRetain = seamVelocityRetain(this.lastSubstepSeconds * Math.max(1, this.substeps));
+    const band = this.seamBand;
     for (let i = 0; i < this.nParticles; i++) {
       if (this.invMasses[i]! <= 0) continue;
       const proxy = this.collideProxies[i]!;
@@ -1296,6 +1314,11 @@ export class XpbdGpuEngine implements ClothSimulator {
         vel[0]! *= s;
         vel[1]! *= s;
         vel[2]! *= s;
+      }
+      if (band !== null && band[i] && bandRetain < 1) {
+        vel[0]! *= bandRetain;
+        vel[1]! *= bandRetain;
+        vel[2]! *= bandRetain;
       }
       this.cpuPos[i * 3] = px;
       this.cpuPos[i * 3 + 1] = py;
@@ -1373,17 +1396,31 @@ export class XpbdGpuEngine implements ClothSimulator {
     return this.colorBuffer;
   }
 
+  /**
+   * The stitch overlay, for the stitches that are still live.
+   *
+   * A ghosted piece is out of the simulation: it has no mass, no constraints and
+   * no claim on anything it was sewn to. Drawing its stitches would say the
+   * opposite — that the seam is still holding it — so its pairs drop out of the
+   * overlay entirely, the same way the CPU engine drops them from its seam
+   * springs.
+   */
+  private seamLinePairs(): Array<[number, number]> {
+    return stitchOverlayPairs(this.seamPairs, this.vertexPieceIds, this.ghostedPieceIds);
+  }
+
   private rebuildSeamLines(): void {
     this.seamLinePosBuf?.destroy();
     this.seamLineNrmBuf?.destroy();
     this.seamLinePosBuf = null;
     this.seamLineNrmBuf = null;
     this.seamLineVertexCount = 0;
-    if (this.seamPairs.length === 0) return;
-    const pos = new Float32Array(this.seamPairs.length * 2 * 3);
-    const nrm = new Float32Array(this.seamPairs.length * 2 * 3);
-    for (let i = 0; i < this.seamPairs.length; i++) {
-      const [a, b] = this.seamPairs[i];
+    const pairs = this.seamLinePairs();
+    if (pairs.length === 0) return;
+    const pos = new Float32Array(pairs.length * 2 * 3);
+    const nrm = new Float32Array(pairs.length * 2 * 3);
+    for (let i = 0; i < pairs.length; i++) {
+      const [a, b] = pairs[i];
       const o = i * 6;
       pos[o] = this.cpuPos[a * 3];
       pos[o + 1] = this.cpuPos[a * 3 + 1];
@@ -1394,7 +1431,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       nrm[o + 1] = 1;
       nrm[o + 4] = 1;
     }
-    this.seamLineVertexCount = this.seamPairs.length * 2;
+    this.seamLineVertexCount = pairs.length * 2;
     this.seamLinePosBuf = this.device.createBuffer({
       size: pos.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -1797,6 +1834,9 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.zeroPieceVelocity(pieceId);
     this.applyFrozenMasses();
     this.simStateDirty = true;
+    // A paused drape gets no readback, so the overlay has to be rebuilt here or
+    // the ghosted piece's stitches would stay on screen until it next runs.
+    this.rebuildSeamLines();
   }
 
   isPieceGhosted(pieceId: string): boolean {
@@ -1842,6 +1882,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     }
     this.applyFrozenMasses();
     this.simStateDirty = true;
+    this.rebuildSeamLines();
   }
 
   getFrozenPieceIds(): string[] {

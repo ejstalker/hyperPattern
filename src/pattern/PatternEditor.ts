@@ -9993,7 +9993,10 @@ export class PatternEditor {
   }
 
   private drawSeams(): void {
-    if (this.seamConnectorsOn) {
+    // The sew tool exists to answer "what is already stitched to what?", so the
+    // links between sewn edges come on with it; the view toggle is for every
+    // other tool, where they are only worth seeing on request.
+    if (this.seamConnectorsOn || this.tool === 'sew') {
       drawMeshSeamConnectors(this.svg, this.pattern, {
         className: 'pattern-seam-connector',
         strokeWidth: this.px(1.2),
