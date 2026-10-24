@@ -30,13 +30,30 @@ export function uid(prefix = 'id'): string {
  * The clamp does real work at both ends: it is what stops a bad step throwing
  * the cloth across the room, and — because a closed seam may only move a pair
  * as far as the substep's travel budget — what limits how far one substep can
- * take a stitch. Below about 0.5 the cloth crawls; above 10 a slam-through is
- * back on the table.
+ * take a stitch. Below about 0.5 the cloth crawls; the old ceiling of 10 sat
+ * below the speed a falling panel actually reaches (a 30 cm fall at the default
+ * gravity passes 10 u/s), so the clamp was doing the fabric's falling for it.
  */
 export const MAX_SPEED_MIN = 0.5;
-export const MAX_SPEED_MAX = 10;
-/** Where the control starts: enough travel for a drape, no room for a rocket. */
-export const DEFAULT_MAX_SPEED = 4;
+export const MAX_SPEED_MAX = 30;
+/**
+ * Where the control starts.
+ *
+ * A garment hem crossing its own length under the default gravity is going about
+ * 8–12 u/s, so the ceiling has to sit above that or every drape is retarded
+ * rather than merely prevented from exploding.
+ */
+export const DEFAULT_MAX_SPEED = 12;
+
+/** Bounds of the Gravity control, in world units per second squared (10 = 1 m/s²). */
+export const GRAVITY_MIN = 0;
+export const GRAVITY_MAX = 30;
+
+/** Bring a stored gravity inside the control's range. */
+export function clampGravity(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_GRAVITY;
+  return Math.min(GRAVITY_MAX, Math.max(GRAVITY_MIN, value));
+}
 
 /**
  * Bring a stored `maxSpeed` inside the control's range.
@@ -50,6 +67,32 @@ export function clampMaxSpeed(value: number | undefined): number {
   return Math.min(MAX_SPEED_MAX, Math.max(MAX_SPEED_MIN, value));
 }
 
+/**
+ * Where gravity starts, in world units per second squared.
+ *
+ * One world unit is 10 cm (`CM_TO_WORLD`), so this is 0.4 m/s² — light, but it
+ * is what the model can carry: nothing pins the garment to the avatar except
+ * contact friction, and past about 20 u/s² a sewn dress falls off the body
+ * instead of hanging on it. At 0.8 (the old default, 0.08 m/s²) the fabric was
+ * a hundred times too light: bending resistance held the panels in their drafted
+ * shape and the drape never fell, which read as stiff shirting.
+ */
+export const DEFAULT_GRAVITY = 4;
+
+/**
+ * Bending is a *regulariser*, not a fabric property.
+ *
+ * Both engines bend the sheet with a distance constraint across each fold, and
+ * at the old default (20 % of the stretch spring) that constraint pushed with
+ * roughly a thousand times the weight of a particle — the fabric behaved like
+ * card: panels stayed flat, gathers ballooned, hems flared instead of falling.
+ * Real shirting bends at almost no cost against its own weight, so the default
+ * is now soft enough to let folds form and only stops the mesh degenerating.
+ */
+export const DEFAULT_BEND_SPRING_SCALE = 0.04;
+/** XPBD compliance for the same bending (higher = floppier). */
+export const DEFAULT_BEND_COMPLIANCE = 0.02;
+
 /** `4`, not `4.0` — but the half-unit steps still read as `0.5`. */
 export function formatMaxSpeed(value: number | undefined): string {
   return String(Number(clampMaxSpeed(value).toFixed(2)));
@@ -60,7 +103,7 @@ export const DEFAULT_SIM_PARAMS: SimParams = {
   mass: 100,
   springConst: 1000,
   dampingConst: 3.5,
-  gravity: 0.8,
+  gravity: DEFAULT_GRAVITY,
   wind: [0, 0, 0],
   fluidDensity: 1.225,
   dragCoeff: 1.0,
@@ -69,8 +112,8 @@ export const DEFAULT_SIM_PARAMS: SimParams = {
   substeps: 24,
   constraintIterations: 6,
   stretchCompliance: 0,
-  bendCompliance: 1e-3,
-  bendSpringScale: 0.2,
+  bendCompliance: DEFAULT_BEND_COMPLIANCE,
+  bendSpringScale: DEFAULT_BEND_SPRING_SCALE,
   maxStretch: 1.12,
   velocityDamping: 0.998,
   longRangeStretchiness: 1.2,

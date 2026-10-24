@@ -10,8 +10,12 @@ import {
   DEFAULT_MESH_FRAME_WIDTH,
   DEFAULT_MESH_FRAME_HEIGHT,
   DEFAULT_MAX_SPEED,
+  DEFAULT_BEND_SPRING_SCALE,
+  GRAVITY_MIN,
+  GRAVITY_MAX,
   MAX_SPEED_MIN,
   MAX_SPEED_MAX,
+  clampGravity,
   clampMaxSpeed,
   formatMaxSpeed,
 } from '../project/createDefault';
@@ -22,6 +26,7 @@ import {
   setDefaultSimCamera,
   syncDefaultCameraFromDrapeA,
 } from '../sim/cameraDefaults';
+import { upgradeLegacyFabrics } from '../sim/clothDefaults';
 import type {
   BlockInstance,
   CanvasNode,
@@ -612,6 +617,10 @@ export class StudioApp {
       if (sim.name === 'Drape A') continue;
       migrateLegacySimCamera(sim.camera, defaults);
     }
+    // Drapes saved before the fabric was re-calibrated hold their drafted shape
+    // instead of falling. Bring them onto the current defaults, once — and write
+    // it back, so the library and the viewport agree from the first frame.
+    if (upgradeLegacyFabrics(project)) this.markDirty();
     return ensureVisibleConnections(project);
   }
 
@@ -6273,7 +6282,7 @@ export class StudioApp {
       const tip = (name: string, text: string, value: string, valueId: string) =>
         this.paramTip(name, text, value, valueId);
       const stretchPct = (((p.maxStretch ?? 1.12) * 100) - 100).toFixed(0);
-      const bendPct = (((p.bendSpringScale ?? 0.2) * 100)).toFixed(0);
+      const bendPct = ((p.bendSpringScale ?? DEFAULT_BEND_SPRING_SCALE) * 100).toFixed(0);
       this.inspector.innerHTML = `
         <h3>${sim.name}</h3>
         <label>Name <input id="simName" value="${sim.name}" /></label>
@@ -6296,12 +6305,12 @@ export class StudioApp {
               <input id="pMass" type="range" min="10" max="300" value="${p.mass}" /></label>
             <label>${tip('Max stretch', 'Hard cap on how far fabric edges may elongate (Provot). Higher % = stretchier knit; lower = stable woven. Recommended: 5–15% (default 12%). Set near 0% only if you need almost inextensible cloth.', `${stretchPct}%`, 'vMaxStretch')}
               <input id="pMaxStretch" type="range" min="1" max="1.5" step="0.01" value="${p.maxStretch ?? 1.12}" /></label>
-            <label>${tip('Bend springs', 'Resistance to folding, as a fraction of Spring. Low = soft drapey folds; high locks panels flat and fights seams. Recommended: 10–40% (default 20%). Avoid 100% for garments.', `${bendPct}%`, 'vBendScale')}
-              <input id="pBendScale" type="range" min="0" max="1" step="0.05" value="${p.bendSpringScale ?? 0.2}" /></label>
+            <label>${tip('Bend springs', 'Resistance to folding, as a fraction of Spring. Real fabric folds almost for free, so keep this low: any real value locks panels flat, balloons gathers and flares hems instead of letting them fall. Recommended: 0–10% (default 4%).', `${bendPct}%`, 'vBendScale')}
+              <input id="pBendScale" type="range" min="0" max="1" step="0.01" value="${p.bendSpringScale ?? DEFAULT_BEND_SPRING_SCALE}" /></label>
             <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Range 0–20 (default 0.45): up to 2 the contact only slows a slide, above that it starts holding the cloth where it touches, fully static by about 8.', (p.contactFriction ?? 0.45).toFixed(2), 'vFriction')}
               <input id="pFriction" type="range" min="0" max="20" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
-            <label>${tip('Gravity', 'Downward acceleration scale for drape. Higher hangs heavier; lower floats. Recommended: 0.6–1.2 (default 0.8).', p.gravity.toFixed(2), 'vGrav')}
-              <input id="pGrav" type="range" min="0" max="5" step="0.05" value="${p.gravity}" /></label>
+            <label>${tip('Gravity', 'Downward acceleration, in world units per second squared (10 = 1 m/s²). Higher hangs heavier and falls faster; lower floats. Recommended: 3–8 (default 4). Past about 20 a garment with nothing but contact grip holding it starts to slide off the avatar.', p.gravity.toFixed(2), 'vGrav')}
+              <input id="pGrav" type="range" min="${GRAVITY_MIN}" max="${GRAVITY_MAX}" step="0.05" value="${clampGravity(p.gravity)}" /></label>
           </div>
           <div class="inspector-section">
             <h4 class="inspector-section-title">Simulation</h4>
@@ -6310,7 +6319,7 @@ export class StudioApp {
               <input id="pCpuSubsteps" type="range" min="4" max="64" value="${p.substeps ?? 24}" /></label>
             <label>${tip('Strain-limit iters', 'Provot stretch-limit passes per substep. Cuts rubber-band stretch after springs. Recommended: 4–10 (default 6). 0 disables limiting (uses Max stretch only via springs).', String(p.constraintIterations ?? 6), 'vStrainIters')}
               <input id="pStrainIters" type="range" min="0" max="20" value="${p.constraintIterations ?? 6}" /></label>
-            <label>${tip('Velocity retain', 'Multiply velocity each substep (1 = none). Slightly below 1 damps high-frequency ringing without heavy Damping. Recommended: 0.995–0.999 (default 0.998).', (p.velocityDamping ?? 0.998).toFixed(3), 'vVelDamp')}
+            <label>${tip('Velocity retain', 'Fraction of speed kept per frame (1 = none). Slightly below 1 damps high-frequency ringing without heavy Damping; it is spread across the substeps, so the feel does not change with Substeps. Recommended: 0.995–0.999 (default 0.998).', (p.velocityDamping ?? 0.998).toFixed(3), 'vVelDamp')}
               <input id="pVelDamp" type="range" min="0.95" max="1" step="0.001" value="${p.velocityDamping ?? 0.998}" /></label>
             <label>${tip('Max speed', `Clamp particle speed (world units/s) to stop explosions from bad steps. Range ${MAX_SPEED_MIN}–${MAX_SPEED_MAX} (default ${DEFAULT_MAX_SPEED}). Lower if the cloth still rockets; raise if motion feels capped.`, formatMaxSpeed(p.maxSpeed), 'vMaxSpeed')}
               <input id="pMaxSpeed" type="range" min="${MAX_SPEED_MIN}" max="${MAX_SPEED_MAX}" step="0.5" value="${clampMaxSpeed(p.maxSpeed)}" /></label>
@@ -6328,8 +6337,8 @@ export class StudioApp {
               <input id="pFrictionGpu" type="range" min="0" max="20" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
             <label>${tip('LRA stretchiness', 'Long-range attachment / sew slack multiplier. Higher = looser seams and attachments; lower pulls tighter. Recommended: 1.1–1.4 (default 1.2).', (p.longRangeStretchiness ?? 1.2).toFixed(2), 'vLra')}
               <input id="pLra" type="range" min="1" max="2" step="0.05" value="${p.longRangeStretchiness ?? 1.2}" /></label>
-            <label>${tip('Gravity', 'Downward acceleration scale for drape. Higher hangs heavier; lower floats. Recommended: 0.6–1.2 (default 0.8).', p.gravity.toFixed(2), 'vGravGpu')}
-              <input id="pGravGpu" type="range" min="0" max="5" step="0.05" value="${p.gravity}" /></label>
+            <label>${tip('Gravity', 'Downward acceleration, in world units per second squared (10 = 1 m/s²). Higher hangs heavier and falls faster; lower floats. Recommended: 3–8 (default 4). Past about 20 a garment with nothing but contact grip holding it starts to slide off the avatar.', p.gravity.toFixed(2), 'vGravGpu')}
+              <input id="pGravGpu" type="range" min="${GRAVITY_MIN}" max="${GRAVITY_MAX}" step="0.05" value="${clampGravity(p.gravity)}" /></label>
           </div>
           <div class="inspector-section">
             <h4 class="inspector-section-title">Simulation</h4>
@@ -6358,7 +6367,7 @@ export class StudioApp {
         setValue('vMass', String(Math.round(p.mass)));
         setValue('vMassGpu', String(Math.round(p.mass)));
         setValue('vMaxStretch', `${(((p.maxStretch ?? 1.12) * 100) - 100).toFixed(0)}%`);
-        setValue('vBendScale', `${(((p.bendSpringScale ?? 0.2) * 100)).toFixed(0)}%`);
+        setValue('vBendScale', `${(((p.bendSpringScale ?? DEFAULT_BEND_SPRING_SCALE) * 100)).toFixed(0)}%`);
         setValue('vFriction', (p.contactFriction ?? 0.45).toFixed(2));
         setValue('vFrictionGpu', (p.contactFriction ?? 0.45).toFixed(2));
         setValue('vGrav', p.gravity.toFixed(2));

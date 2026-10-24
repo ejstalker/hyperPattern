@@ -31,8 +31,11 @@ import hashBuildWgsl from './shaders/hash_build.wgsl?raw';
 import { FROZEN_PIECE_OPACITY, GHOSTED_PIECE_OPACITY } from '../../pieceOpacity';
 import { ghostInverseMass } from '../../ghostMass';
 import { DEFAULT_MAX_SPEED } from '../../../project/createDefault';
+import { perSubstepRetain } from '../../velocityDamping';
+import { relaxContactPush } from '../../contactRelax';
 
 const DELTA_SCALE = 1 << 20;
+
 
 /** How far apart cloth–cloth contact holds two points, in mesh edges. */
 const DEFAULT_CONTACT_EDGES = 0.5;
@@ -218,6 +221,16 @@ export class XpbdGpuEngine implements ClothSimulator {
   private bendIdxBuf!: GPUBuffer;
   private bendRestBuf!: GPUBuffer;
   private bendLambdaBuf!: GPUBuffer;
+  /**
+   * Fold resistance across each stitch: the interior vertices of the two
+   * triangles that meet along the seam. Solved with the bend kernel, and held
+   * off until the seam has closed.
+   */
+  private seamBendIdxBuf!: GPUBuffer;
+  private seamBendRestBuf!: GPUBuffer;
+  private seamBendLambdaBuf!: GPUBuffer;
+  private seamBendSlackBuf!: GPUBuffer;
+  private seamBendColorOffsets: Uint32Array = new Uint32Array([0]);
   /** Pairwise sew constraints: indices (i,j), target rest, initial distance. */
   private seamIdxBuf!: GPUBuffer;
   private seamRestBuf!: GPUBuffer;
@@ -256,6 +269,7 @@ export class XpbdGpuEngine implements ClothSimulator {
 
   private nStretch = 0;
   private nBend = 0;
+  private nSeamBend = 0;
   private nAttach = 0;
   private nParticles = 0;
   private nTriangles = 0;
@@ -451,6 +465,41 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.bendLambdaBuf = this.createBuf(Math.max(this.nBend, 1) * 4, usage, 'xpbd-bend-lambda');
     this.writeBuf(this.bendIdxBuf, bendIdx);
     this.writeBuf(this.bendRestBuf, bendRest);
+
+    // Seam bends: the triangle interiors either side of the stitch, solved by
+    // the same kernel. Their rest comes from the pattern — the two triangle
+    // heights, which is how far apart those vertices sit with the seam flat —
+    // not from the layout, where the panels are still apart.
+    const seamBends = this.topo.seamBend ?? [];
+    this.nSeamBend = seamBends.length;
+    const seamBendColoring = colorConstraints(
+      seamBends.map((b) => [b.i, b.j]),
+      this.nParticles
+    );
+    this.seamBendColorOffsets = seamBendColoring.offsets;
+    const seamBendIdx = new Uint32Array(Math.max(this.nSeamBend, 1) * 2);
+    const seamBendRest = new Float32Array(Math.max(this.nSeamBend, 1));
+    for (let slot = 0; slot < this.nSeamBend; slot++) {
+      const b = seamBends[seamBendColoring.idx[slot]!]!;
+      seamBendIdx[slot * 2] = b.i;
+      seamBendIdx[slot * 2 + 1] = b.j;
+      seamBendRest[slot] = b.rest;
+    }
+    this.seamBendIdxBuf = this.createBuf(seamBendIdx.byteLength, usage, 'xpbd-seam-bend-idx');
+    this.seamBendRestBuf = this.createBuf(seamBendRest.byteLength, usage, 'xpbd-seam-bend-rest');
+    this.seamBendLambdaBuf = this.createBuf(
+      Math.max(this.nSeamBend, 1) * 4,
+      usage,
+      'xpbd-seam-bend-lambda'
+    );
+    this.seamBendSlackBuf = this.createBuf(
+      Math.max(this.nSeamBend, 1) * 4,
+      usage,
+      'xpbd-seam-bend-slack'
+    );
+    this.writeBuf(this.seamBendIdxBuf, seamBendIdx);
+    this.writeBuf(this.seamBendRestBuf, seamBendRest);
+    this.writeBuf(this.seamBendSlackBuf, new Float32Array(Math.max(this.nSeamBend, 1)).fill(1));
 
     this.writeMassEdgeBuffer();
 
@@ -708,6 +757,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       for (let it = 0; it < this.iterations; it++) {
         this.dispatchStretch(pass, invH2);
         this.dispatchBend(pass, invH2);
+        this.dispatchSeamBend(pass, invH2, seamProgress);
         this.dispatchAttach(pass, seamProgress, h);
         // Extra stretch pass resists seam crumpling / self-intersection.
         if (wrapping) this.dispatchStretch(pass, invH2);
@@ -732,10 +782,7 @@ export class XpbdGpuEngine implements ClothSimulator {
         const f = new Float32Array(uData);
         const u32 = new Uint32Array(uData);
         f[0] = 1 / h;
-        f[1] = Math.pow(
-          Math.min(1, Math.max(0.9, this.velocityDamping)),
-          1 / Math.max(1, this.substeps)
-        );
+        f[1] = perSubstepRetain(this.velocityDamping, this.substeps);
         f[2] = this.maxSpeed;
         u32[3] = n;
         const u = this.uniform('finalize', uData);
@@ -799,6 +846,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     pass.setPipeline(this.pipelines.resetLambdas);
     zero(this.nStretch, this.stretchLambdaBuf, 'reset-stretch');
     zero(this.nBend, this.bendLambdaBuf, 'reset-bend');
+    zero(this.nSeamBend, this.seamBendLambdaBuf, 'reset-seam-bend');
   }
 
   /** Shared colored XPBD distance solver, used for both stretch and bend. */
@@ -875,6 +923,34 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.bendLambdaBuf,
       this.bendSlackBuf,
       this.bendCompliance,
+      invH2
+    );
+  }
+
+  /**
+   * Fold resistance across the stitches.
+   *
+   * Off while the seam is still closing — the panels have not met yet, so there
+   * is no fold to resist, and pulling those two triangles to their sewn spacing
+   * would fight the sew itself — then the same compliance as ordinary bending,
+   * so the seam bends exactly as the fabric either side of it does.
+   */
+  private dispatchSeamBend(
+    pass: GPUComputePassEncoder,
+    invH2: number,
+    seamProgress: number
+  ): void {
+    if (this.nSeamBend === 0) return;
+    const closed = seamProgress >= 0.999;
+    this.dispatchDistancePass(
+      pass,
+      'seam-bend',
+      this.seamBendColorOffsets,
+      this.seamBendIdxBuf,
+      this.seamBendRestBuf,
+      this.seamBendLambdaBuf,
+      this.seamBendSlackBuf,
+      closed ? this.bendCompliance : 1e6,
       invH2
     );
   }
@@ -1205,6 +1281,14 @@ export class XpbdGpuEngine implements ClothSimulator {
         vel[1]! *= 0.92;
         vel[2]! *= 0.92;
       }
+      // The push is taken a share at a time — see `relaxContactPush`. Velocities
+      // stay the contact's own (the inward component is already gone, the
+      // tangential slip damped); only the positional jump is eased, so this
+      // frame-rate pass cannot fight the substep solve.
+      const moved = movedSq > 1e-10;
+      const px = relaxContactPush(x0, pos[0]!, moved);
+      const py = relaxContactPush(y0, pos[1]!, moved);
+      const pz = relaxContactPush(z0, pos[2]!, moved);
       const speedCap = this.maxSpeed;
       const speed = Math.hypot(vel[0]!, vel[1]!, vel[2]!);
       if (speed > speedCap && speed > 1e-8) {
@@ -1213,9 +1297,9 @@ export class XpbdGpuEngine implements ClothSimulator {
         vel[1]! *= s;
         vel[2]! *= s;
       }
-      this.cpuPos[i * 3] = pos[0]!;
-      this.cpuPos[i * 3 + 1] = pos[1]!;
-      this.cpuPos[i * 3 + 2] = pos[2]!;
+      this.cpuPos[i * 3] = px;
+      this.cpuPos[i * 3 + 1] = py;
+      this.cpuPos[i * 3 + 2] = pz;
       this.cpuVel[i * 3] = vel[0]!;
       this.cpuVel[i * 3 + 1] = vel[1]!;
       this.cpuVel[i * 3 + 2] = vel[2]!;

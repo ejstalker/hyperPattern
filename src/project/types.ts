@@ -331,6 +331,7 @@ export type SimParams = {
   mass: number;
   springConst: number;
   dampingConst: number;
+  /** Downward acceleration in world units/s² (one world unit = 10 cm, so 10 = 1 m/s²). */
   gravity: number;
   wind: [number, number, number];
   fluidDensity: number;
@@ -384,8 +385,8 @@ export type SimParams = {
   interleavedHash?: number;
   /**
    * Clamp particle speed (world units/s) after each CPU substep / GPU finalize.
-   * Bounds of the control are `MAX_SPEED_MIN`–`MAX_SPEED_MAX` (0.5–10) with a
-   * default of `DEFAULT_MAX_SPEED` (4) in `createDefault`.
+   * Bounds of the control are `MAX_SPEED_MIN`–`MAX_SPEED_MAX` (0.5–30) with a
+   * default of `DEFAULT_MAX_SPEED` (12) in `createDefault`.
    */
   maxSpeed?: number;
 };

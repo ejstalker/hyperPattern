@@ -9,9 +9,10 @@ import { identity } from '../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../project/types';
 import { CM_TO_WORLD } from './units';
 import { DEFAULT_MAX_SPEED } from '../project/createDefault';
-import { buildClothTopology, FALLBACK_PIECE_ID } from './meshTopology';
+import { buildClothTopology, FALLBACK_PIECE_ID, type SeamBendConstraint } from './meshTopology';
 import { buildWireframeEdgeIndices } from './wireframeEdges';
 import { fillStrainColors, type StrainEdge } from './strainMap';
+import { perSubstepRetain } from './velocityDamping';
 
 /** @deprecated Import from `./units` instead. */
 export { CM_TO_WORLD };
@@ -82,6 +83,9 @@ export class PatternCloth {
    * its seams back.
    */
   private seamSpecs: Array<{ a: number; b: number; rest: { initial: number; target: number } }> = [];
+  /** Stitch-quad diagonals: fold resistance across a seam (see meshTopology). */
+  private seamBendSpecs: SeamBendConstraint[] = [];
+  private seamBendSprings: SpringDamper[] = [];
   private seamRampElapsed = 0;
   private seamSpringTarget = 0;
   private triangles: Triangle[] = [];
@@ -248,6 +252,7 @@ export class PatternCloth {
       b: sc.j,
       rest: { initial: sc.initialDist, target: sc.rest },
     }));
+    this.seamBendSpecs = topo.seamBend.map((b) => ({ ...b }));
     this.seamSprings = [];
     this.seamRestLengths = [];
     this.seamPairIndices = [];
@@ -697,6 +702,28 @@ export class PatternCloth {
       pairs.push([a, b]);
     }
     this.seamSprings = springs;
+
+    // Fold resistance across the stitch. Stiffness is left at zero here —
+    // `setSeamProgress` turns it on once the seam has actually closed.
+    const seamBends: SpringDamper[] = [];
+    for (const spec of this.seamBendSpecs) {
+      if (
+        this.ghostedPieceIds.has(this.vertexPieceIds[spec.i]) ||
+        this.ghostedPieceIds.has(this.vertexPieceIds[spec.j])
+      ) {
+        continue;
+      }
+      seamBends.push(
+        new SpringDamper(
+          this.particles[spec.i],
+          this.particles[spec.j],
+          0,
+          this.dampingConst * 0.5,
+          spec.rest
+        )
+      );
+    }
+    this.seamBendSprings = seamBends;
     this.seamRestLengths = rests;
     this.seamPairIndices = pairs;
     // The bond overlay is sized for the active pairs, so refresh it when the
@@ -860,7 +887,8 @@ export class PatternCloth {
 
     const steps = Math.max(1, this.numOfOversamples);
     const sub = dt / steps;
-    const velRetain = Math.min(1, Math.max(0.9, this.velocityDamping));
+    // Per *frame* rate, spread over the substeps — see `perSubstepRetain`.
+    const velRetain = perSubstepRetain(this.velocityDamping, steps);
     const strainOn = this.maxStretch > 1 && this.strainLimitIters > 0;
     for (let s = 0; s < steps; s++) {
       for (const p of this.particles) p.resetForce();
@@ -868,6 +896,7 @@ export class PatternCloth {
       if (this.bendSpringScale > 0) {
         for (const c of this.bendSprings) c.computeForce();
       }
+      for (const c of this.seamBendSprings) c.computeForce();
       for (const c of this.seamSprings) c.computeForce();
       for (const t of this.triangles) t.computeAerodynamicForce();
       for (const p of this.particles) p.resetNormal();
@@ -963,6 +992,10 @@ export class PatternCloth {
       c.setSpringConst(bendK);
       c.setDampingConst(this.dampingConst * 0.5);
     }
+    for (const c of this.seamBendSprings) {
+      c.setSpringConst(bendK);
+      c.setDampingConst(this.dampingConst * 0.5);
+    }
     for (const c of this.seamSprings) {
       c.setDampingConst(this.dampingConst * 1.5);
     }
@@ -989,6 +1022,14 @@ export class PatternCloth {
       spring.setSpringConst(stiffness);
       spring.setRestLength(rest.initial + (rest.target - rest.initial) * eased);
     }
+
+    // Fold resistance across the stitch comes on only once the seam has closed.
+    // While the panels are still travelling there is no seam yet, and a
+    // constraint holding the stitch quads to their sewn diagonals would fight
+    // the sew itself.
+    const bendK = this.springConst * Math.max(0, this.bendSpringScale);
+    const fold = Math.max(0, Math.min(1, (p - 0.7) / 0.3));
+    for (const spring of this.seamBendSprings) spring.setSpringConst(bendK * fold);
   }
 
   getModelMatrix(): mat4 {

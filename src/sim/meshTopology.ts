@@ -31,6 +31,23 @@ export type LraConstraint = {
 };
 
 /** Pairwise sew distance: |x_i − x_j| ≤ rest, ramped from initialDist. */
+/**
+ * Fold resistance across a stitch, as the two diagonals of a stitch quad.
+ *
+ * A seam held only by pairwise stitches is a free hinge: the panels either side
+ * of it can swing to a knife edge about the stitch line and keep going. Real
+ * cloth does not — the seam is where the fabric is doubled, and the two panels
+ * behave as one sheet across it. These are the same cross-fold distance
+ * constraints `buildBendConstraints` makes inside a panel, taken across the
+ * stitch: for two stitch rows joined by a mesh edge, the quad's two diagonals.
+ */
+export type SeamBendConstraint = {
+  i: number;
+  j: number;
+  /** Diagonal length with the seam lying flat (the shorter of the two rows). */
+  rest: number;
+};
+
 export type SeamDistanceConstraint = {
   i: number;
   j: number;
@@ -58,6 +75,8 @@ export type ClothTopology = {
   seamConstraints: SeamDistanceConstraint[];
   /** Seam particle pairs for overlay (a,b). */
   seamPairs: Array<[number, number]>;
+  /** Cross-seam fold resistance — see {@link SeamBendConstraint}. */
+  seamBend: SeamBendConstraint[];
   /** CSR one-ring: offsets[i]..offsets[i+1] → neighbors. */
   oneRingOffsets: Uint32Array;
   oneRingNeighbors: Uint32Array;
@@ -212,6 +231,88 @@ function windOutward(triangles: ArrayLike<number>): Uint32Array {
 /**
  * Shared mesh → particle/constraint topology for CPU and GPU engines.
  */
+/**
+ * Cross-seam fold constraints: the two triangles either side of the stitch.
+ *
+ * Inside a panel, bending is resisted by one distance constraint across each
+ * shared edge — the two opposite vertices of the adjacent triangles. Sewing
+ * makes two *boundary* triangles adjacent, so the same constraint has to cross
+ * the stitch: `x`, the interior vertex of the triangle on the seam edge
+ * `(a, b)` of one panel, against `y`, the interior vertex of the triangle on
+ * the stitched edge `(a', b')` of the other.
+ *
+ * The rest is `h(a,b) + h(a',b')` — the two triangle heights. Sewn flat, the
+ * second triangle is the mirror of the first across the stitch line, so the two
+ * interior vertices sit on opposite sides of that line at the same station
+ * along it, exactly `hA + hB` apart. Folding the panels about the stitch
+ * shortens `x–y` (a 90° fold takes it to about 70 %), so the constraint pulls
+ * the seam back flat, with the same compliance as ordinary bending.
+ *
+ * Note which pair this is *not*: the diagonals of the stitch quad (`a–b'`,
+ * `b–a'`) lie along the seam, so folding about the seam does not shorten them
+ * at all — they cannot feel a fold.
+ */
+export function buildSeamBendConstraints(
+  positions: Float32Array,
+  triangles: number[],
+  seamPairs: Array<[number, number]>
+): SeamBendConstraint[] {
+  if (seamPairs.length === 0) return [];
+
+  // Mesh edge → the vertex of the (single) triangle on it. Both rows of a seam
+  // are boundaries, so each edge here has exactly one.
+  const opposite = new Map<string, number>();
+  const edgeKey = (u: number, v: number) => (u < v ? `${u}_${v}` : `${v}_${u}`);
+  for (let t = 0; t + 2 < triangles.length; t += 3) {
+    const i0 = triangles[t]!;
+    const i1 = triangles[t + 1]!;
+    const i2 = triangles[t + 2]!;
+    opposite.set(edgeKey(i0, i1), i2);
+    opposite.set(edgeKey(i1, i2), i0);
+    opposite.set(edgeKey(i2, i0), i1);
+  }
+
+  /** Perpendicular distance from `p` to the line through edge (a, b). */
+  const height = (p: number, a: number, b: number): number => {
+    const abx = positions[b * 3] - positions[a * 3];
+    const aby = positions[b * 3 + 1] - positions[a * 3 + 1];
+    const abz = positions[b * 3 + 2] - positions[a * 3 + 2];
+    const apx = positions[p * 3] - positions[a * 3];
+    const apy = positions[p * 3 + 1] - positions[a * 3 + 1];
+    const apz = positions[p * 3 + 2] - positions[a * 3 + 2];
+    const cx = aby * apz - abz * apy;
+    const cy = abz * apx - abx * apz;
+    const cz = abx * apy - aby * apx;
+    const area2 = Math.hypot(cx, cy, cz);
+    const base = Math.hypot(abx, aby, abz);
+    return base > 1e-9 ? area2 / base : 0;
+  };
+
+  const out: SeamBendConstraint[] = [];
+  const seen = new Set<string>();
+  const add = (i: number, j: number, rest: number) => {
+    if (i === j || !(rest > 1e-6)) return;
+    const key = i < j ? `${i}_${j}` : `${j}_${i}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ i, j, rest });
+  };
+
+  // Consecutive stitch pairs walk along one seam, so their two rows are the
+  // edges of the adjacent triangles — the pair of triangles the fold happens
+  // between.
+  for (let k = 0; k + 1 < seamPairs.length; k++) {
+    const [a0, b0] = seamPairs[k]!;
+    const [a1, b1] = seamPairs[k + 1]!;
+    const x = opposite.get(edgeKey(a0, a1));
+    const y = opposite.get(edgeKey(b0, b1));
+    if (x === undefined || y === undefined) continue;
+    const rest = height(x, a0, a1) + height(y, b0, b1);
+    add(x, y, rest);
+  }
+  return out;
+}
+
 export function buildClothTopology(
   mesh: MeshGeometry,
   mass: number,
@@ -379,6 +480,8 @@ export function buildClothTopology(
     }
   }
 
+  const seamBend = buildSeamBendConstraints(positions, triangles, seamPairs);
+
   const { offsets, neighbors } = buildOneRing(n, edges);
 
   return {
@@ -395,6 +498,7 @@ export function buildClothTopology(
     lra,
     seamConstraints,
     seamPairs,
+    seamBend,
     oneRingOffsets: offsets,
     oneRingNeighbors: neighbors,
     avgEdgeLength,
