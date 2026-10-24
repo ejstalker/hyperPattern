@@ -30,13 +30,13 @@ Obviously, it could be easier and there are some hard limits on file storage, bu
 
 Hyperpattern isn't so opinionated about workflow, but it assumes something like:
 
-Gather references
-Do small studies (e.g. circle skirt? godets? princess seam or sloper block bodice?)
+- Gather references
+- Do small studies (e.g. circle skirt? godets? princess seam or sloper block bodice?)
 - Draw one piece in 2d -> drape in 3d
-Do larger full garmet studies
+- Do larger full garmet studies
 - Assemble all pattern pieces -> drape in 3d
-Project the pattern directly from the app on fabric to cut or export
-Cut a muslin for the parts where fit really matters
+- Project the pattern directly from the app (using a cheap projector) on fabric to cut or export
+- Cut a muslin for the parts where fit really matters
 
 It's trying to help you work quickly, intuitively, iteratively and accurately from inspiration to cuttable pattern or interesting sim/mesh. It looks and feels a lot like Figma so that the earlier parts of the process can happen more quickly, as they would in a real studio, where you have all kinds of little studies and drafts laying around.
 
@@ -50,4 +50,12 @@ Keep in mind the sim is not 100% accurate, although I think it's good enough to 
 The component system is very basic now but will be like an atomic design approach to creating what are called digital assets in Houdini, components in React, or their ancient ancestors: pattern blocks. Basically, a dart will be a component, a type of collar can be a component, and they get referenced into bodice block components or skirts or whatever, which live in your local component library and can be shared. Measurements are already set up as project variable sets indexed by "person" (you, your friend, s/m/l, 4/6/8/10 etc) and can get referenced in to these as you would expect.
 
 At some point, I hope to have time to build out a full modifier system for doing all the cool procedural design things but in a slightly more friendly way, like Mograph in Cinema4d or maybe even some of the SOP/VOPs in Houdini. Think noise displacement, voroni cuts etc, subdivision, iterative whatever, image maps, etc.. but in terms of your underlying pattern and measurements, not just in terms of a mesh. Haven't quite gotten there yet.
+
+### LICENSE
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
 
