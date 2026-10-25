@@ -29,6 +29,7 @@ import {
 } from '../sim/cameraDefaults';
 import { upgradeLegacyFabrics } from '../sim/clothDefaults';
 import type {
+  BezierPoint,
   BlockInstance,
   CanvasNode,
   ImageNode,
@@ -369,6 +370,10 @@ export class StudioApp {
    *  Backspace / Delete belong to the nodes rather than to a pattern editor
    *  sitting on the same board. */
   private boardSurfaceActive = true;
+  /** True while the last press landed on the page — the board's own background
+   *  drawing rather than a container's editor. It keeps the node selection in
+   *  reach of ⌫ without taking the key from a container's pattern. */
+  private pageSurfaceActive = false;
   /** Fixed-position tip host (escapes inspector overflow clipping). */
   private inspectorTipEl: HTMLDivElement | null = null;
   /** Avatar editor dialog, when open. */
@@ -906,13 +911,22 @@ export class StudioApp {
       (e) => {
         const target = e.target as HTMLElement | null;
         const wrap = document.getElementById('boardWrap');
-        this.boardSurfaceActive = !!(
-          target &&
-          wrap?.contains(target) &&
-          !target.closest(
-            'button, input, textarea, select, [contenteditable="true"], .pattern-editor, canvas'
-          )
-        );
+        if (
+          !target ||
+          !wrap?.contains(target) ||
+          target.closest('button, input, textarea, select, [contenteditable="true"], canvas')
+        ) {
+          this.boardSurfaceActive = false;
+          this.pageSurfaceActive = false;
+          return;
+        }
+        const editor = target.closest('.pattern-editor');
+        this.boardSurfaceActive = !editor;
+        // The page is the board's own background rather than a document of its
+        // own — a marquee dragged across it is how nodes are picked — so presses
+        // there still leave the node selection in reach of the keyboard. A
+        // container's editor is a document, and keeps its key for its pattern.
+        this.pageSurfaceActive = !!editor && editor === this.canvasEditor?.element();
       },
       true
     );
@@ -922,7 +936,7 @@ export class StudioApp {
     // The node menu owns Escape, and a delete underneath an open menu would
     // leave it pointing at a node that is gone.
     if (this.expandedNodeId || this.isStudioModalOpen() || this.nodeMenu) return;
-    if (!this.boardSurfaceActive) return;
+    if (!this.boardSurfaceActive && !this.pageSurfaceActive) return;
     const target = e.target as HTMLElement | null;
     if (
       target &&
@@ -934,13 +948,18 @@ export class StudioApp {
       return;
     }
     if (e.key === 'Backspace' || e.key === 'Delete') {
+      // A press on the page counts too: the inspector promises that ⌫ deletes the
+      // selected nodes, and a marquee across the page is how that selection is
+      // made. The page's own work is the fallback, the way it is for copy — a
+      // rectangle dragged across the canvas takes the frames it crossed *and* the
+      // work, and ⌫ acts on the frames.
       if (this.selectedNodeIds.length === 0) return;
       e.preventDefault();
       e.stopImmediatePropagation();
       this.deleteSelectedNodes();
       return;
     }
-    if (e.key === 'Escape' && this.selectedNodeIds.length > 0) {
+    if (e.key === 'Escape' && this.boardSurfaceActive && this.selectedNodeIds.length > 0) {
       e.preventDefault();
       e.stopImmediatePropagation();
       this.clearNodeSelection();
@@ -7496,22 +7515,28 @@ export class StudioApp {
       .map((piece) => {
       const newPieceId = uid('piece');
       pieceIdMap.set(piece.id, newPieceId);
-      const points = piece.points.map((pt) => {
-        const newPtId = uid('pt');
-        pointIdMap.set(pt.id, newPtId);
-        return {
-          id: newPtId,
-          anchor: { ...pt.anchor },
-          handleIn: pt.handleIn ? { ...pt.handleIn } : null,
-          handleOut: pt.handleOut ? { ...pt.handleOut } : null,
-          handlesParallel: pt.handlesParallel,
-        };
-      });
+      // Every ring, the holes included: their points are named by seams, seam
+      // allowance overrides and measurements, so they are re-minted and recorded
+      // here alongside the outline's.
+      const cloneRing = (ring: BezierPoint[]) =>
+        ring.map((pt) => {
+          const newPtId = uid('pt');
+          pointIdMap.set(pt.id, newPtId);
+          return {
+            id: newPtId,
+            anchor: { ...pt.anchor },
+            handleIn: pt.handleIn ? { ...pt.handleIn } : null,
+            handleOut: pt.handleOut ? { ...pt.handleOut } : null,
+            handlesParallel: pt.handlesParallel,
+          };
+        });
+      const points = cloneRing(piece.points);
       return {
         id: newPieceId,
         name: piece.name,
         closed: piece.closed,
         points,
+        holes: piece.holes?.map(cloneRing),
         grainline: piece.grainline
           ? {
               from: { ...piece.grainline.from },
