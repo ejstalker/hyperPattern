@@ -1113,11 +1113,13 @@ optgroup {
   display: none !important;
 }
 
-/* Selection chrome: the same top-left slot, never both at once (selecting a
-   ruler clears the point selection, and vice versa). */
+/* The picked point's own options: its own ribbon along the bottom middle, so it
+   can be up while the tool's ribbon is in the top-left corner — the two used to
+   fight over one slot, and Move always won it. */
 .pattern-point-bar {
-  top: var(--node-top-inset, 8px);
-  left: 8px;
+  bottom: var(--node-bottom-inset, 10px);
+  left: 50%;
+  transform: translateX(-50%);
   gap: 14px;
   color: var(--muted, #8a8278);
 }
@@ -1142,8 +1144,9 @@ optgroup {
   cursor: default;
 }
 
-/* Tool settings: what the tool in hand is set to, in the top-left slot the
-   point settings use — the two are never up together. */
+/* Tool settings: what the tool in hand is set to, in the top-left slot. The
+   picked point's options have their own ribbon at the bottom middle, so a point
+   can be picked while the tool's ribbon is up. */
 /*
  * Above the board's scrim.
  *
@@ -6686,13 +6689,13 @@ optgroup {
 }
 
 /* The rail floats over the canvas now, so anything that used to sit in the
-   top-left slot of the editor — the tool settings, the selection bar, the ruler
-   options — has to clear it instead of being covered by it. */
+   top-left slot of the editor — the tool settings, the ruler options — has to
+   clear it instead of being covered by it. The point options are not in that
+   slot: they have a ribbon of their own along the bottom middle. */
 .pattern-editor {
   --rail-width: 62px;
 }
 
-.pattern-point-bar,
 .pattern-ruler-bar,
 .pattern-tool-settings,
 .pattern-allowance-bar,

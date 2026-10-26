@@ -1378,6 +1378,7 @@ export class PatternEditor {
     this.pointBar.className = 'pattern-point-bar';
     this.pointBar.hidden = true;
     this.pointBar.innerHTML = `
+      <span class="pattern-settings-title">Point</span>
       <label title="Keep handles opposite when dragging"><input type="checkbox" data-opt="parallel" /> Parallel handles</label>
       <label title="Zero-length handles — corner / straight segments"><input type="checkbox" data-opt="corner" /> Corner (zero handles)</label>
     `;
@@ -3791,8 +3792,8 @@ export class PatternEditor {
 
   /**
    * The seam allowance ribbon: what the picked edge and the piece are set to,
-   * in the canvas' unit. It shares the top-left slot with the point settings, and
-   * a picked edge wins — you are setting an edge, not dragging a point.
+   * in the canvas' unit. It shares the top-left slot with the tool's ribbon, and
+   * a picked edge wins — you are setting an edge, not choosing a tool.
    */
   private updateAllowanceBar(): void {
     const sel = this.allowanceEdge;
@@ -3801,8 +3802,13 @@ export class PatternEditor {
     if (sel && !piece) this.allowanceEdge = null;
     const showing = this.allowanceOn && !!sel && !!piece;
     this.allowanceBar.hidden = !showing;
-    if (!showing || !sel || !piece) return;
-    this.pointBar.hidden = true;
+    if (!showing) {
+      // The ribbon it shares the top-left corner with comes back when the edge
+      // is let go. Only when it was actually taken: this runs on every redraw,
+      // and laying the ribbon out again would cost a layout read each time.
+      if (this.toolSettings.hidden) this.syncToolSettings();
+      return;
+    }
     this.toolSettings.hidden = true;
 
     this.allowanceEdgeLabel.textContent = `${piece.name} · edge ${sel.edgeIndex + 1} of ${
@@ -3836,7 +3842,11 @@ export class PatternEditor {
 
   private updatePointBar(): void {
     const pt = this.selectedPoint();
-    if (!pt || this.hasToolSettings() || (this.allowanceOn && !!this.allowanceEdge)) {
+    // The point's options have a ribbon of their own along the bottom, so they
+    // can be up while the tool's ribbon is: a picked point is what the tool in
+    // hand is about to move. An allowance edge takes the slot instead — that is
+    // an edge being set, not a point being dragged — and only Move works points.
+    if (!pt || this.tool !== 'move' || (this.allowanceOn && !!this.allowanceEdge)) {
       this.pointBar.hidden = true;
       return;
     }
@@ -3879,13 +3889,22 @@ export class PatternEditor {
       this.updatePointBar();
       return;
     }
+    this.toggleCornerPoint(piece, pt);
+  }
+
+  /**
+   * Bézier point ↔ sharp corner: the two states the point ribbon's Corner box
+   * switches between, on the point the hand is on. A corner drops its handles; a
+   * Bézier point grows handles along its neighbours again.
+   */
+  private toggleCornerPoint(piece: PatternPiece, pt: BezierPoint): void {
     this.markBeforeChange();
-    if (this.cornerCheck.checked) {
-      pt.handleIn = null;
-      pt.handleOut = null;
-    } else {
+    if (this.isCornerPoint(pt)) {
       this.createDefaultHandles(piece, pt);
       pt.handlesParallel = false;
+    } else {
+      pt.handleIn = null;
+      pt.handleOut = null;
     }
     this.cbs.onChange();
     this.endHistoryGesture();
@@ -5460,8 +5479,11 @@ export class PatternEditor {
     return null;
   }
 
-  /** The point an orbit pick would take: the nearest anchor, holes included. */
-  private orbitPointAt(p: Vec2): { piece: PatternPiece; point: BezierPoint } | null {
+  /**
+   * The anchor under the pointer: the nearest one, holes included. What an orbit
+   * pick and an Alt-click both take.
+   */
+  private anchorPointAt(p: Vec2): { piece: PatternPiece; point: BezierPoint } | null {
     let best: { piece: PatternPiece; point: BezierPoint } | null = null;
     let bestDistance = this.hitRadius();
     for (const piece of this.pattern.pieces) {
@@ -5492,7 +5514,7 @@ export class PatternEditor {
    * the canvas reads it the way it always does.
    */
   private onOrbitDown(e: PointerEvent, p: Vec2): boolean {
-    const hit = this.orbitPointAt(p);
+    const hit = this.anchorPointAt(p);
     if (this.orbit) {
       if (hit && hit.point.id === this.orbit.movingPointId) {
         this.beginOrbitDrag(e);
@@ -8526,16 +8548,22 @@ export class PatternEditor {
     if (e.button === 0) this.hideContextMenu();
 
     // Alt over a scale handle means "scale about the selection centre", so the
-    // handle takes precedence over the Alt-pan gesture there.
+    // handle takes precedence over the Alt-pan gesture there. Alt on a point is
+    // the other exception: it flips the point between a Bézier point and a sharp
+    // corner, so the press is the toggle rather than the start of a pan.
     const hitEl = e.target as SVGElement;
     const onScaleHandle =
       this.tool === 'move' && hitEl.dataset?.kind === 'scale' && !!hitEl.dataset.handle;
+    const altAnchor =
+      this.tool === 'move' && e.button === 0 && e.altKey && !onScaleHandle
+        ? this.anchorPointAt(this.svgPoint(e))
+        : null;
 
     // Middle-mouse (or Alt-left) pans the pattern view. A locked frame has no
     // view of its own, so there the gesture belongs to the canvas behind it.
     const lockedFrame = !!this.container?.locked;
     const panGesture =
-      e.button === 1 || (e.button === 0 && e.altKey && !onScaleHandle);
+      e.button === 1 || (e.button === 0 && e.altKey && !onScaleHandle && !altAnchor);
     if (lockedFrame && panGesture) return;
     if (panGesture) {
       this.drag = {
@@ -8562,6 +8590,15 @@ export class PatternEditor {
     const pointId = target.dataset?.pointId;
     const pieceId = target.dataset?.pieceId;
     const p = this.svgPoint(e);
+
+    // Alt on a point flips it between a Bézier point and a sharp corner — the
+    // point ribbon's Corner box, where the hand already is.
+    if (altAnchor) {
+      this.selectOnly(altAnchor.point.id, altAnchor.piece.id);
+      this.toggleCornerPoint(altAnchor.piece, altAnchor.point);
+      e.preventDefault();
+      return;
+    }
 
     // The ruler tool owns every gesture: empty canvas starts a new ruler, and a
     // ruler under the cursor can be picked up, slid or turned.
