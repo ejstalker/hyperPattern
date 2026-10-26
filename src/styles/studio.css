@@ -6883,26 +6883,56 @@ textarea:focus-visible {
 
 /* ── Messages ─────────────────────────────────────────────────────────────
    The board used to reserve a strip along the bottom for the last message. It
-   is a toast instead: it shows, then leaves. */
+   is a toast in the bottom-right corner instead: it shows, then leaves — or
+   goes at once on its close button, which sits at the far right of the chip. */
 
 .studio-toast {
   position: fixed;
-  left: 50%;
+  right: 16px;
   bottom: 16px;
   z-index: 6000;
-  max-width: min(620px, calc(100vw - 32px));
-  padding: 7px 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(440px, calc(100vw - 32px));
+  padding: 7px 8px 7px 14px;
   border-radius: 10px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
   background: rgba(28, 26, 23, 0.94);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
   color: var(--ink);
   font: 12px var(--mono);
-  transform: translateX(-50%);
+  /* The message never gets in the way of the canvas; its button still does. */
   pointer-events: none;
   animation: studio-toast-in 140ms ease-out;
+}
+
+.studio-toast-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.35;
+}
+
+.studio-toast-close {
+  pointer-events: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font: 13px/1 var(--mono);
+  cursor: pointer;
+}
+
+.studio-toast-close:hover {
+  background: var(--hover);
+  color: var(--ink);
 }
 
 .studio-toast[hidden] {
@@ -6912,10 +6942,10 @@ textarea:focus-visible {
 @keyframes studio-toast-in {
   from {
     opacity: 0;
-    transform: translate(-50%, 6px);
+    transform: translateY(6px);
   }
   to {
     opacity: 1;
-    transform: translate(-50%, 0);
+    transform: translateY(0);
   }
 }

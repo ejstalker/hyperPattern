@@ -339,6 +339,8 @@ export class StudioApp {
   private studioBody: HTMLElement;
   private inspector: HTMLElement;
   private toastEl: HTMLElement;
+  /** The message inside the toast — the chip also carries its dismiss button. */
+  private toastTextEl: HTMLElement;
   /** Folded to a rail? Kept across re-renders and node selections. */
   private inspectorCollapsed = false;
   private toastTimer = 0;
@@ -499,7 +501,10 @@ export class StudioApp {
           <aside class="studio-inspector" id="inspector"></aside>
         </div>
         <div class="text-style-bar" id="textStyleBar" role="toolbar" aria-label="Text style" hidden></div>
-        <div class="studio-toast" id="toast" role="status" aria-live="polite" hidden></div>
+        <div class="studio-toast" id="toast" hidden>
+          <span class="studio-toast-text" id="toastText" role="status" aria-live="polite"></span>
+          <button type="button" class="studio-toast-close" id="toastClose" aria-label="Dismiss message" title="Dismiss">×</button>
+        </div>
         <div class="studio-modal-root" id="modalRoot" hidden></div>
         <input type="file" id="importFile" accept="application/json,.json,.patterncanvas,application/zip" hidden />
         <input type="file" id="imageFile" accept="image/*" multiple hidden />
@@ -511,6 +516,8 @@ export class StudioApp {
     this.wiresSvg = root.querySelector('#wires')!;
     this.inspector = root.querySelector('#inspector')!;
     this.toastEl = root.querySelector('#toast')!;
+    this.toastTextEl = root.querySelector('#toastText')!;
+    root.querySelector('#toastClose')?.addEventListener('click', () => this.setStatus(''));
     this.textBar = root.querySelector('#textStyleBar')!;
     this.modalRoot = root.querySelector('#modalRoot')!;
     this.importFileInput = root.querySelector('#importFile')!;
@@ -1760,16 +1767,17 @@ export class StudioApp {
   /**
    * Messages used to live in a permanent strip under the board. It cost 25px of
    * canvas at all times to say "Auto-saved" — so the strip is gone and a message
-   * is a toast that appears, then gets out of the way.
+   * is a toast in the bottom-right corner: it shows, then gets out of the way, or
+   * goes at once on its own close button.
    */
   private setStatus(msg: string): void {
     window.clearTimeout(this.toastTimer);
     if (!msg) {
       this.toastEl.hidden = true;
-      this.toastEl.textContent = '';
+      this.toastTextEl.textContent = '';
       return;
     }
-    this.toastEl.textContent = msg;
+    this.toastTextEl.textContent = msg;
     this.toastEl.hidden = false;
     this.toastTimer = window.setTimeout(() => {
       this.toastEl.hidden = true;
