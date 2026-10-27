@@ -209,10 +209,17 @@ export type PatternEditorCallbacks = {
    * this box, in pattern centimetres. A click rather than a drag reports a box
    * with no size, which means "wherever I clicked, at its own natural size".
    *
-   * Only hosts that can own such an object pass this — the page does, a container
-   * full of pattern work does not — and the modes are hidden where it is missing.
+   * Only hosts that can own such an object pass this, and the modes are hidden
+   * where it is missing — or where `canPlaceObject` says that one of them is not
+   * on offer here.
    */
   onAddObject?: (kind: PlacedObjectKind, box: ObjectBoxPlace) => void;
+  /**
+   * Whether this host can place this kind of object *here*. A canvas that holds
+   * both patterns and notes takes both; a pattern opened full screen takes a note
+   * over its work but has nowhere to put a section, which groups canvas objects.
+   */
+  canPlaceObject?: (kind: PlacedObjectKind) => boolean;
   onMarqueeRect?: (
     box: { x: number; y: number; w: number; h: number } | null,
     info: { additive: boolean; panels: boolean }
@@ -1425,10 +1432,7 @@ export class PatternEditor {
       <div class="pattern-settings-set" data-settings-for="add" hidden>
         <span class="pattern-settings-title">Add</span>
         <div class="pattern-settings-group" role="group" aria-label="Add mode">
-          ${ADD_MODES.filter(
-            (entry) =>
-              (entry.mode !== 'text' && entry.mode !== 'section') || this.cbs.onAddObject
-          )
+          ${ADD_MODES.filter((entry) => this.canPlaceObject(entry.mode))
             .map(
               (entry) =>
                 `<button type="button" data-add-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
@@ -2883,6 +2887,20 @@ export class PatternEditor {
   private clearOrbit(): void {
     this.orbitPickId = null;
     this.orbit = null;
+  }
+
+  /**
+   * Whether the Add tool can place this kind of object here.
+   *
+   * The shapes and the pen are the pattern's own work and are always on offer.
+   * Text and sections are objects the *host* owns, so they need a host that can
+   * take one — and one that can take *this* one, since a pattern opened full
+   * screen has somewhere to put a note but nowhere to put a section.
+   */
+  private canPlaceObject(mode: AddMode): boolean {
+    if (mode !== 'text' && mode !== 'section') return true;
+    if (!this.cbs.onAddObject) return false;
+    return this.cbs.canPlaceObject ? this.cbs.canPlaceObject(mode) : true;
   }
 
   private setAddMode(mode: AddMode): void {

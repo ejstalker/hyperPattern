@@ -52,8 +52,10 @@ import type {
 } from '../project/types';
 import {
   PatternEditor,
+  type ObjectBoxPlace,
   type PatternDetail,
   type PatternEditorContainer,
+  type PlacedObjectKind,
 } from '../pattern/PatternEditor';
 import {
   DEFAULT_TEXT_BACKGROUND,
@@ -113,6 +115,7 @@ import {
   CONTAINER_PADDING_CM,
   canvasAtCm,
   canvasCmScale,
+  containerCanvasAt,
   containerClips,
   containerView,
   groupIntoContainer,
@@ -2640,6 +2643,32 @@ export class StudioApp {
       : (this.canvasEditor ?? undefined);
   }
 
+  /**
+   * The Add tool asked for an object over a container's work.
+   *
+   * A note is a canvas object, so it is placed on the canvas at the spot this
+   * frame is showing — written over a pattern, it stays with the pattern on the
+   * board. That is also why a container opened up steps out of the way when one is
+   * made: the object has to be visible to be typed into.
+   *
+   * A section is not offered here at all (see `canPlaceObject`): it groups things
+   * on the canvas, and the canvas is not what a container full of work is.
+   */
+  private addObjectToContainer(
+    frame: PatternFrameNode,
+    kind: PlacedObjectKind,
+    box: ObjectBoxPlace
+  ): void {
+    if (kind !== 'text') return;
+    const editor = this.editors.get(frame.id);
+    editor?.setTool('move');
+    if (this.expandedNodeId === frame.id) this.closeNodeFullscreen();
+    this.addTextObject(box, frame);
+    // The frame steps aside to show the note: it belongs to the canvas, and an
+    // object you cannot see is not one you can type into.
+    this.setStatus(`Text over Container · ${this.containerName(frame)} — style it from the bar below`);
+  }
+
   /** The container's name, as its own frame titles it. */
   private containerName(node: PatternFrameNode): string {
     return this.project.patterns.find((p) => p.id === node.patternId)?.name ?? 'Container';
@@ -4459,6 +4488,10 @@ export class StudioApp {
         onSelectionChange: (pieceIds) => this.syncSplitSelectionFrom2d(pieceIds),
         // Dragged out past the frame, the work belongs to the canvas again.
         onPiecesDropped: (drop) => this.handOverDroppedPieces(node, drop),
+        // A note can be written over a pattern, and belongs to the canvas at the
+        // place this frame is showing it. A section has nothing to group here.
+        onAddObject: (kind, box) => this.addObjectToContainer(node, kind, box),
+        canPlaceObject: (kind) => kind === 'text',
       });
       this.editors.set(node.id, editor);
       this.syncContainer(node, el);
@@ -7794,12 +7827,23 @@ export class StudioApp {
    * click sizes itself to what is typed. Both are geometry in canvas units —
    * the box the drag drew, or a default paragraph — and the tool goes back to
    * Move, because typing into what you just made is the next thing you do.
+   *
+   * Drawn on the page the box is in page centimetres; drawn inside a container it
+   * is in that container's own, and `frame` maps it back onto the canvas — a note
+   * written over a pattern frame belongs to the canvas at the place the frame is
+   * showing it.
    */
-  private addTextObject(box: { x: number; y: number; w: number; h: number }): void {
-    const topLeft = canvasAtCm(this.project, box.x, box.y);
+  private addTextObject(
+    box: { x: number; y: number; w: number; h: number },
+    frame?: PatternFrameNode
+  ): void {
+    const cmScale = frame ? containerView(frame).cmScale : canvasCmScale(this.project);
+    const topLeft = frame
+      ? containerCanvasAt(frame, box.x, box.y)
+      : canvasAtCm(this.project, box.x, box.y);
     const dragged = box.w > 0.5 && box.h > 0.5;
-    const width = dragged ? box.w * canvasCmScale(this.project) : 260;
-    const height = dragged ? box.h * canvasCmScale(this.project) : 44;
+    const width = dragged ? box.w * cmScale : 260;
+    const height = dragged ? box.h * cmScale : 44;
     const node: TextAnnotationNode = {
       type: 'text',
       id: uid('node'),
