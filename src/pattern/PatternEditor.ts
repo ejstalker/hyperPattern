@@ -5250,20 +5250,43 @@ export class PatternEditor {
     }
     if (mark !== 'full') return;
 
-    // Drafted blocks are full of short edges — dart legs, the waistband notch,
-    // ease offsets. Labelling every one of them piles unreadable text over the
-    // outline, so lengths are placed greedily: an edge earns a label only when
-    // the text fits along it *and* the resulting box is clear of every label
-    // already placed. Longest edges are considered first, because those are the
-    // ones you actually measure; short ones fill the gaps if there is room.
+    // Every edge carries its length while the points are on show: an unlabelled
+    // edge is a measurement missing from the sheet, and the points are what you
+    // are reading the numbers against. Longest edges are placed first, in the
+    // middle of their edge, because those are the ones you actually measure. An
+    // edge too short to hold its own text there — a dart leg, a notch, the ease
+    // on a drafted block — is labelled just outside the piece instead, pushed
+    // further out until it is clear of the labels already placed.
+    //
+    // A piece with hundreds of edges is not one you read numbers off: a
+    // rasterised glyph is a staircase of one-pixel steps. Past that many edges
+    // only the ones long enough to hold their text are marked, which is what
+    // every piece used to do.
+    const maxLabelledEdges = 80;
     const labelPx = 11;
     const fontSize = this.px(labelPx);
-    const scale = this.viewScale();
-    type Candidate = { index: number; length: number; text: string; x: number; y: number; w: number; h: number };
+    const outset = this.px(labelPx * 0.55 + 6);
+    type Candidate = {
+      index: number;
+      length: number;
+      text: string;
+      /** Where the label sits when it fits along the edge. */
+      x: number;
+      y: number;
+      /** The middle of the edge itself, which the fallback steps out from. */
+      mx: number;
+      my: number;
+      w: number;
+      h: number;
+      /** Unit normal pointing away from the cloth, for the fallback places. */
+      nx: number;
+      ny: number;
+    };
     const candidates: Candidate[] = [];
     // Holes are labelled like the outline: their edges are measured, sewn and
     // allowed for like any other, so they read the same way.
     const rings = pieceRings(piece);
+    const edgeTotal = rings.reduce((sum, _ring, r) => sum + ringEdgeCount(piece, r), 0);
     for (let r = 0; r < rings.length; r++) {
       const ring = rings[r]!;
       const lengths = segmentLengths(ring, r === 0 ? piece.closed : true);
@@ -5271,32 +5294,72 @@ export class PatternEditor {
       for (let i = 0; i < edgeCount; i++) {
         const length = lengths[i] ?? 0;
         const text = formatLength(length, this.unit, 1);
-        const w = text.length * labelPx * 0.62;
-        if (length * scale < w + 8) continue;
+        if (edgeTotal > maxLabelledEdges && this.px(text.length * labelPx * 0.62 + 8) > length) {
+          continue;
+        }
         const a = ring[i].anchor;
         const b = ring[(i + 1) % ring.length].anchor;
+        let nx = -(b.y - a.y);
+        let ny = b.x - a.x;
+        const span = Math.hypot(nx, ny) || 1;
+        nx /= span;
+        ny /= span;
+        // Which side of the edge is not cloth: outside an outline, inside a hole.
+        const probe = this.px(2);
+        const midX = (a.x + b.x) / 2;
+        const midY = (a.y + b.y) / 2;
+        if (pointInPiece({ x: midX + nx * probe, y: midY + ny * probe }, piece)) {
+          nx = -nx;
+          ny = -ny;
+        }
         candidates.push({
           index: pieceEdgeNumber(piece, r, i),
           length,
           text,
-          x: (a.x + b.x) / 2,
-          y: (a.y + b.y) / 2 - this.px(10),
-          w,
-          h: labelPx * 1.1,
+          x: midX,
+          y: midY - this.px(10),
+          mx: midX,
+          my: midY,
+          // The text's box, in the pattern units the boxes are compared in —
+          // it was measured in screen pixels, which made every label look four
+          // times the size it is and turned most of them away as clashes.
+          w: this.px(text.length * labelPx * 0.62),
+          h: this.px(labelPx * 1.1),
+          nx,
+          ny,
         });
       }
     }
     candidates.sort((a, b) => b.length - a.length);
     const placed: Array<{ index: number; text: string; x: number; y: number }> = [];
     const boxes: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
-    for (const c of candidates) {
-      const box = { x0: c.x - c.w / 2, y0: c.y - c.h / 2, x1: c.x + c.w / 2, y1: c.y + c.h / 2 };
-      const clash = boxes.some(
+    const clear = (x: number, y: number, c: Candidate): boolean => {
+      const box = { x0: x - c.w / 2, y0: y - c.h / 2, x1: x + c.w / 2, y1: y + c.h / 2 };
+      return !boxes.some(
         (b) => box.x0 < b.x1 && box.x1 > b.x0 && box.y0 < b.y1 && box.y1 > b.y0
       );
-      if (clash) continue;
-      boxes.push(box);
-      placed.push({ index: c.index, text: c.text, x: c.x, y: c.y });
+    };
+    const claim = (x: number, y: number, c: Candidate): void => {
+      boxes.push({ x0: x - c.w / 2, y0: y - c.h / 2, x1: x + c.w / 2, y1: y + c.h / 2 });
+      placed.push({ index: c.index, text: c.text, x, y });
+    };
+    for (const c of candidates) {
+      // The middle of the edge first, then the same place stepped outwards.
+      if (clear(c.x, c.y, c)) {
+        claim(c.x, c.y, c);
+        continue;
+      }
+      let placedAt: { x: number; y: number } | null = null;
+      for (const step of [1, 1.9, 2.8, 3.7]) {
+        const x = c.mx + c.nx * outset * step;
+        const y = c.my + c.ny * outset * step;
+        if (!clear(x, y, c)) continue;
+        placedAt = { x, y };
+        break;
+      }
+      // Even crowded, the edge keeps its number: further out is better than none.
+      if (placedAt) claim(placedAt.x, placedAt.y, c);
+      else claim(c.mx + c.nx * outset * 3.7, c.my + c.ny * outset * 3.7, c);
     }
     placed.sort((a, b) => a.index - b.index);
     for (const p of placed) {
@@ -8436,6 +8499,46 @@ export class PatternEditor {
     this.afterPieceDuplicated(copy);
   }
 
+  /**
+   * Alt-drag on a panel: copy what is being dragged, then carry the copy. A
+   * panel already picked as part of a set takes the whole set with it, the way
+   * picking one up would.
+   */
+  private beginAltDuplicate(e: PointerEvent, p: Vec2, piece: PatternPiece): void {
+    const picked = this.whollySelectedPieces();
+    const ids = picked.includes(piece.id) ? picked : [piece.id];
+    this.markBeforeChange();
+    const copies: PatternPiece[] = [];
+    for (const id of ids) {
+      const source = this.pattern.pieces.find((entry) => entry.id === id);
+      if (!source) continue;
+      // In place, not stepped aside: the drag is what moves it away.
+      const copy = clonePatternPiece(source, this.makePieceId, { x: 0, y: 0 });
+      copy.id = uid('piece');
+      this.pattern.pieces.push(copy);
+      copies.push(copy);
+    }
+    if (copies.length === 0) {
+      this.endHistoryGesture();
+      return;
+    }
+    this.selectedIds = new Set(
+      copies.flatMap((copy) => pieceRings(copy).flat().map((point) => point.id))
+    );
+    this.selectedPointId = null;
+    this.selectedPieceId = copies[copies.length - 1].id;
+    this.drag = {
+      type: 'moveSelection',
+      start: p,
+      snapshots: this.snapshotSelection(),
+      moved: false,
+    };
+    this.svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    this.cbs.onChange();
+    this.redraw();
+  }
+
   private deleteContextPiece(): void {
     const id = this.contextPieceId ?? this.selectedPieceId;
     if (!id) return;
@@ -8550,20 +8653,21 @@ export class PatternEditor {
     // Alt over a scale handle means "scale about the selection centre", so the
     // handle takes precedence over the Alt-pan gesture there. Alt on a point is
     // the other exception: it flips the point between a Bézier point and a sharp
-    // corner, so the press is the toggle rather than the start of a pan.
+    // corner, so the press is the toggle rather than the start of a pan. Alt on a
+    // panel is a third: it duplicates the panel and carries the copy.
     const hitEl = e.target as SVGElement;
     const onScaleHandle =
       this.tool === 'move' && hitEl.dataset?.kind === 'scale' && !!hitEl.dataset.handle;
-    const altAnchor =
-      this.tool === 'move' && e.button === 0 && e.altKey && !onScaleHandle
-        ? this.anchorPointAt(this.svgPoint(e))
-        : null;
+    const altPress = this.tool === 'move' && e.button === 0 && e.altKey && !onScaleHandle;
+    const altAnchor = altPress ? this.anchorPointAt(this.svgPoint(e)) : null;
+    const altPiece = altPress && !altAnchor ? this.pieceAt(hitEl, this.svgPoint(e)) : null;
 
     // Middle-mouse (or Alt-left) pans the pattern view. A locked frame has no
     // view of its own, so there the gesture belongs to the canvas behind it.
     const lockedFrame = !!this.container?.locked;
     const panGesture =
-      e.button === 1 || (e.button === 0 && e.altKey && !onScaleHandle && !altAnchor);
+      e.button === 1 ||
+      (e.button === 0 && e.altKey && !onScaleHandle && !altAnchor && !altPiece);
     if (lockedFrame && panGesture) return;
     if (panGesture) {
       this.drag = {
@@ -8597,6 +8701,13 @@ export class PatternEditor {
       this.selectOnly(altAnchor.point.id, altAnchor.piece.id);
       this.toggleCornerPoint(altAnchor.piece, altAnchor.point);
       e.preventDefault();
+      return;
+    }
+
+    // Alt on a panel duplicates it: the copy is what the drag carries, and the
+    // original stays where it was. The same press without Alt picks the panel up.
+    if (altPiece) {
+      this.beginAltDuplicate(e, p, altPiece);
       return;
     }
 
