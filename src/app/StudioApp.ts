@@ -38,6 +38,7 @@ import type {
   PatternDocument,
   PatternFrameNode,
   PatternPiece,
+  PatternText,
   PieceTransform3d,
   ProjectDocument,
   SeamEdgeRef,
@@ -115,7 +116,6 @@ import {
   CONTAINER_PADDING_CM,
   canvasAtCm,
   canvasCmScale,
-  containerCanvasAt,
   containerClips,
   containerView,
   groupIntoContainer,
@@ -2646,10 +2646,11 @@ export class StudioApp {
   /**
    * The Add tool asked for an object over a container's work.
    *
-   * A note is a canvas object, so it is placed on the canvas at the spot this
-   * frame is showing — written over a pattern, it stays with the pattern on the
-   * board. That is also why a container opened up steps out of the way when one is
-   * made: the object has to be visible to be typed into.
+   * A note is written into the *pattern*: it is held in the pattern's own
+   * centimetres, so on the board it rides inside the frame, scales with the work,
+   * and is still there when the container is opened up again. The editor makes it
+   * and puts the caret in it, and the style bar comes up for it the same way it
+   * does for a canvas text object.
    *
    * A section is not offered here at all (see `canPlaceObject`): it groups things
    * on the canvas, and the canvas is not what a container full of work is.
@@ -2661,12 +2662,16 @@ export class StudioApp {
   ): void {
     if (kind !== 'text') return;
     const editor = this.editors.get(frame.id);
-    editor?.setTool('move');
-    if (this.expandedNodeId === frame.id) this.closeNodeFullscreen();
-    this.addTextObject(box, frame);
-    // The frame steps aside to show the note: it belongs to the canvas, and an
-    // object you cannot see is not one you can type into.
-    this.setStatus(`Text over Container · ${this.containerName(frame)} — style it from the bar below`);
+    if (!editor) return;
+    // A new note starts the size a new canvas text object does, in the pattern's
+    // centimetres: the drafting scale is the only difference between the two.
+    const scale = canvasCmScale(this.project) || 1;
+    // Back to Move first, the way a canvas text object leaves the tool: typing
+    // into what you just made is the next thing you do, and a note is picked,
+    // carried and styled from Move.
+    editor.setTool('move');
+    editor.createText(box, { fontSizeCm: 28 / scale, paddingCm: 8 / scale });
+    this.setStatus('Text — style it from the bar below');
   }
 
   /** The container's name, as its own frame titles it. */
@@ -4488,10 +4493,11 @@ export class StudioApp {
         onSelectionChange: (pieceIds) => this.syncSplitSelectionFrom2d(pieceIds),
         // Dragged out past the frame, the work belongs to the canvas again.
         onPiecesDropped: (drop) => this.handOverDroppedPieces(node, drop),
-        // A note can be written over a pattern, and belongs to the canvas at the
-        // place this frame is showing it. A section has nothing to group here.
+        // A note is written into the pattern itself, so it rides inside the
+        // frame on the board. A section has nothing to group here.
         onAddObject: (kind, box) => this.addObjectToContainer(node, kind, box),
         canPlaceObject: (kind) => kind === 'text',
+        onTextSelectionChange: () => this.syncTextStyleBar(),
       });
       this.editors.set(node.id, editor);
       this.syncContainer(node, el);
@@ -7605,6 +7611,11 @@ export class StudioApp {
         restGapCm: seam.restGapCm,
       })),
       rulers: src.rulers ? structuredClone(src.rulers) : undefined,
+      // Notes are the pattern's own writing, so a copy of the pattern carries
+      // them, each one re-minted so the two documents never share an id.
+      texts: src.texts?.length
+        ? src.texts.map((note) => ({ ...structuredClone(note), id: uid('txt') }))
+        : undefined,
       blocks: blocks.length > 0 ? blocks : undefined,
       pieceSuccessors: src.pieceSuccessors ? structuredClone(src.pieceSuccessors) : undefined,
     };
@@ -7828,22 +7839,15 @@ export class StudioApp {
    * the box the drag drew, or a default paragraph — and the tool goes back to
    * Move, because typing into what you just made is the next thing you do.
    *
-   * Drawn on the page the box is in page centimetres; drawn inside a container it
-   * is in that container's own, and `frame` maps it back onto the canvas — a note
-   * written over a pattern frame belongs to the canvas at the place the frame is
-   * showing it.
+   * The box is in the page's own centimetres. A note written over a *container*
+   * is a different kind of object — it belongs to that pattern, and the editor
+   * makes it (see `addObjectToContainer`).
    */
-  private addTextObject(
-    box: { x: number; y: number; w: number; h: number },
-    frame?: PatternFrameNode
-  ): void {
-    const cmScale = frame ? containerView(frame).cmScale : canvasCmScale(this.project);
-    const topLeft = frame
-      ? containerCanvasAt(frame, box.x, box.y)
-      : canvasAtCm(this.project, box.x, box.y);
+  private addTextObject(box: { x: number; y: number; w: number; h: number }): void {
+    const topLeft = canvasAtCm(this.project, box.x, box.y);
     const dragged = box.w > 0.5 && box.h > 0.5;
-    const width = dragged ? box.w * cmScale : 260;
-    const height = dragged ? box.h * cmScale : 44;
+    const width = dragged ? box.w * canvasCmScale(this.project) : 260;
+    const height = dragged ? box.h * canvasCmScale(this.project) : 44;
     const node: TextAnnotationNode = {
       type: 'text',
       id: uid('node'),
@@ -8182,9 +8186,9 @@ export class StudioApp {
       }
       const toggle = target.closest('button[data-text-toggle]') as HTMLButtonElement | null;
       if (toggle) {
-        const node = this.selectedTextNode();
-        if (!node) return;
-        this.applyTextBarField('fontStyle', node.fontStyle === 'italic' ? 'normal' : 'italic');
+        const style = this.textBarStyle();
+        if (!style) return;
+        this.applyTextBarField('fontStyle', style.fontStyle === 'italic' ? 'normal' : 'italic');
         return;
       }
       const none = target.closest('button[data-text-bg]') as HTMLButtonElement | null;
@@ -8199,15 +8203,54 @@ export class StudioApp {
     return node && node.type === 'text' ? node : null;
   }
 
+  /** A note picked inside a pattern — the style bar's other kind of text. */
+  private selectedPatternText(): { editor: PatternEditor; note: PatternText } | null {
+    const editor = this.activeEditor();
+    const note = editor?.getSelectedText() ?? null;
+    return editor && note ? { editor, note } : null;
+  }
+
+  /**
+   * A note's type, read as the canvas-units numbers the style bar shows: the
+   * drafting scale is the only difference between the two kinds of text object,
+   * which is what keeps one bar and one set of numbers for both.
+   */
+  private patternTextStyle(note: PatternText): TextStyle {
+    const scale = canvasCmScale(this.project);
+    // Rounded, or the round trip through centimetres shows in the field as
+    // 59.99999999999999 where the hand typed 60.
+    const units = (cm: number) => Math.round(cm * scale * 1000) / 1000;
+    return {
+      fontFamily: note.fontFamily ?? TEXT_FONT_FAMILIES[0],
+      fontSize: units(note.fontSizeCm),
+      fontWeight: note.fontWeight ?? 400,
+      fontStyle: note.fontStyle ?? 'normal',
+      lineHeight: note.lineHeight ?? 1.3,
+      letterSpacing: units(note.letterSpacingCm ?? 0),
+      align: note.align ?? 'left',
+      color: note.color ?? DEFAULT_TEXT_COLOR,
+      background: note.background ?? DEFAULT_TEXT_BACKGROUND,
+      padding: units(note.paddingCm ?? 1.2),
+      autoWidth: !!note.autoWidth,
+    };
+  }
+
+  /** Whatever the bar is pointed at, as one shape: a note, or a canvas text object. */
+  private textBarStyle(): TextStyle | null {
+    const note = this.selectedPatternText();
+    if (note) return this.patternTextStyle(note.note);
+    const node = this.selectedTextNode();
+    return node ? textStyleOf(node) : null;
+  }
+
   /** Show the bar for that text object, or put it away. */
   private syncTextStyleBar(): void {
-    const node = this.selectedTextNode();
-    if (!node) {
+    const style = this.textBarStyle();
+    if (!style) {
       if (!this.textBar.hidden) this.textBar.hidden = true;
       return;
     }
     if (this.textBar.hidden) this.textBar.hidden = false;
-    const style = textStyleOf(node);
     const set = (field: string, value: string) => {
       const el = this.textBar.querySelector<HTMLInputElement | HTMLSelectElement>(
         `[data-text-field="${field}"]`
@@ -8242,6 +8285,11 @@ export class StudioApp {
    * colour drag.
    */
   private applyTextBarField(field: string, raw: string, commit = false): void {
+    const picked = this.selectedPatternText();
+    if (picked) {
+      this.applyPatternTextBarField(picked, field, raw);
+      return;
+    }
     const node = this.selectedTextNode();
     if (!node) return;
     if (commit) this.pushUndo();
@@ -8285,6 +8333,60 @@ export class StudioApp {
       this.applyTextNodeStyle(node, content);
       this.fitTextNode(node, content);
     }
+    this.syncTextStyleBar();
+    this.markDirty();
+  }
+
+  /**
+   * A style change on a note. The bar speaks in canvas units, so the numbers are
+   * divided by the drafting scale on the way in — the note itself only ever holds
+   * the pattern's own centimetres.
+   */
+  private applyPatternTextBarField(
+    picked: { editor: PatternEditor; note: PatternText },
+    field: string,
+    raw: string
+  ): void {
+    const scale = canvasCmScale(this.project) || 1;
+    const number = Number.parseFloat(raw);
+    const clamp = (value: number, low: number, high: number) =>
+      Math.max(low, Math.min(high, value));
+    const patch: Partial<PatternText> = {};
+    switch (field) {
+      case 'fontFamily':
+        patch.fontFamily = raw;
+        break;
+      case 'fontSize':
+        if (Number.isFinite(number)) patch.fontSizeCm = clamp(number, 4, 400) / scale;
+        break;
+      case 'fontWeight':
+        if (Number.isFinite(number)) patch.fontWeight = number;
+        break;
+      case 'fontStyle':
+        patch.fontStyle = raw === 'italic' ? 'italic' : 'normal';
+        break;
+      case 'lineHeight':
+        if (Number.isFinite(number)) patch.lineHeight = clamp(number, 0.6, 4);
+        break;
+      case 'letterSpacing':
+        if (Number.isFinite(number)) patch.letterSpacingCm = clamp(number, -20, 80) / scale;
+        break;
+      case 'padding':
+        if (Number.isFinite(number)) patch.paddingCm = clamp(number, 0, 200) / scale;
+        break;
+      case 'align':
+        patch.align = raw === 'center' || raw === 'right' || raw === 'justify' ? raw : 'left';
+        break;
+      case 'color':
+        patch.color = raw;
+        break;
+      case 'background':
+        patch.background = raw;
+        break;
+      default:
+        return;
+    }
+    picked.editor.updateSelectedText(patch);
     this.syncTextStyleBar();
     this.markDirty();
   }

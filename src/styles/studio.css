@@ -2700,6 +2700,46 @@ optgroup {
   opacity: 0.9;
 }
 
+/* Notes written over a pattern: an HTML box inside the drawing's own units, so
+   it scales, pans and clips with the work. The box takes the pointer — that is
+   how a note is picked and typed into — while its text stays selectable. */
+.pattern-text {
+  overflow: visible;
+}
+
+.pattern-text-content {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  border-radius: 2px;
+  cursor: default;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.pattern-text.is-selected .pattern-text-content {
+  cursor: move;
+}
+
+.pattern-text-content[contenteditable='true'] {
+  cursor: text;
+  outline: none;
+  box-shadow: 0 0 0 1px var(--accent-2);
+}
+
+.pattern-text-frame {
+  fill: none;
+  stroke: var(--accent-2);
+  opacity: 0.8;
+  pointer-events: none;
+}
+
+.pattern-text-grip {
+  fill: var(--bg-elev);
+  stroke: var(--accent-2);
+  cursor: nwse-resize;
+}
+
 .pattern-measure-ref-point.is-hot {
   stroke: #ffc65c;
   fill: rgba(255, 198, 92, 0.35);

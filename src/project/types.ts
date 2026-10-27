@@ -179,6 +179,12 @@ export type PatternDocument = {
    */
   measures?: PatternMeasure[];
   /**
+   * Notes written over the pattern (see `PatternText`). They belong to the
+   * pattern rather than to the canvas: a note drawn inside a container travels
+   * with the frame, scales with it, and never reaches a mesh.
+   */
+  texts?: PatternText[];
+  /**
    * Parametric block instances (see `BlockInstance`). Their pieces live in
    * `pieces` like any other, so meshing, seams and export need no special case.
    */
@@ -196,6 +202,49 @@ export type PatternDocument = {
    * nothing reads this, and an empty or absent list means "plain pieces".
    */
   modifiers?: PatternModifier[];
+};
+
+/**
+ * A note written over the pattern.
+ *
+ * Held in the pattern's own centimetres, so it belongs to the pattern rather than
+ * to the canvas: on the board it rides inside the container's frame, moving and
+ * scaling with the work, and it is never pattern geometry — nothing about it
+ * reaches a mesh. The styling fields mirror a canvas text object's, measured in
+ * centimetres where a canvas object counts canvas units, which is what makes a
+ * note the same size in either place.
+ */
+export type PatternText = {
+  id: string;
+  /** Top-left of the box, in pattern centimetres. */
+  x: number;
+  y: number;
+  /** The box, in centimetres. An `autoWidth` note grows with what is typed. */
+  widthCm: number;
+  heightCm: number;
+  text: string;
+  /** Type size in centimetres. */
+  fontSizeCm: number;
+  /** Font family as a CSS name; the studio's own families are offered first. */
+  fontFamily?: string;
+  fontWeight?: number;
+  fontStyle?: 'normal' | 'italic';
+  /** Multiplier of the font size. */
+  lineHeight?: number;
+  /** Centimetres between characters. */
+  letterSpacingCm?: number;
+  align?: TextAlign;
+  /** Text colour, as a CSS colour. */
+  color?: string;
+  /** Fill behind the text; `'transparent'` for none. */
+  background?: string;
+  /** Inset between the box and the text, centimetres on every side. */
+  paddingCm?: number;
+  /**
+   * The box is as wide as the text: a click-placed note grows and shrinks with
+   * what is typed into it. A dragged-out box has a width of its own and wraps.
+   */
+  autoWidth?: boolean;
 };
 
 /**

@@ -10,12 +10,19 @@ import type {
   PatternMeasure,
   PatternPiece,
   PatternRuler,
+  PatternText,
   SeamBinding,
   SeamEdgeRef,
   UnitDisplay,
   Vec2,
 } from '../project/types';
 import { formatLength, cmToDisplay, displayToCm } from '../project/types';
+import {
+  PATTERN_TEXT_MIN_CM,
+  createPatternText,
+  normalizePatternTexts,
+  patternTextCss,
+} from './patternText';
 import type { MeasurementLibrary, MeasurementSet } from '../project/measurements';
 import { MEASUREMENT_FIELDS } from '../project/measurements';
 import {
@@ -220,6 +227,11 @@ export type PatternEditorCallbacks = {
    * over its work but has nowhere to put a section, which groups canvas objects.
    */
   canPlaceObject?: (kind: PlacedObjectKind) => boolean;
+  /**
+   * The note in hand changed — picked, let go, or started being typed into. The
+   * host reads `getSelectedText()` and puts its style bar up when there is one.
+   */
+  onTextSelectionChange?: () => void;
   onMarqueeRect?: (
     box: { x: number; y: number; w: number; h: number } | null,
     info: { additive: boolean; panels: boolean }
@@ -633,6 +645,10 @@ type DragKind =
       current: Vec2;
     }
   | { type: 'rulerCreate'; start: Vec2; current: Vec2; snap: boolean }
+  /** The note in hand being carried, in pattern centimetres. */
+  | { type: 'moveText'; id: string; start: Vec2; origin: Vec2 }
+  /** A note's corner being dragged out, in pattern centimetres. */
+  | { type: 'resizeText'; id: string; start: Vec2; width: number; height: number }
   | { type: 'rulerMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'rulerTurn'; id: string; which: 'a' | 'b' }
   /** A measure line being drawn across the pattern. */
@@ -789,6 +805,7 @@ function normalizePattern(
 ): void {
   if (pattern.rulers) pattern.rulers = normalizeRulers(pattern.rulers);
   if (pattern.measures) pattern.measures = normalizeMeasures(pattern.measures);
+  if (pattern.texts) pattern.texts = normalizePatternTexts(pattern.texts);
   normalizeBlocks(pattern, getBlockDefinition, setFor);
 }
 
@@ -1055,6 +1072,12 @@ export class PatternEditor {
   /** Ruler tool state — rulers are document data on `pattern.rulers`. */
   private selectedRulerId: string | null = null;
   private hoverRulerId: string | null = null;
+  /** The note in hand — document data on `pattern.texts`. */
+  private selectedTextId: string | null = null;
+  /** The note being typed into: its box is a live contenteditable while set. */
+  private textEditingId: string | null = null;
+  /** When the note in hand was last pressed, for the double-press that types. */
+  private lastTextPress = 0;
   private rulerBtn!: HTMLButtonElement;
   private cutBtn!: HTMLButtonElement;
   private settingsMenuOpen: SettingsMenuKey | null = null;
@@ -2297,6 +2320,19 @@ export class PatternEditor {
         this.hoverEdge = null;
         this.redraw();
       }
+      // Typing into a note, or the note in hand: Escape lets that go first.
+      if (this.textEditingId) {
+        this.commitTextEditing();
+        e.preventDefault();
+        return;
+      }
+      if (this.selectedTextId) {
+        this.selectedTextId = null;
+        this.cbs.onTextSelectionChange?.();
+        this.redraw();
+        e.preventDefault();
+        return;
+      }
       // An orbit tether, or the point waiting for one, is the nearest thing in
       // hand: Escape lets it go before it steps further back.
       if (this.orbit || this.orbitPickId) {
@@ -2461,6 +2497,9 @@ export class PatternEditor {
     this.selectedRulerId = null;
     this.hoverRulerId = null;
     this.selectedBlockId = null;
+    // A note being typed into belongs to the document that was on screen.
+    this.selectedTextId = null;
+    this.textEditingId = null;
     // A pick in flight belongs to the document that was on screen.
     this.clearJoin();
     this.clearBridge();
@@ -3696,6 +3735,9 @@ export class PatternEditor {
       // all the chrome.
       const mark = detail === 'preview' ? 'silhouette' : 'outline';
       for (const piece of this.pattern.pieces) this.drawPiece(piece, mark);
+      // Notes are the draughtsperson's own words on the sheet: they stay at every
+      // level, scaled down with the work.
+      this.drawTexts();
       // The rectangle is the gesture in hand, not chrome: dropping it would make
       // a drag on a zoomed-out canvas look like it did nothing at all. It is the
       // only preview that can reach here, since every other tool draws at `full`.
@@ -3741,6 +3783,10 @@ export class PatternEditor {
     // Measurements ride over the rulers: both are references, and the readout is
     // the smaller thing you need to be able to grab.
     this.drawMeasures();
+
+    // Notes sit above the pattern and its drafting marks, below the points and
+    // handles you grab.
+    this.drawTexts();
 
     if (this.tool === 'move') {
       this.drawOrbitGuide();
@@ -8024,6 +8070,311 @@ export class PatternEditor {
    * while the scale itself stays behind it.
    */
   /**
+   * Notes written over the pattern.
+   *
+   * Each one is a `<foreignObject>` in the pattern's own user units — a
+   * centimetre is a user unit here — so the box pans, scales and clips with the
+   * work without the editor having to lay anything out. The note being typed into
+   * is a live contenteditable; every other is plain text that only the box takes
+   * the pointer for.
+   */
+  private drawTexts(): void {
+    const notes = this.texts();
+    if (notes.length === 0) return;
+    for (const note of notes) {
+      const editing = this.textEditingId === note.id;
+      const picked = this.selectedTextId === note.id;
+      const box = document.createElementNS(SVG_NS, 'foreignObject');
+      box.setAttribute('x', String(note.x));
+      box.setAttribute('y', String(note.y));
+      box.setAttribute('width', String(note.widthCm));
+      box.setAttribute('height', String(note.heightCm));
+      box.setAttribute('class', `pattern-text${picked ? ' is-selected' : ''}`);
+      box.dataset.textId = note.id;
+
+      const content = document.createElement('div');
+      content.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
+      content.className = 'pattern-text-content';
+      const css = patternTextCss(note);
+      for (const [property, value] of Object.entries(css)) {
+        content.style.setProperty(property, value);
+      }
+      content.textContent = note.text;
+      content.dataset.textId = note.id;
+      content.contentEditable = editing ? 'true' : 'false';
+      content.spellcheck = false;
+      box.appendChild(content);
+      this.svg.appendChild(box);
+
+      if (editing) this.bindTextEditing(note, content);
+      if (picked) this.drawTextChrome(note);
+    }
+  }
+
+  /** The box and handle that say which note is in hand. */
+  private drawTextChrome(note: PatternText): void {
+    const rect = document.createElementNS(SVG_NS, 'rect');
+    rect.setAttribute('x', String(note.x));
+    rect.setAttribute('y', String(note.y));
+    rect.setAttribute('width', String(note.widthCm));
+    rect.setAttribute('height', String(note.heightCm));
+    rect.setAttribute('class', 'pattern-text-frame');
+    rect.setAttribute('stroke-width', String(this.px(1.25)));
+    rect.setAttribute('stroke-dasharray', `${this.px(4)} ${this.px(3)}`);
+    rect.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(rect);
+
+    const handle = this.px(4);
+    const grip = document.createElementNS(SVG_NS, 'rect');
+    grip.setAttribute('x', String(note.x + note.widthCm - handle));
+    grip.setAttribute('y', String(note.y + note.heightCm - handle));
+    grip.setAttribute('width', String(handle));
+    grip.setAttribute('height', String(handle));
+    grip.setAttribute('class', 'pattern-text-grip');
+    grip.setAttribute('stroke-width', String(this.px(1.2)));
+    grip.dataset.textGrip = note.id;
+    this.svg.appendChild(grip);
+  }
+
+  /** Typing into a note: write what is typed back, without redrawing under the caret. */
+  private bindTextEditing(note: PatternText, content: HTMLElement): void {
+    content.addEventListener('input', () => {
+      note.text = content.innerText.replace(/\r/g, '');
+      this.sizeTextToContent(note, content);
+      this.notifyReferenceChange();
+    });
+    content.addEventListener('blur', () => {
+      // A redraw takes the element out from under the caret, and the browser
+      // fires one last blur as it goes: that is not a second commit, so only the
+      // box that is still in the drawing is allowed to write back.
+      if (!this.svg.contains(content)) return;
+      this.finishTextEditing(note, content);
+    });
+    content.addEventListener('keydown', (e) => {
+      // Enter breaks the line — the box wraps on its own — but
+      // Escape is how you leave the note, the way it is anywhere else here.
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.finishTextEditing(note, content);
+      }
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        this.finishTextEditing(note, content);
+      }
+    });
+  }
+
+  /** Take what is in the box, put the caret away, and repaint. */
+  private finishTextEditing(note: PatternText, content: HTMLElement): void {
+    if (this.textEditingId !== note.id) return;
+    note.text = content.isConnected ? content.innerText.replace(/\r/g, '') : note.text;
+    this.textEditingId = null;
+    this.notifyReferenceChange();
+    this.redraw();
+  }
+
+  /**
+   * The same, from a press elsewhere: the note being typed into is only known by
+   * id here, so the live box is looked up first.
+   */
+  private commitTextEditing(): void {
+    const note = this.findText(this.textEditingId);
+    if (!note) {
+      this.textEditingId = null;
+      return;
+    }
+    const content = this.svg.querySelector<HTMLElement>(
+      `.pattern-text-content[data-text-id="${note.id}"]`
+    );
+    if (content) this.finishTextEditing(note, content);
+    else this.textEditingId = null;
+  }
+
+  /**
+   * An auto-width note is as wide as what was typed, and every note is as tall as
+   * its lines: the box is re-measured from the live element rather than guessed
+   * at, so the frame and the grip sit where the text ends.
+   */
+  private sizeTextToContent(note: PatternText, content: HTMLElement): void {
+    const box = content.parentElement as SVGForeignObjectElement | null;
+    if (!box) return;
+    // A few units of slack, or the last glyph is clipped by its own box.
+    const pad = this.px(1);
+    const height = content.scrollHeight + pad;
+    if (height > 0) note.heightCm = height;
+    if (note.autoWidth) {
+      const width = content.scrollWidth + pad;
+      if (width > 0) note.widthCm = width;
+    }
+    box.setAttribute('width', String(note.widthCm));
+    box.setAttribute('height', String(note.heightCm));
+  }
+
+  /** The note under the pointer, if any. */
+  private textAt(p: Vec2): PatternText | null {
+    const notes = this.texts();
+    for (let i = notes.length - 1; i >= 0; i--) {
+      const note = notes[i];
+      if (
+        p.x >= note.x &&
+        p.x <= note.x + note.widthCm &&
+        p.y >= note.y &&
+        p.y <= note.y + note.heightCm
+      ) {
+        return note;
+      }
+    }
+    return null;
+  }
+
+  private texts(): PatternText[] {
+    return this.pattern.texts ?? [];
+  }
+
+  private findText(id: string | null): PatternText | null {
+    if (!id) return null;
+    return this.texts().find((note) => note.id === id) ?? null;
+  }
+
+  private setTextSelection(id: string | null): void {
+    if (this.selectedTextId === id) return;
+    this.selectedTextId = id;
+    this.cbs.onTextSelectionChange?.();
+    this.redraw();
+  }
+
+  /** The note in hand, for the host's style bar. */
+  getSelectedText(): PatternText | null {
+    return this.findText(this.selectedTextId);
+  }
+
+  /**
+   * Add a note for the box the Add tool drew, pick it, and put the caret in it:
+   * a new note is empty until it says something, so selecting it alone would not
+   * make that obvious.
+   */
+  createText(box: ObjectBoxPlace, defaults: { fontSizeCm?: number; paddingCm?: number } = {}): PatternText | null {
+    const note = createPatternText(box, defaults);
+    this.markBeforeChange();
+    this.ensureTexts().push(note);
+    this.clearSelection();
+    this.selectedTextId = note.id;
+    this.textEditingId = note.id;
+    this.notifyReferenceChange();
+    this.endHistoryGesture();
+    this.cbs.onTextSelectionChange?.();
+    this.redraw();
+    // The press that asked for the note is still finishing its own repaint — take
+    // the caret once the drawing has settled, or it lands in a box about to be
+    // replaced.
+    requestAnimationFrame(() => this.focusTextContent(note.id));
+    return note;
+  }
+
+  /**
+   * Put the caret in a note, with its text picked so typing replaces it.
+   *
+   * A box that has just been drawn has no layout yet, and a box with no layout
+   * cannot take focus — so the attempt is repeated over the next few frames
+   * rather than being lost on the first one.
+   */
+  private focusTextContent(id: string, attempt = 0): void {
+    const content = this.svg.querySelector<HTMLElement>(
+      `.pattern-text-content[data-text-id="${id}"]`
+    );
+    if (!content) return;
+    content.focus({ preventScroll: true });
+    if (document.activeElement !== content) {
+      if (attempt < 5) requestAnimationFrame(() => this.focusTextContent(id, attempt + 1));
+      return;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(content);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }
+
+  private ensureTexts(): PatternText[] {
+    if (!this.pattern.texts) this.pattern.texts = [];
+    return this.pattern.texts;
+  }
+
+  private deleteText(id: string): void {
+    const notes = this.ensureTexts();
+    const index = notes.findIndex((note) => note.id === id);
+    if (index < 0) return;
+    this.markBeforeChange();
+    notes.splice(index, 1);
+    if (this.selectedTextId === id) this.selectedTextId = null;
+    if (this.textEditingId === id) this.textEditingId = null;
+    this.notifyReferenceChange();
+    this.endHistoryGesture();
+    this.cbs.onTextSelectionChange?.();
+    this.redraw();
+  }
+
+  /**
+   * A change from the style bar. The host works in canvas units (the numbers it
+   * shows for a canvas text object), and hands the note's own centimetres over;
+   * either way the box re-measures itself and the ribbon stays in step.
+   */
+  updateSelectedText(patch: Partial<PatternText>): void {
+    const note = this.getSelectedText();
+    if (!note) return;
+    this.markBeforeChange();
+    Object.assign(note, patch);
+    this.notifyReferenceChange();
+    this.endHistoryGesture();
+    this.cbs.onTextSelectionChange?.();
+    this.redraw();
+  }
+
+  /**
+   * A press on a note. Picking it puts it in hand; a second press in the same
+   * breath types into it; dragging carries it. The grip at its corner resizes it.
+   */
+  private onTextDown(e: PointerEvent, p: Vec2, noteId: string): void {
+    const note = this.findText(noteId);
+    if (!note) return;
+    const grip = (e.target as Element | null)?.closest?.('[data-text-grip]');
+    if (grip) {
+      this.clearSelection();
+      this.selectedTextId = note.id;
+      this.markBeforeChange();
+      this.drag = { type: 'resizeText', id: note.id, start: p, width: note.widthCm, height: note.heightCm };
+      this.svg.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      this.redraw();
+      return;
+    }
+    // Already typing here? Then the press is the browser's — it places the caret.
+    if (this.textEditingId === note.id) return;
+
+    const now = performance.now();
+    const again = now - this.lastTextPress < 450;
+    this.lastTextPress = now;
+    this.clearSelection();
+    this.selectedTextId = note.id;
+    this.cbs.onTextSelectionChange?.();
+    if (again) {
+      this.textEditingId = note.id;
+      this.markBeforeChange();
+      this.redraw();
+      this.focusTextContent(note.id);
+      this.endHistoryGesture();
+      e.preventDefault();
+      return;
+    }
+    this.markBeforeChange();
+    this.drag = { type: 'moveText', id: note.id, start: p, origin: { x: note.x, y: note.y } };
+    this.svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    this.redraw();
+  }
+
+  /**
    * The measurements, drawn like the dimensions on a technical drawing: a line
    * with a tick at each end for a span, the edge itself lit up when the item is
    * an edge, and a value that can be parked anywhere.
@@ -8644,6 +8995,11 @@ export class PatternEditor {
   }
 
   private handleDeleteKey(): void {
+    // A note in hand is the nearest thing the key can be about.
+    if (this.selectedTextId && this.selectedIds.size === 0) {
+      this.deleteText(this.selectedTextId);
+      return;
+    }
     // A selected ruler is the only thing "in hand" — delete that first.
     if (this.selectedRulerId && this.selectedIds.size === 0) {
       this.deleteSelectedRuler();
@@ -8727,6 +9083,27 @@ export class PatternEditor {
     if (altPiece) {
       this.beginAltDuplicate(e, p, altPiece);
       return;
+    }
+
+    // A note takes its own presses: it is an object written over the pattern, not
+    // a piece of it, and it is picked, carried and typed into in place.
+    if (this.tool === 'move') {
+      const noteEl = (e.target as Element | null)?.closest?.('[data-text-id]') as
+        | HTMLElement
+        | null;
+      const noteId = noteEl?.dataset.textId ?? null;
+      if (noteId) {
+        this.onTextDown(e, p, noteId);
+        return;
+      }
+      // Any other press is done with the note being typed into, and lets go of
+      // the one in hand: a note is picked one at a time, like a ruler.
+      if (this.textEditingId) this.commitTextEditing();
+      if (this.selectedTextId) {
+        this.selectedTextId = null;
+        this.cbs.onTextSelectionChange?.();
+        this.redraw();
+      }
     }
 
     // The Ruler tool has two hands: the rule laid over the work, and the measure
@@ -11214,6 +11591,30 @@ export class PatternEditor {
       return;
     }
 
+    if (this.drag.type === 'moveText') {
+      const d = this.drag;
+      const note = this.findText(d.id);
+      if (!note) return;
+      note.x = d.origin.x + (p.x - d.start.x);
+      note.y = d.origin.y + (p.y - d.start.y);
+      this.redraw();
+      this.notifyReferenceChange();
+      return;
+    }
+
+    if (this.drag.type === 'resizeText') {
+      const d = this.drag;
+      const note = this.findText(d.id);
+      if (!note) return;
+      note.widthCm = Math.max(PATTERN_TEXT_MIN_CM, d.width + (p.x - d.start.x));
+      note.heightCm = Math.max(PATTERN_TEXT_MIN_CM, d.height + (p.y - d.start.y));
+      // Dragged out by hand, the box has a width of its own from now on.
+      note.autoWidth = false;
+      this.redraw();
+      this.notifyReferenceChange();
+      return;
+    }
+
     if (this.drag.type === 'rulerTurn') {
       const d = this.drag;
       const ruler = this.rulers().find((r) => r.id === d.id);
@@ -11484,6 +11885,14 @@ export class PatternEditor {
 
     if (finished.type === 'extrudeEdge') {
       this.finishExtrudeEdge(finished);
+      this.redraw();
+      return;
+    }
+
+    if (finished.type === 'moveText' || finished.type === 'resizeText') {
+      // The drag has been writing to the note all along; letting go only closes
+      // the undo step.
+      this.endHistoryGesture();
       this.redraw();
       return;
     }

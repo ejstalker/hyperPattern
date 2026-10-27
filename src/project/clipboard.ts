@@ -439,6 +439,11 @@ function remapPatternDom(
   copy.seams = copy.seams
     .map((seam) => remapSeam(seam, pieceIds, pointIds, newId))
     .filter((seam): seam is SeamBinding => seam !== null);
+  if (copy.texts) {
+    // Notes are the pattern's own writing: a copy carries them, re-minted so the
+    // clipboard and the document never share an id.
+    copy.texts = copy.texts.map((note) => ({ ...note, id: newId('txt') }));
+  }
   if (copy.blocks) {
     copy.blocks = copy.blocks.map((instance) => ({
       ...instance,
