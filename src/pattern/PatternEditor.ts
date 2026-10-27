@@ -8711,17 +8711,12 @@ export class PatternEditor {
       return;
     }
 
-    // The ruler tool owns every gesture: empty canvas starts a new ruler, and a
-    // ruler under the cursor can be picked up, slid or turned.
+    // The Ruler tool has two hands: the rule laid over the work, and the measure
+    // line that reads off what it crosses. Which one a press gets is the mode —
+    // the mode test has to come first, since both are the same tool underneath.
     if (this.tool === 'ruler') {
-      this.onRulerDown(e, p);
-      return;
-    }
-
-    // Measure builds a measurement out of what you pick, or draws one across the
-    // work; its readout is the handle for moving it.
-    if (this.isRuler('measure')) {
-      this.onMeasureDown(e, p);
+      if (this.rulerMode === 'measure') this.onMeasureDown(e, p);
+      else this.onRulerDown(e, p);
       return;
     }
 
