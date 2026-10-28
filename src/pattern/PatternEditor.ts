@@ -7,6 +7,7 @@ import type {
   MeasureAnchor,
   MeasureItem,
   PatternDocument,
+  PatternImage,
   PatternMeasure,
   PatternPiece,
   PatternRuler,
@@ -23,6 +24,13 @@ import {
   normalizePatternTexts,
   patternTextCss,
 } from './patternText';
+import {
+  PATTERN_IMAGE_MIN_CM,
+  createPatternImage,
+  normalizePatternImages,
+  patternImageAspect,
+  patternImageSize,
+} from './patternImage';
 import type { MeasurementLibrary, MeasurementSet } from '../project/measurements';
 import { MEASUREMENT_FIELDS } from '../project/measurements';
 import {
@@ -376,14 +384,15 @@ export type PatternTool =
  * What the Add tool is drawing: a pen stroke, a rectangle, a circle, or a box for
  * an object the host owns.
  *
- * Text and sections are not pattern work — they are canvas objects — so the editor
- * only draws the box and asks the host to place it. Those modes are offered only
- * where a host says it can take one.
+ * Text, sections and images are not pattern work — a note and a section are canvas
+ * objects the host places, and an image is a reference the host has to load — so
+ * the editor only draws the box and asks the host to fill it. Those modes are
+ * offered only where a host says it can take one.
  */
-export type AddMode = 'pen' | 'rect' | 'circle' | 'text' | 'section';
+export type AddMode = 'pen' | 'rect' | 'circle' | 'text' | 'section' | 'image';
 
-/** What an object box is for: the kinds of canvas object a host can place. */
-export type PlacedObjectKind = 'text' | 'section';
+/** What an object box is for: the kinds of object a host can place. */
+export type PlacedObjectKind = 'text' | 'section' | 'image';
 
 /** A box dragged out on the canvas: pattern centimetres, `w`/`h` 0 for a click. */
 export type ObjectBoxPlace = { x: number; y: number; w: number; h: number };
@@ -510,6 +519,11 @@ const ADD_MODES: ReadonlyArray<{ mode: AddMode; label: string; tip: string }> = 
   { mode: 'rect', label: 'Rectangle', tip: 'Add · Rectangle — drag out a rectangular panel' },
   { mode: 'circle', label: 'Circle', tip: 'Add · Circle — drag out a round piece' },
   { mode: 'text', label: 'Text', tip: 'Add · Text — click for a text object, or drag out its box' },
+  {
+    mode: 'image',
+    label: 'Image',
+    tip: 'Add · Image — drag out the box for a reference image, or click to place one at its own size',
+  },
   {
     mode: 'section',
     label: 'Section',
@@ -649,6 +663,10 @@ type DragKind =
   | { type: 'moveText'; id: string; start: Vec2; origin: Vec2 }
   /** A note's corner being dragged out, in pattern centimetres. */
   | { type: 'resizeText'; id: string; start: Vec2; width: number; height: number }
+  /** A reference image being carried, in pattern centimetres. */
+  | { type: 'moveImage'; id: string; start: Vec2; origin: Vec2 }
+  /** An image's corner being dragged out, in pattern centimetres. */
+  | { type: 'resizeImage'; id: string; start: Vec2; width: number; height: number; aspect: number }
   | { type: 'rulerMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'rulerTurn'; id: string; which: 'a' | 'b' }
   /** A measure line being drawn across the pattern. */
@@ -806,6 +824,7 @@ function normalizePattern(
   if (pattern.rulers) pattern.rulers = normalizeRulers(pattern.rulers);
   if (pattern.measures) pattern.measures = normalizeMeasures(pattern.measures);
   if (pattern.texts) pattern.texts = normalizePatternTexts(pattern.texts);
+  if (pattern.images) pattern.images = normalizePatternImages(pattern.images);
   normalizeBlocks(pattern, getBlockDefinition, setFor);
 }
 
@@ -1078,6 +1097,8 @@ export class PatternEditor {
   private textEditingId: string | null = null;
   /** When the note in hand was last pressed, for the double-press that types. */
   private lastTextPress = 0;
+  /** The image in hand — document data on `pattern.images`. */
+  private selectedImageId: string | null = null;
   private rulerBtn!: HTMLButtonElement;
   private cutBtn!: HTMLButtonElement;
   private settingsMenuOpen: SettingsMenuKey | null = null;
@@ -2333,6 +2354,12 @@ export class PatternEditor {
         e.preventDefault();
         return;
       }
+      // Then an image in hand, which is picked and let go the same way.
+      if (this.selectedImageId) {
+        this.setImageSelection(null);
+        e.preventDefault();
+        return;
+      }
       // An orbit tether, or the point waiting for one, is the nearest thing in
       // hand: Escape lets it go before it steps further back.
       if (this.orbit || this.orbitPickId) {
@@ -2500,6 +2527,8 @@ export class PatternEditor {
     // A note being typed into belongs to the document that was on screen.
     this.selectedTextId = null;
     this.textEditingId = null;
+    // So does an image in hand.
+    this.selectedImageId = null;
     // A pick in flight belongs to the document that was on screen.
     this.clearJoin();
     this.clearBridge();
@@ -2932,12 +2961,13 @@ export class PatternEditor {
    * Whether the Add tool can place this kind of object here.
    *
    * The shapes and the pen are the pattern's own work and are always on offer.
-   * Text and sections are objects the *host* owns, so they need a host that can
-   * take one — and one that can take *this* one, since a pattern opened full
-   * screen has somewhere to put a note but nowhere to put a section.
+   * Text, images and sections are objects the *host* owns, so they need a host
+   * that can take one — and one that can take *this* one, since a pattern opened
+   * full screen has somewhere to put a note or a reference image but nowhere to
+   * put a section.
    */
   private canPlaceObject(mode: AddMode): boolean {
-    if (mode !== 'text' && mode !== 'section') return true;
+    if (mode !== 'text' && mode !== 'section' && mode !== 'image') return true;
     if (!this.cbs.onAddObject) return false;
     return this.cbs.canPlaceObject ? this.cbs.canPlaceObject(mode) : true;
   }
@@ -3723,6 +3753,11 @@ export class PatternEditor {
     if (frame.childNodes.length > 0) this.svg.appendChild(frame);
     this.applyContainerClip();
 
+    // A reference image is what the work is drafted *over*, so it goes down
+    // before the pieces: the linework stays on top of the picture, which is the
+    // whole reason to bring one onto the sheet.
+    this.drawImages();
+
     // Zoomed far enough out that every mark would be a smear of chrome over the
     // work, there is less to draw — see `PatternDetail`. A frame on the canvas
     // hands the pointer over as well, so a press there moves the container.
@@ -3787,6 +3822,11 @@ export class PatternEditor {
     // Notes sit above the pattern and its drafting marks, below the points and
     // handles you grab.
     this.drawTexts();
+
+    // The box round an image in hand rides above the work rather than with the
+    // picture: the picture is drawn under the pieces (see the top of `redraw`),
+    // and a grip buried under a panel is a grip nobody can take hold of.
+    this.drawSelectedImageChrome();
 
     if (this.tool === 'move') {
       this.drawOrbitGuide();
@@ -8070,6 +8110,68 @@ export class PatternEditor {
    * while the scale itself stays behind it.
    */
   /**
+   * Reference images placed in the pattern.
+   *
+   * Each one is an `<image>` in the pattern's own user units, so it pans, scales
+   * and clips with the work exactly like the pieces do and rides inside the
+   * container's frame on the board. It is drawn under the pieces (see `redraw`):
+   * a reference is something to draft over, not something to cover the drafting.
+   */
+  private drawImages(): void {
+    const images = this.images();
+    if (images.length === 0) return;
+    for (const image of images) {
+      const picked = this.selectedImageId === image.id;
+      const el = document.createElementNS(SVG_NS, 'image');
+      el.setAttribute('x', String(image.x));
+      el.setAttribute('y', String(image.y));
+      el.setAttribute('width', String(image.widthCm));
+      el.setAttribute('height', String(image.heightCm));
+      // The box is the truth: it is what the grip drags, and what the frame on
+      // the board has to agree with.
+      el.setAttribute('preserveAspectRatio', 'none');
+      el.setAttribute('class', `pattern-image${picked ? ' is-selected' : ''}`);
+      el.setAttribute('href', image.src);
+      el.dataset.imageId = image.id;
+      this.svg.appendChild(el);
+    }
+  }
+
+  /** The box round the image in hand — drawn over the work (see `redraw`). */
+  private drawSelectedImageChrome(): void {
+    const image = this.findImage(this.selectedImageId);
+    if (image) this.drawImageChrome(image);
+  }
+
+  /** The box and handle that say which image is in hand. */
+  private drawImageChrome(image: PatternImage): void {
+    const rect = document.createElementNS(SVG_NS, 'rect');
+    rect.setAttribute('x', String(image.x));
+    rect.setAttribute('y', String(image.y));
+    rect.setAttribute('width', String(image.widthCm));
+    rect.setAttribute('height', String(image.heightCm));
+    rect.setAttribute('class', 'pattern-image-frame');
+    rect.setAttribute('stroke-width', String(this.px(1.25)));
+    rect.setAttribute('stroke-dasharray', `${this.px(4)} ${this.px(3)}`);
+    rect.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(rect);
+
+    const handle = this.px(4);
+    const grip = document.createElementNS(SVG_NS, 'rect');
+    grip.setAttribute('x', String(image.x + image.widthCm - handle));
+    grip.setAttribute('y', String(image.y + image.heightCm - handle));
+    grip.setAttribute('width', String(handle));
+    grip.setAttribute('height', String(handle));
+    grip.setAttribute('class', 'pattern-image-grip');
+    grip.setAttribute('stroke-width', String(this.px(1.2)));
+    grip.dataset.imageGrip = image.id;
+    // The grip is part of the image's own chrome, so a press on it has to find
+    // the image it belongs to — that is what turns the press into a resize.
+    grip.dataset.imageId = image.id;
+    this.svg.appendChild(grip);
+  }
+
+  /**
    * Notes written over the pattern.
    *
    * Each one is a `<foreignObject>` in the pattern's own user units — a
@@ -8133,6 +8235,10 @@ export class PatternEditor {
     grip.setAttribute('class', 'pattern-text-grip');
     grip.setAttribute('stroke-width', String(this.px(1.2)));
     grip.dataset.textGrip = note.id;
+    // The grip is part of the note's own chrome, so a press on it has to find the
+    // note it belongs to — that is what turns the press into a resize rather than
+    // a press on bare canvas.
+    grip.dataset.textId = note.id;
     this.svg.appendChild(grip);
   }
 
@@ -8341,6 +8447,7 @@ export class PatternEditor {
     const grip = (e.target as Element | null)?.closest?.('[data-text-grip]');
     if (grip) {
       this.clearSelection();
+      this.dropObjectSelections(note.id);
       this.selectedTextId = note.id;
       this.markBeforeChange();
       this.drag = { type: 'resizeText', id: note.id, start: p, width: note.widthCm, height: note.heightCm };
@@ -8356,6 +8463,7 @@ export class PatternEditor {
     const again = now - this.lastTextPress < 450;
     this.lastTextPress = now;
     this.clearSelection();
+    this.dropObjectSelections(note.id);
     this.selectedTextId = note.id;
     this.cbs.onTextSelectionChange?.();
     if (again) {
@@ -8369,6 +8477,124 @@ export class PatternEditor {
     }
     this.markBeforeChange();
     this.drag = { type: 'moveText', id: note.id, start: p, origin: { x: note.x, y: note.y } };
+    this.svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    this.redraw();
+  }
+
+  // ── Reference images ─────────────────────────────────────────────────────
+  //
+  // An image belongs to the pattern the way a note does: its box is in the
+  // pattern's centimetres, it is drawn under the pieces, and it is picked,
+  // carried and resized in place with the Move tool.
+
+  private images(): PatternImage[] {
+    return this.pattern.images ?? [];
+  }
+
+  private ensureImages(): PatternImage[] {
+    if (!this.pattern.images) this.pattern.images = [];
+    return this.pattern.images;
+  }
+
+  private findImage(id: string | null): PatternImage | null {
+    if (!id) return null;
+    return this.images().find((image) => image.id === id) ?? null;
+  }
+
+  /** The image in hand, for a host that wants to say what it is. */
+  getSelectedImage(): PatternImage | null {
+    return this.findImage(this.selectedImageId);
+  }
+
+  /** Only one object is in hand at a time: a note and an image never both are. */
+  private setImageSelection(id: string | null): void {
+    if (this.selectedImageId === id) return;
+    this.selectedImageId = id;
+    this.redraw();
+  }
+
+  /**
+   * Put an image on the sheet for the box the Add tool drew — or at the point it
+   * clicked — and leave it in hand, ready to be carried into place.
+   *
+   * The picture itself is the host's to load: the editor is handed a source that
+   * the browser can draw, and knows nothing about files.
+   */
+  createImage(
+    box: ObjectBoxPlace,
+    source: { src: string; label?: string; naturalAspect?: number }
+  ): PatternImage | null {
+    if (!source?.src) return null;
+    const image = createPatternImage(box, source);
+    this.markBeforeChange();
+    this.ensureImages().push(image);
+    this.clearSelection();
+    this.dropObjectSelections(image.id);
+    this.selectedImageId = image.id;
+    this.notifyReferenceChange();
+    this.endHistoryGesture();
+    this.redraw();
+    return image;
+  }
+
+  /** A dropped or pasted image: placed where the pointer is, at a click's size. */
+  placeImageAtClient(
+    clientX: number,
+    clientY: number,
+    source: { src: string; label?: string; naturalAspect?: number }
+  ): PatternImage | null {
+    const p = this.svgPointFromClient(clientX, clientY);
+    return this.createImage({ x: p.x, y: p.y, w: 0, h: 0 }, source);
+  }
+
+  /** Let go of whatever object was in hand, except the one just picked. */
+  private dropObjectSelections(except: string | null): void {
+    if (this.selectedTextId && this.selectedTextId !== except) {
+      this.selectedTextId = null;
+      this.textEditingId = null;
+      this.cbs.onTextSelectionChange?.();
+    }
+    if (this.selectedImageId && this.selectedImageId !== except) this.selectedImageId = null;
+  }
+
+  private deleteImage(id: string): void {
+    const images = this.ensureImages();
+    const index = images.findIndex((image) => image.id === id);
+    if (index < 0) return;
+    this.markBeforeChange();
+    images.splice(index, 1);
+    if (this.selectedImageId === id) this.selectedImageId = null;
+    this.notifyReferenceChange();
+    this.endHistoryGesture();
+    this.redraw();
+  }
+
+  /**
+   * A press on an image: the grip at its corner resizes it, anything else picks
+   * it up and carries it. Shift holds its proportions, the way Shift does on the
+   * canvas.
+   */
+  private onImageDown(e: PointerEvent, p: Vec2, imageId: string): void {
+    const image = this.findImage(imageId);
+    if (!image) return;
+    this.clearSelection();
+    this.dropObjectSelections(image.id);
+    this.selectedImageId = image.id;
+    this.markBeforeChange();
+    const grip = (e.target as Element | null)?.closest?.('[data-image-grip]');
+    if (grip) {
+      this.drag = {
+        type: 'resizeImage',
+        id: image.id,
+        start: p,
+        width: image.widthCm,
+        height: image.heightCm,
+        aspect: patternImageAspect(image),
+      };
+    } else {
+      this.drag = { type: 'moveImage', id: image.id, start: p, origin: { x: image.x, y: image.y } };
+    }
     this.svg.setPointerCapture(e.pointerId);
     e.preventDefault();
     this.redraw();
@@ -9000,6 +9226,11 @@ export class PatternEditor {
       this.deleteText(this.selectedTextId);
       return;
     }
+    // An image in hand, likewise.
+    if (this.selectedImageId && this.selectedIds.size === 0) {
+      this.deleteImage(this.selectedImageId);
+      return;
+    }
     // A selected ruler is the only thing "in hand" — delete that first.
     if (this.selectedRulerId && this.selectedIds.size === 0) {
       this.deleteSelectedRuler();
@@ -9096,6 +9327,17 @@ export class PatternEditor {
         this.onTextDown(e, p, noteId);
         return;
       }
+      // An image takes its own presses the same way — but only where the
+      // picture shows: it is drawn under the pieces, so pressing through a panel
+      // still picks the panel.
+      const imageEl = (e.target as Element | null)?.closest?.('[data-image-id]') as
+        | HTMLElement
+        | null;
+      const imageId = imageEl?.dataset.imageId ?? null;
+      if (imageId) {
+        this.onImageDown(e, p, imageId);
+        return;
+      }
       // Any other press is done with the note being typed into, and lets go of
       // the one in hand: a note is picked one at a time, like a ruler.
       if (this.textEditingId) this.commitTextEditing();
@@ -9104,6 +9346,7 @@ export class PatternEditor {
         this.cbs.onTextSelectionChange?.();
         this.redraw();
       }
+      if (this.selectedImageId) this.setImageSelection(null);
     }
 
     // The Ruler tool has two hands: the rule laid over the work, and the measure
@@ -9273,9 +9516,9 @@ export class PatternEditor {
         this.onPenDown(e, p);
         return;
       }
-      // Text and sections are canvas objects rather than pattern work: drag out
-      // the box and hand it over, and let the host take the tool back afterwards.
-      if (this.addMode === 'text' || this.addMode === 'section') {
+      // Text, images and sections are not pattern work: drag out the box and hand
+      // it over, and let the host take the tool back afterwards.
+      if (this.addMode === 'text' || this.addMode === 'section' || this.addMode === 'image') {
         this.drag = { type: 'objectBox', kind: this.addMode, start: p, current: p };
         this.svg.setPointerCapture(e.pointerId);
         e.preventDefault();
@@ -11615,6 +11858,34 @@ export class PatternEditor {
       return;
     }
 
+    if (this.drag.type === 'moveImage') {
+      const d = this.drag;
+      const image = this.findImage(d.id);
+      if (!image) return;
+      image.x = d.origin.x + (p.x - d.start.x);
+      image.y = d.origin.y + (p.y - d.start.y);
+      this.redraw();
+      this.notifyReferenceChange();
+      return;
+    }
+
+    if (this.drag.type === 'resizeImage') {
+      const d = this.drag;
+      const image = this.findImage(d.id);
+      if (!image) return;
+      const size = patternImageSize(image, {
+        width: d.width + (p.x - d.start.x),
+        height: d.height + (p.y - d.start.y),
+        aspect: d.aspect,
+        lockAspect: e.shiftKey,
+      });
+      image.widthCm = Math.max(PATTERN_IMAGE_MIN_CM, size.widthCm);
+      image.heightCm = Math.max(PATTERN_IMAGE_MIN_CM, size.heightCm);
+      this.redraw();
+      this.notifyReferenceChange();
+      return;
+    }
+
     if (this.drag.type === 'rulerTurn') {
       const d = this.drag;
       const ruler = this.rulers().find((r) => r.id === d.id);
@@ -11892,6 +12163,13 @@ export class PatternEditor {
     if (finished.type === 'moveText' || finished.type === 'resizeText') {
       // The drag has been writing to the note all along; letting go only closes
       // the undo step.
+      this.endHistoryGesture();
+      this.redraw();
+      return;
+    }
+
+    if (finished.type === 'moveImage' || finished.type === 'resizeImage') {
+      // The same for an image: the drag wrote to it, letting go closes the step.
       this.endHistoryGesture();
       this.redraw();
       return;

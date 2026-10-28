@@ -92,6 +92,39 @@ describe('clipboard: nodes', () => {
     expect(pattern.pieces[0].points[0].id).not.toBe(source.patterns[1].pieces[0].points[0].id);
   });
 
+  it('carries a pattern’s notes and reference images, each with a fresh id', () => {
+    const source = createSmallFixture();
+    const pattern = source.patterns[1];
+    pattern.texts = [
+      { id: 'txt_a', x: 1, y: 2, widthCm: 10, heightCm: 4, text: 'note', fontSizeCm: 2 },
+    ];
+    pattern.images = [
+      { id: 'img_a', x: 3, y: 4, widthCm: 20, heightCm: 10, src: 'data:image/png;base64,AAAA' },
+    ];
+    const frame = withFrame(source, pattern.id);
+    const clip = copyNodes(source, [frame.id])!;
+
+    const target = createSmallFixture();
+    target.patterns = [];
+    target.meshes = [];
+    target.transforms = [];
+    target.sims = [];
+    target.canvas.nodes = [];
+    const ids = pasteNodes(target, clip!, {
+      x: 0,
+      y: 0,
+      zIndex: 1,
+      newId: (prefix) => uid(prefix),
+    });
+    const pasted = target.canvas.nodes.find((node) => node.id === ids[0])!;
+    if (pasted.type !== 'patternFrame') throw new Error('expected a container');
+    const copy = target.patterns.find((p) => p.id === pasted.patternId)!;
+    expect(copy.texts?.[0]).toMatchObject({ text: 'note', x: 1, y: 2 });
+    expect(copy.texts?.[0].id).not.toBe('txt_a');
+    expect(copy.images?.[0]).toMatchObject({ src: 'data:image/png;base64,AAAA', widthCm: 20 });
+    expect(copy.images?.[0].id).not.toBe('img_a');
+  });
+
   it('gives a pasted container its own pattern, and a pasted drape the document’s', () => {
     const project = createSmallFixture();
     const frame = withFrame(project, project.patterns[1].id);

@@ -185,6 +185,12 @@ export type PatternDocument = {
    */
   texts?: PatternText[];
   /**
+   * Reference images drafted over (see `PatternImage`). Like the notes, they
+   * belong to the pattern: an image placed inside a container travels with the
+   * frame, scales with it, and never reaches a mesh.
+   */
+  images?: PatternImage[];
+  /**
    * Parametric block instances (see `BlockInstance`). Their pieces live in
    * `pieces` like any other, so meshing, seams and export need no special case.
    */
@@ -245,6 +251,31 @@ export type PatternText = {
    * what is typed into it. A dragged-out box has a width of its own and wraps.
    */
   autoWidth?: boolean;
+};
+
+/**
+ * A reference image placed in a pattern.
+ *
+ * Held in the pattern's own centimetres, so it belongs to the pattern rather than
+ * to the canvas: on the board it rides inside the container's frame, moving and
+ * scaling with the work, and it is drawn *under* the pieces so a photograph or a
+ * diagram can be drafted over. Nothing about it is pattern geometry — it is never
+ * sewn and never reaches a mesh.
+ */
+export type PatternImage = {
+  id: string;
+  /** Top-left of the box, in pattern centimetres. */
+  x: number;
+  y: number;
+  /** The box the picture fills, in centimetres. */
+  widthCm: number;
+  heightCm: number;
+  /** Data URL, blob URL, or other browser-loadable source. */
+  src: string;
+  /** What the image is, for the host to name in messages. */
+  label?: string;
+  /** Natural pixel aspect (width/height), for the resize that keeps proportions. */
+  naturalAspect?: number;
 };
 
 /**

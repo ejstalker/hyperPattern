@@ -444,6 +444,10 @@ function remapPatternDom(
     // clipboard and the document never share an id.
     copy.texts = copy.texts.map((note) => ({ ...note, id: newId('txt') }));
   }
+  if (copy.images) {
+    // Reference images travel with the pattern for the same reason.
+    copy.images = copy.images.map((image) => ({ ...image, id: newId('img') }));
+  }
   if (copy.blocks) {
     copy.blocks = copy.blocks.map((instance) => ({
       ...instance,

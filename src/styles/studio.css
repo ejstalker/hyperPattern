@@ -2740,6 +2740,29 @@ optgroup {
   cursor: nwse-resize;
 }
 
+/* A reference image drafted over: the picture is the sheet's, so it takes the
+   pointer, and the box in hand is drawn like a note's. */
+.pattern-image {
+  cursor: default;
+}
+
+.pattern-image.is-selected {
+  cursor: move;
+}
+
+.pattern-image-frame {
+  fill: none;
+  stroke: var(--accent-2);
+  opacity: 0.8;
+  pointer-events: none;
+}
+
+.pattern-image-grip {
+  fill: var(--bg-elev);
+  stroke: var(--accent-2);
+  cursor: nwse-resize;
+}
+
 .pattern-measure-ref-point.is-hot {
   stroke: #ffc65c;
   fill: rgba(255, 198, 92, 0.35);
@@ -4758,6 +4781,12 @@ optgroup {
 
 .text-style-bar[hidden] {
   display: none !important;
+}
+
+/* A note belongs to a pattern, and a pattern can be open full screen. The bar is
+   the same bar there, so it has to rise over the overlay it is being used in. */
+body:has(.node-fullscreen-overlay) .text-style-bar {
+  z-index: 4100;
 }
 
 .text-style-field {

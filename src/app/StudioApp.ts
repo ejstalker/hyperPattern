@@ -486,6 +486,11 @@ export class StudioApp {
   /** Guard so mirrored 2D ↔ 3D selection does not feed back on itself. */
   private splitSelectionSyncing = false;
   private imageFileInput: HTMLInputElement;
+  /**
+   * Where an image asked for from a container goes: the pattern the Add tool drew
+   * a box in, and the box itself. Cleared as soon as the picker answers.
+   */
+  private pendingPatternImage: { nodeId: string; box: ObjectBoxPlace } | null = null;
   /** The Figma-style bar that styles the text object in hand, bottom centre. */
   private textBar: HTMLElement;
   private resizeShiftKey = false;
@@ -1044,8 +1049,66 @@ export class StudioApp {
       const files = Array.from(this.imageFileInput.files ?? []);
       this.imageFileInput.value = '';
       if (files.length === 0) return;
+      // A container asked for this one: it belongs to the pattern, not the board.
+      const pending = this.pendingPatternImage;
+      this.pendingPatternImage = null;
+      if (pending) {
+        void this.placeImagesInPattern(pending, files);
+        return;
+      }
       void this.addImagesFromFiles(files);
     });
+  }
+
+  /**
+   * The files picked for a container become reference images in that pattern,
+   * fitted to the box the Add tool drew — or, for a click rather than a drag,
+   * placed at their own size centred on the point that was clicked.
+   *
+   * A second file steps down the sheet instead of landing on the first, the way
+   * two dropped files do on the canvas.
+   */
+  private async placeImagesInPattern(
+    pending: { nodeId: string; box: ObjectBoxPlace },
+    files: File[]
+  ): Promise<void> {
+    const editor = this.editors.get(pending.nodeId);
+    if (!editor) return;
+    const images = files.filter((file) => file.type.startsWith('image/'));
+    if (images.length === 0) return;
+    // The placement was the tool's whole job, so hand the pattern back in Move —
+    // a reference is carried into place from there.
+    editor.setTool('move');
+    let box = { ...pending.box };
+    let placed = 0;
+    for (const file of images) {
+      try {
+        const src = await this.readFileAsDataUrl(file);
+        if (!src) continue;
+        const { w, h } = await this.loadImageNaturalSize(src).catch(() => ({ w: 4, h: 3 }));
+        const label = file.name?.replace(/\.[^.]+$/, '') || 'Reference';
+        editor.createImage(box, { src, label, naturalAspect: w > 0 && h > 0 ? w / h : undefined });
+        placed += 1;
+        box = { ...box, y: box.y + (box.h > 0.5 ? box.h : 30) };
+      } catch {
+        this.setStatus(`Could not load image “${file.name}”`);
+      }
+    }
+    if (placed === 0) return;
+    this.setStatus(this.placedImageStatus(editor, placed));
+  }
+
+  /**
+   * What to say when an image lands. Poured in *under* the pieces — which is
+   * where a reference belongs when it is being drafted over — the picture is easy
+   * to lose behind an opaque panel, so the message names the way to see it.
+   */
+  private placedImageStatus(editor: PatternEditor, placed: number): string {
+    const noun = placed === 1 ? 'Image' : `${placed} images`;
+    const covered = (editor.getPattern()?.pieces.length ?? 0) > 0;
+    return covered
+      ? `${noun} placed under the pattern — X-ray shows it through the work`
+      : `${noun} placed in the pattern`;
   }
 
   private bindImagePasteAndDrop(): void {
@@ -1056,6 +1119,13 @@ export class StudioApp {
       const files = this.imageFilesFromClipboard(e.clipboardData);
       if (files.length === 0) return;
       e.preventDefault();
+      // A container open on screen is where the picture was meant to go; pasted
+      // onto the board it is a canvas reference like any other.
+      const editor = this.expandedContainerEditor();
+      if (editor) {
+        void this.placeImagesInEditor(editor, files, null);
+        return;
+      }
       void this.addImagesFromFiles(files);
     });
 
@@ -1073,6 +1143,10 @@ export class StudioApp {
     wrap.addEventListener('drop', (e) => {
       wrap.classList.remove('is-image-drop');
       if (!this.dataTransferHasImage(e.dataTransfer)) return;
+      // Dropped on a container's work, the picture belongs to that pattern — the
+      // document handler below takes it. Dropped anywhere else on the board it is
+      // a canvas reference.
+      if (this.containerEditorAtClient(e.clientX, e.clientY)) return;
       e.preventDefault();
       const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/'));
       if (files.length === 0) return;
@@ -1081,6 +1155,86 @@ export class StudioApp {
         clientY: e.clientY,
       });
     });
+
+    // A container opened full screen sits outside the board, so it takes its own
+    // drop: the picture lands in the pattern under the pointer.
+    document.addEventListener('dragover', (e) => {
+      if (!this.dataTransferHasImage(e.dataTransfer)) return;
+      const editor = this.containerEditorAtClient(e.clientX, e.clientY);
+      if (!editor) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    });
+    document.addEventListener('drop', (e) => {
+      if (!this.dataTransferHasImage(e.dataTransfer)) return;
+      const editor = this.containerEditorAtClient(e.clientX, e.clientY);
+      if (!editor) return;
+      e.preventDefault();
+      const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/'));
+      if (files.length === 0) return;
+      void this.placeImagesInEditor(editor, files, { clientX: e.clientX, clientY: e.clientY });
+    });
+  }
+
+  /**
+   * The pattern editor of a container open full screen, if one is open — where a
+   * pasted picture is meant to go.
+   */
+  private expandedContainerEditor(): PatternEditor | null {
+    if (!this.expandedNodeId) return null;
+    return this.editors.get(this.expandedNodeId) ?? null;
+  }
+
+  /** The container editor a screen point is over. The page's own is not one. */
+  private containerEditorAtClient(clientX: number, clientY: number): PatternEditor | null {
+    const el = document.elementFromPoint(clientX, clientY)?.closest?.('.pattern-editor') as
+      | HTMLElement
+      | null;
+    const key = el ? this.editorKeyForElement(el) : null;
+    if (!key || key === 'canvas') return null;
+    return this.editors.get(key) ?? null;
+  }
+
+  /**
+   * Dropped or pasted pictures, written into a pattern as reference images: at
+   * the point they were dropped on, or for a paste, at a size and place you can
+   * carry from.
+   */
+  private async placeImagesInEditor(
+    editor: PatternEditor,
+    files: File[],
+    at: { clientX: number; clientY: number } | null
+  ): Promise<void> {
+    const images = files.filter((file) => file.type.startsWith('image/'));
+    if (images.length === 0) return;
+    const target = at ?? this.editorCentreClient(editor);
+    let placed = 0;
+    let offset = 0;
+    for (const file of images) {
+      try {
+        const src = await this.readFileAsDataUrl(file);
+        if (!src) continue;
+        const { w, h } = await this.loadImageNaturalSize(src).catch(() => ({ w: 4, h: 3 }));
+        const label = file.name?.replace(/\.[^.]+$/, '') || 'Reference';
+        editor.placeImageAtClient(target.clientX + offset, target.clientY + offset, {
+          src,
+          label,
+          naturalAspect: w > 0 && h > 0 ? w / h : undefined,
+        });
+        placed += 1;
+        offset += 16;
+      } catch {
+        this.setStatus(`Could not load image “${file.name}”`);
+      }
+    }
+    if (placed === 0) return;
+    this.setStatus(this.placedImageStatus(editor, placed));
+  }
+
+  /** The middle of a pattern sheet on screen, for a paste with no pointer in it. */
+  private editorCentreClient(editor: PatternEditor): { clientX: number; clientY: number } {
+    const rect = editor.element().getBoundingClientRect();
+    return { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
   }
 
   private isTextEditingTarget(target: EventTarget | null): boolean {
@@ -2528,6 +2682,9 @@ export class StudioApp {
       onMarqueeRect: (box, info) => this.mirrorPageMarquee(box, info),
       onAddObject: (kind, box) =>
         kind === 'section' ? this.addSection(box) : this.addTextObject(box),
+      // On the page an image is a canvas reference, placed from the board's own
+      // Add menu — not something the pattern sheet holds.
+      canPlaceObject: (kind) => kind !== 'image',
       onPiecesDropped: (drop) => this.handOverDroppedPieces(null, drop),
     });
     this.canvasSurface = host;
@@ -2654,12 +2811,25 @@ export class StudioApp {
    *
    * A section is not offered here at all (see `canPlaceObject`): it groups things
    * on the canvas, and the canvas is not what a container full of work is.
+   *
+   * An image is the other way round from a note: the editor can draw one but
+   * cannot open a file, so the host remembers where the box was, asks for a
+   * picture, and writes it into the pattern when one is picked.
    */
   private addObjectToContainer(
     frame: PatternFrameNode,
     kind: PlacedObjectKind,
     box: ObjectBoxPlace
   ): void {
+    if (kind === 'image') {
+      const editor = this.editors.get(frame.id);
+      if (!editor) return;
+      this.pendingPatternImage = { nodeId: frame.id, box };
+      // The picker writes into the same input paste and drop use. Cancelled, the
+      // Add tool stays in hand so the box can be drawn again.
+      this.imageFileInput.click();
+      return;
+    }
     if (kind !== 'text') return;
     const editor = this.editors.get(frame.id);
     if (!editor) return;
@@ -4494,9 +4664,10 @@ export class StudioApp {
         // Dragged out past the frame, the work belongs to the canvas again.
         onPiecesDropped: (drop) => this.handOverDroppedPieces(node, drop),
         // A note is written into the pattern itself, so it rides inside the
-        // frame on the board. A section has nothing to group here.
+        // frame on the board. An image is the pattern's too, drawn under the
+        // work to draft over. A section has nothing to group here.
         onAddObject: (kind, box) => this.addObjectToContainer(node, kind, box),
-        canPlaceObject: (kind) => kind === 'text',
+        canPlaceObject: (kind) => kind === 'text' || kind === 'image',
         onTextSelectionChange: () => this.syncTextStyleBar(),
       });
       this.editors.set(node.id, editor);
@@ -7615,6 +7786,10 @@ export class StudioApp {
       // them, each one re-minted so the two documents never share an id.
       texts: src.texts?.length
         ? src.texts.map((note) => ({ ...structuredClone(note), id: uid('txt') }))
+        : undefined,
+      // Reference images belong to the pattern in the same way.
+      images: src.images?.length
+        ? src.images.map((image) => ({ ...structuredClone(image), id: uid('img') }))
         : undefined,
       blocks: blocks.length > 0 ? blocks : undefined,
       pieceSuccessors: src.pieceSuccessors ? structuredClone(src.pieceSuccessors) : undefined,
