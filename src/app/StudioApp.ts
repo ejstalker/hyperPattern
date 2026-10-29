@@ -276,6 +276,15 @@ import type { AvatarBody } from '../mesh/AvatarBody';
 
 const WORLD_TO_CM = 10;
 
+/**
+ * The stages between the pattern and the drape, as icons for the 3D chip.
+ *
+ * Remesh is a panel cut into triangles; transform is the three-axis gizmo a 3D
+ * stage is turned and placed with.
+ */
+const MESH_STAGE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="2.3" y="2.3" width="11.4" height="11.4" rx="1.3"/><path d="M2.3 2.3 13.7 13.7"/><path d="M13.7 2.3 2.3 13.7"/></svg>`;
+const TRANSFORM_STAGE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7.1V2.5"/><path d="M6.4 4.1 8 2.5l1.6 1.6"/><path d="M8.9 8h4.6"/><path d="M11.9 6.4 13.5 8l-1.6 1.6"/><path d="M6.9 9.1 3.5 12.5"/><circle cx="8" cy="8" r="1.15"/></svg>`;
+
 type WireSource = {
   kind: 'pattern' | 'mesh' | 'transform';
   id: string;
@@ -3684,32 +3693,13 @@ export class StudioApp {
 
     if (title) title.hidden = true;
     tabs.hidden = false;
-    // Stroked chips joined by arrows so the chain reads as a run of sequential
-    // modifiers: pattern → remesh → transform → drape. A remesh whose pattern
-    // moved on since the last build is flagged red.
-    tabs.innerHTML = pipeline
-      .map((n, i) => {
-        const stale =
-          n.type === 'meshFrame' &&
-          !this.project.meshes.find((m) => m.id === n.meshId)?.geometry;
-        const chip = `<button type="button" role="tab" class="node-fullscreen-tab${
-          n.id === activeId ? ' is-active' : ''
-        }${stale ? ' is-stale' : ''}" data-fs-node="${n.id}" aria-selected="${
-          n.id === activeId
-        }"${stale ? ' title="Pattern changed since this mesh was built — it rebuilds when you open a later stage"' : ''}>${this.escapeHtml(
-          this.pipelineTabLabel(n)
-        )}</button>`;
-        if (i >= pipeline.length - 1) return chip;
-        const link = this.splitLinkHtml();
-        // The 2D + 3D split toggle sits where the run leaves the pattern, before
-        // the remesh.
-        const splitBtn =
-          i === 0 && pipeline[0].type === 'patternFrame'
-            ? this.splitToggleButtonHtml() + link
-            : link;
-        return chip + splitBtn;
-      })
-      .join('');
+    // Two chips rather than one per node: the run is two things you look at — the
+    // pattern, and the drape it becomes — so the stages in between hang off the
+    // 3D chip as icons. A remesh whose pattern moved on since the last build is
+    // flagged red.
+    tabs.innerHTML = this.fullscreenChipsHtml(pipeline, [activeId], 'data-fs-node', {
+      split: false,
+    });
 
     tabs.querySelectorAll('button[data-fs-node]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
@@ -3727,10 +3717,95 @@ export class StudioApp {
 
     // The strip scrolls horizontally; make sure the stage you are looking at is
     // the one in view (and that a stage is never clipped out of reach).
-    tabs.querySelector('.node-fullscreen-tab.is-active')?.scrollIntoView({
-      block: 'nearest',
-      inline: 'nearest',
-    });
+    tabs
+      .querySelector('.node-fullscreen-tab.is-active, .node-fullscreen-chip.is-active')
+      ?.scrollIntoView({
+        block: 'nearest',
+        inline: 'nearest',
+      });
+  }
+
+  /**
+   * The chips across the top of a fullscreen stage.
+   *
+   * A run of pattern → remesh → transform → drape is really two things you look
+   * at, so it is drawn as two chips: **2D** for the pattern, and **3D** for the
+   * drape it becomes, with the stages that build the drape (remesh, transform)
+   * hung off the 3D chip behind a rule. A chip's face goes where it says; a stage
+   * icon goes to that stage.
+   */
+  private fullscreenChipsHtml(
+    pipeline: CanvasNode[],
+    activeIds: readonly string[],
+    attr: 'data-fs-node' | 'data-split-node',
+    opts: { split: boolean }
+  ): string {
+    const active = new Set(activeIds);
+    const pattern = pipeline.find((n) => n.type === 'patternFrame') ?? null;
+    const stages = this.splitStageNodes(pipeline);
+    // The face of the 3D chip is the view the run is working towards: the drape
+    // when there is one, and the furthest stage when there is not.
+    const face =
+      [...stages].reverse().find((n) => n.type === 'simViewport') ??
+      stages[stages.length - 1] ??
+      null;
+    const icons = stages
+      .filter((n) => n.type === 'meshFrame' || n.type === 'transform3d')
+      .map((stage) => this.fullscreenStageIconHtml(stage, active.has(stage.id), attr))
+      .join('');
+
+    const chips: string[] = [];
+    if (pattern) {
+      const on = active.has(pattern.id);
+      chips.push(
+        `<button type="button" role="tab" class="node-fullscreen-tab is-2d${
+          on ? ' is-active' : ''
+        }${opts.split ? ' is-fixed' : ''}" ${attr}="${pattern.id}" aria-selected="${on}" title="${this.escapeHtml(
+          this.pipelineTabLabel(pattern)
+        )}">2D</button>`
+      );
+      // The 2D + 3D split toggle sits between the two dimensions it splits.
+      if (opts.split || stages.length > 0) chips.push(this.splitToggleButtonHtml());
+    }
+
+    if (face) {
+      const on = stages.some((n) => active.has(n.id));
+      const label = this.escapeHtml(this.pipelineTabLabel(face));
+      chips.push(
+        `<span class="node-fullscreen-chip is-3d${on ? ' is-active' : ''}">` +
+          `<button type="button" role="tab" class="node-fullscreen-chip-face" ${attr}="${
+            face.id
+          }" aria-selected="${on}" title="${label}">3D</button>` +
+          (icons
+            ? `<span class="node-fullscreen-chip-sep" aria-hidden="true"></span>${icons}`
+            : '') +
+          `</span>`
+      );
+    }
+    return chips.join('');
+  }
+
+  /** One stage of the run, as an icon inside the 3D chip. */
+  private fullscreenStageIconHtml(
+    stage: CanvasNode,
+    active: boolean,
+    attr: 'data-fs-node' | 'data-split-node'
+  ): string {
+    const stale =
+      stage.type === 'meshFrame' &&
+      !this.project.meshes.find((m) => m.id === stage.meshId)?.geometry;
+    const label = this.pipelineTabLabel(stage);
+    const tip = stale
+      ? `${label} — the pattern changed since this mesh was built; it rebuilds when you open a later stage`
+      : label;
+    const icon = stage.type === 'meshFrame' ? MESH_STAGE_ICON : TRANSFORM_STAGE_ICON;
+    return `<button type="button" class="node-fullscreen-stage${
+      active ? ' is-active' : ''
+    }${stale ? ' is-stale' : ''}" ${attr}="${
+      stage.id
+    }" title="${this.escapeHtml(tip)}" aria-label="${this.escapeHtml(
+      label
+    )}" aria-pressed="${active}">${icon}</button>`;
   }
 
   private clearFullscreenTabs(el: HTMLElement): void {
@@ -4024,25 +4099,12 @@ export class StudioApp {
     if (title) title.hidden = true;
     tabs.hidden = false;
     const pipeline = this.splitPipeline();
-    tabs.innerHTML = pipeline
-      .map((n, i) => {
-        const isStage = this.splitStageNodes([n]).length > 0;
-        const active = isStage && n.id === split.stageNodeId;
-        const stale =
-          n.type === 'meshFrame' &&
-          !this.project.meshes.find((m) => m.id === n.meshId)?.geometry;
-        const chip = `<button type="button" role="tab" class="node-fullscreen-tab${
-          active ? ' is-active' : ''
-        }${stale ? ' is-stale' : ''}${isStage ? '' : ' is-fixed'}" data-split-node="${n.id}" aria-selected="${active}">${this.escapeHtml(
-          this.pipelineTabLabel(n)
-        )}</button>`;
-        if (i >= pipeline.length - 1) return chip;
-        if (n.type === 'patternFrame') {
-          return chip + this.splitToggleButtonHtml() + this.splitLinkHtml();
-        }
-        return chip + this.splitLinkHtml();
-      })
-      .join('');
+    tabs.innerHTML = this.fullscreenChipsHtml(
+      pipeline,
+      [split.stageNodeId],
+      'data-split-node',
+      { split: true }
+    );
     tabs.querySelectorAll('button[data-split-node]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
         e.preventDefault();
@@ -4059,10 +4121,6 @@ export class StudioApp {
       e.stopPropagation();
       this.exitSplitView();
     });
-  }
-
-  private splitLinkHtml(): string {
-    return `<span class="node-fullscreen-link" aria-hidden="true"><svg viewBox="0 0 26 10" width="26" height="10" fill="none"><path class="node-fullscreen-link-line" d="M0 5 H 17" /><path class="node-fullscreen-link-head" d="M16 2 L 21 5 L 16 8" /></svg></span>`;
   }
 
   private canvasNode(nodeId: string): CanvasNode | undefined {

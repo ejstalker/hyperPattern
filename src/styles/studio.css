@@ -6221,24 +6221,98 @@ body:has(.node-fullscreen-overlay) .text-style-bar {
   box-shadow: inset 0 0 0 1px #e07a63;
 }
 
-.node-fullscreen-link {
+/*
+ * The 3D chip: its face and the stages that build it in one pill, divided by a
+ * rule. The run is two things you look at — the pattern and the drape — so the
+ * chips say 2D and 3D, and the stages in between are icons rather than words.
+ */
+.node-fullscreen-chip {
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 3px;
+  background: #2f2b26;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--ink);
+}
+
+.node-fullscreen-chip:hover {
+  border-color: var(--accent);
+  background: #3a342c;
+}
+
+.node-fullscreen-chip.is-active {
+  background: #3a342c;
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.node-fullscreen-chip-face {
   display: inline-flex;
   align-items: center;
   flex: 0 0 auto;
-  padding: 0 1px;
-  pointer-events: none;
+  padding: 0 8px 0 9px;
+  background: none;
+  border: 0;
+  border-radius: 999px;
+  color: inherit;
+  font: 600 11px var(--font);
+  letter-spacing: 0.02em;
+  cursor: pointer;
 }
 
-.node-fullscreen-link-line {
-  stroke: var(--border);
-  stroke-width: 1.2;
+/* Top to bottom of the chip, so the icons read as belonging to the 3D face. */
+.node-fullscreen-chip-sep {
+  flex: 0 0 auto;
+  width: 1px;
+  align-self: stretch;
+  margin: 0 3px;
+  background: var(--border);
 }
 
-.node-fullscreen-link-head {
-  stroke: var(--muted);
-  stroke-width: 1.2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+.node-fullscreen-stage {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 21px;
+  padding: 0;
+  margin: 2px 1px;
+  background: none;
+  border: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.node-fullscreen-stage:hover {
+  color: var(--ink);
+  background: rgba(242, 235, 227, 0.1);
+}
+
+.node-fullscreen-stage.is-active {
+  color: inherit;
+  background: rgba(212, 160, 23, 0.28);
+}
+
+/* The pattern moved on since this mesh was built. */
+.node-fullscreen-stage.is-stale {
+  color: #f0a091;
+}
+
+.node-fullscreen-stage.is-stale.is-active {
+  color: #ffb9a6;
+  background: rgba(196, 92, 74, 0.3);
+}
+
+/* The 2D chip matches the 3D one in height, since they sit side by side. */
+.node-fullscreen-tab.is-2d {
+  height: 24px;
+  padding: 0 11px;
+  font: 600 11px var(--font);
+  letter-spacing: 0.02em;
 }
 
 /*
