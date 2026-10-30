@@ -38,6 +38,23 @@ export type SeamAllowance = {
   edges?: Record<string, number>;
 };
 
+/** One named value on a geometry element. */
+export type AttributeValue = number | number[] | string | boolean;
+
+/** The attributes on one element, by name. */
+export type AttributeBag = Record<string, AttributeValue>;
+
+/**
+ * A piece's attributes, by element: per point (point id), per edge (`from>to`, the
+ * key seams and seam allowances use) and the piece's own. See
+ * `src/project/attributes.ts` for the defaults and the readers/writers.
+ */
+export type PieceAttributes = {
+  point?: Record<string, AttributeBag>;
+  edge?: Record<string, AttributeBag>;
+  piece?: AttributeBag;
+};
+
 export type PatternPiece = {
   id: string;
   name: string;
@@ -55,6 +72,12 @@ export type PatternPiece = {
   holes?: BezierPoint[][];
   grainline?: { from: Vec2; to: Vec2 };
   seamAllowance?: SeamAllowance;
+  /**
+   * Geometry attributes (see `src/project/attributes.ts`): named values on the
+   * piece, its points and its edges. Held here so a document that never runs a
+   * modifier carries none of them.
+   */
+  attributes?: PieceAttributes;
 };
 
 /**
@@ -279,18 +302,14 @@ export type PatternImage = {
 };
 
 /**
- * One entry in a container's modifier stack. Deliberately opaque for now — the
- * stack exists in the data model so containers can be designed around it, and
- * the operations themselves are still to come.
+ * One node of a container's modifier stack — a 2D SOP.
+ *
+ * The stack is the pattern's geometry network: cooking it (see
+ * `src/pattern/modifiers/engine.ts`) turns the pattern's own pieces into the
+ * geometry the drape, the mesh and the 2D view see. Kept as a type alias here so
+ * the document model names it without the model depending on the engine.
  */
-export type PatternModifier = {
-  id: string;
-  /** Operation name, e.g. `offset-edges`, `pleat`. */
-  type: string;
-  enabled?: boolean;
-  /** Operation parameters, owned by whichever operation `type` names. */
-  params?: Record<string, unknown>;
-};
+export type PatternModifier = import('../pattern/modifiers/types').ModifierNode;
 
 /**
  * How a measurement is scaled before the ease is added.

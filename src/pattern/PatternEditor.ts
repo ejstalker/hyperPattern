@@ -24,6 +24,7 @@ import {
   normalizePatternTexts,
   patternTextCss,
 } from './patternText';
+import { cookPattern } from './modifiers/engine';
 import {
   PATTERN_IMAGE_MIN_CM,
   createPatternImage,
@@ -31,6 +32,8 @@ import {
   patternImageAspect,
   patternImageSize,
 } from './patternImage';
+import { normalizePieceAttributes } from '../project/attributes';
+import { normalizeModifiers } from './modifiers/types';
 import type { MeasurementLibrary, MeasurementSet } from '../project/measurements';
 import { MEASUREMENT_FIELDS } from '../project/measurements';
 import {
@@ -240,6 +243,12 @@ export type PatternEditorCallbacks = {
    * host reads `getSelectedText()` and puts its style bar up when there is one.
    */
   onTextSelectionChange?: () => void;
+  /**
+   * A press landed on a cooked document. The stack's output is a result, not a
+   * document, so the press does nothing — the host says how to get back to the
+   * editable copy.
+   */
+  onLockedPress?: () => void;
   onMarqueeRect?: (
     box: { x: number; y: number; w: number; h: number } | null,
     info: { additive: boolean; panels: boolean }
@@ -824,6 +833,10 @@ function normalizePattern(
   if (pattern.rulers) pattern.rulers = normalizeRulers(pattern.rulers);
   if (pattern.measures) pattern.measures = normalizeMeasures(pattern.measures);
   if (pattern.texts) pattern.texts = normalizePatternTexts(pattern.texts);
+  if (pattern.modifiers) pattern.modifiers = normalizeModifiers(pattern.modifiers);
+  // Attributes never affect geometry, but a document written elsewhere may hold
+  // numbers nobody can read; dropping them keeps every reader's job simple.
+  for (const piece of pattern.pieces) normalizePieceAttributes(piece);
   if (pattern.images) pattern.images = normalizePatternImages(pattern.images);
   normalizeBlocks(pattern, getBlockDefinition, setFor);
 }
@@ -1099,6 +1112,11 @@ export class PatternEditor {
   private lastTextPress = 0;
   /** The image in hand — document data on `pattern.images`. */
   private selectedImageId: string | null = null;
+  /**
+   * This editor is showing the cook of a modifier stack rather than the document
+   * itself: something to look at, not to draw on.
+   */
+  private readOnly = false;
   private rulerBtn!: HTMLButtonElement;
   private cutBtn!: HTMLButtonElement;
   private settingsMenuOpen: SettingsMenuKey | null = null;
@@ -2439,6 +2457,8 @@ export class PatternEditor {
       return;
     }
     if (this.handleToolKey(e)) return;
+    // A cooked document has nothing to delete: its contents are derived.
+    if (this.readOnly) return;
     if (e.key !== 'Delete' && e.key !== 'Backspace') return;
 
     const ae = document.activeElement as HTMLElement | null;
@@ -2510,8 +2530,12 @@ export class PatternEditor {
    * state of the user's, not of the document, so restoring history through here
    * must not move it.
    */
-  setPattern(pattern: PatternDocument, opts: { preserveView?: boolean } = {}): void {
+  setPattern(
+    pattern: PatternDocument,
+    opts: { preserveView?: boolean; cooked?: boolean } = {}
+  ): void {
     this.pattern = pattern;
+    this.setReadOnly(!!opts.cooked);
     // A new document replaces the pieces a simplify preview was drawn into, so
     // the session cannot be finished — drop it (undo lands here).
     this.simplify = null;
@@ -2521,6 +2545,9 @@ export class PatternEditor {
     // whose variables were clamped on the way in, must not keep displaying the
     // shape it was saved with.
     normalizePattern(pattern, (id) => this.measurementSet(id));
+    // A cooked document is the stack's output: cook it here, after the blocks
+    // have expanded, so what is drawn is what the mesh will be built from.
+    if (opts.cooked) this.cookIntoDocument();
     this.selectedRulerId = null;
     this.hoverRulerId = null;
     this.selectedBlockId = null;
@@ -2541,6 +2568,44 @@ export class PatternEditor {
     this.clearSelection();
     if (!opts.preserveView) this.fitView();
     this.redraw();
+  }
+
+  /**
+   * Show the cook of a modifier stack: the pattern's geometry as the stack leaves
+   * it, drawn read-only.
+   *
+   * The host hands over a *copy*, so cooking can never write into the document
+   * the stack reads — the pieces on screen are derived, and editing them would be
+   * editing a result.
+   */
+  setCookedPattern(copy: PatternDocument): void {
+    this.setPattern(copy, { preserveView: true, cooked: true });
+  }
+
+  /** Whether the editor is showing the stack's output rather than the document. */
+  isCooked(): boolean {
+    return this.readOnly;
+  }
+
+  private setReadOnly(on: boolean): void {
+    this.readOnly = on;
+    this.root.classList.toggle('is-readonly', on);
+  }
+
+  /**
+   * Replace the document's geometry with the cooked stack.
+   *
+   * Only ever called on a copy: the stack itself, the notes, the images and the
+   * rulers come along untouched — it is the pieces and the seams between them
+   * that a cook rewrites.
+   */
+  private cookIntoDocument(): void {
+    const result = cookPattern(this.pattern);
+    // Point and piece ids may have changed under a cut, so nothing can stay picked.
+    this.selectedPieceId = null;
+    this.clearSelection();
+    this.pattern.pieces = result.pieces;
+    this.pattern.seams = result.seams;
   }
 
   /** The visible pattern-space rectangle (the editor's zoom/pan), for history. */
@@ -9287,6 +9352,16 @@ export class PatternEditor {
     }
 
     if (e.button !== 0) return;
+
+    // The stack's output is something to look at, not to draw on: panning and
+    // zooming still work (above), every other press says how to get back to the
+    // editable copy.
+    if (this.readOnly) {
+      e.stopPropagation();
+      e.preventDefault();
+      this.cbs.onLockedPress?.();
+      return;
+    }
     e.stopPropagation();
 
     // A preview is not committed until Done: any fresh gesture on the canvas

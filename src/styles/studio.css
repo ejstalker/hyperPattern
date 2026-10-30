@@ -6072,7 +6072,8 @@ body:has(.node-fullscreen-overlay) .text-style-bar {
 }
 
 /* The pattern chip is informational in split mode — the 2D pane is always there. */
-.node-fullscreen-overlay.is-split .node-fullscreen-tab.is-fixed {
+.node-fullscreen-overlay.is-split .node-fullscreen-tab.is-fixed,
+.node-fullscreen-overlay.is-split .node-fullscreen-chip.is-fixed {
   opacity: 0.75;
 }
 
@@ -6292,6 +6293,15 @@ body:has(.node-fullscreen-overlay) .text-style-bar {
   background: rgba(242, 235, 227, 0.1);
 }
 
+/* A bypassed modifier is in the run but is not cooking. */
+.node-fullscreen-stage.is-off {
+  opacity: 0.4;
+}
+
+.node-fullscreen-stage.is-off:hover {
+  opacity: 0.75;
+}
+
 .node-fullscreen-stage.is-active {
   color: inherit;
   background: rgba(212, 160, 23, 0.28);
@@ -6307,12 +6317,9 @@ body:has(.node-fullscreen-overlay) .text-style-bar {
   background: rgba(196, 92, 74, 0.3);
 }
 
-/* The 2D chip matches the 3D one in height, since they sit side by side. */
-.node-fullscreen-tab.is-2d {
+/* The 2D chip is a chip like the 3D one — a face and a button in one pill. */
+.node-fullscreen-chip.is-2d {
   height: 24px;
-  padding: 0 11px;
-  font: 600 11px var(--font);
-  letter-spacing: 0.02em;
 }
 
 /*
@@ -7091,4 +7098,441 @@ textarea:focus-visible {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* ── Modifier panel ─────────────────────────────────────────────────────────
+ *
+ * The stack lives to the left of the canvas, inside the container's body: the
+ * grid grows a left-hand column when it is open, and the editor's own size
+ * observer redraws the work into what is left.
+ */
+.node-body.has-modifier-panel {
+  display: flex;
+  flex-direction: row;
+}
+
+.node-body.has-modifier-panel > .pattern-host {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pattern-modifier-panel {
+  flex: 0 0 292px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: #221f1b;
+  color: var(--ink);
+  font: 11px var(--font);
+  overflow: hidden;
+}
+
+.pattern-modifier-panel[hidden] {
+  display: none !important;
+}
+
+.modifier-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modifier-title {
+  font: 600 11px var(--font);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-right: auto;
+}
+
+.modifier-display {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.modifier-display button {
+  padding: 3px 8px;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font: 11px var(--font);
+  cursor: pointer;
+}
+
+.modifier-display button + button {
+  border-left: 1px solid var(--border);
+}
+
+.modifier-display button.is-active {
+  background: var(--accent);
+  color: #1b1815;
+  font-weight: 600;
+}
+
+.modifier-display button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.modifier-close {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.modifier-close:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.modifier-stack {
+  flex: 0 0 auto;
+  max-height: 40%;
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modifier-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 6px;
+  padding: 1px 2px;
+}
+
+.modifier-row:hover {
+  background: rgba(242, 235, 227, 0.05);
+}
+
+.modifier-row.is-selected {
+  background: rgba(196, 92, 38, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(196, 92, 38, 0.55);
+}
+
+.modifier-row.is-off .modifier-row-name {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+
+.modifier-row-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  padding: 3px 4px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: 11px var(--font);
+  cursor: pointer;
+}
+
+.modifier-eye,
+.modifier-mini {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.modifier-eye:hover,
+.modifier-mini:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.modifier-mini:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+.modifier-remove:hover {
+  color: #f0a091;
+}
+
+/* The parameters and the mask list scroll together, under the stack. */
+.modifier-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.modifier-params {
+  padding: 8px 10px 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  align-content: flex-start;
+}
+
+.modifier-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 calc(50% - 8px);
+  min-width: 96px;
+}
+
+.modifier-field.is-wide {
+  flex-basis: 100%;
+}
+
+.modifier-field > span {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.modifier-field input[type='text'],
+.modifier-field input[type='number'],
+.modifier-field select {
+  width: 100%;
+  min-width: 0;
+  padding: 3px 5px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #191714;
+  color: var(--ink);
+  font: 11px var(--mono);
+}
+
+.modifier-field.is-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  flex-basis: 100%;
+}
+
+.modifier-field.is-check > span {
+  font-size: 11px;
+  color: var(--ink);
+}
+
+/* ── Masks ─────────────────────────────────────────────────────────────── */
+
+.modifier-masks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.modifier-masks-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.modifier-masks-title {
+  font: 600 10px var(--font);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.modifier-masks-note {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.modifier-mask {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #1e1b18;
+}
+
+.modifier-mask select,
+.modifier-mask input[type='text'],
+.modifier-mask input[type='number'] {
+  min-width: 0;
+  padding: 3px 5px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #191714;
+  color: var(--ink);
+  font: 11px var(--mono);
+}
+
+.modifier-mask input[type='text'] {
+  flex: 1 1 70px;
+}
+
+.modifier-mask input[type='number'] {
+  width: 56px;
+}
+
+.modifier-mask-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.modifier-mask-falloff {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.modifier-mask-falloff input[type='number'] {
+  width: 44px;
+}
+
+/* The mask's own curve: full across the range, sloping over the fade. */
+.modifier-mask-profile {
+  flex: 0 0 auto;
+  margin-left: auto;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.modifier-mask-profile-area {
+  fill: var(--accent);
+  opacity: 0.22;
+}
+
+.modifier-mask-profile-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+}
+
+.modifier-add-mask {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 3px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: 11px var(--font);
+  cursor: pointer;
+}
+
+.modifier-add-mask:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.modifier-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.modifier-add {
+  padding: 4px 9px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: 11px var(--font);
+  cursor: pointer;
+}
+
+.modifier-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.modifier-readout {
+  margin-left: auto;
+  color: var(--muted);
+  font: 10px var(--mono);
+  white-space: nowrap;
+}
+
+.modifier-add-menu {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 10px 8px;
+}
+
+.modifier-add-menu[hidden] {
+  display: none !important;
+}
+
+.modifier-add-menu button {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #2b2723;
+  color: var(--ink);
+  font: 11px var(--font);
+  cursor: pointer;
+}
+
+.modifier-add-menu button:hover {
+  border-color: var(--accent);
+  background: #3a342c;
+}
+
+.modifier-empty {
+  margin: 4px 6px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.modifier-diagnostics:empty {
+  display: none;
+}
+
+.modifier-diagnostics {
+  padding: 0 10px 8px;
+}
+
+.modifier-diagnostic {
+  padding: 4px 6px;
+  margin-top: 4px;
+  border-radius: 5px;
+  background: rgba(196, 92, 74, 0.16);
+  color: #f0a091;
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+/* The editor is showing the stack's output: it is a result, not a document. */
+.pattern-editor.is-readonly .pattern-settings-menu {
+  display: none;
 }

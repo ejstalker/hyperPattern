@@ -135,6 +135,25 @@ import { buildBlenderPack, blenderPackFileName, type BlenderPackSeam } from '../
 import { SimExportControl } from './SimExportControl';
 import type { PlacementCommit } from '../sim/placementGesture';
 import { quatToEulerDeg, resolvePieceQuat } from '../sim/pieceTransforms';
+import {
+  cookPattern,
+  hasEnabledModifiers,
+  rangeDensity,
+  type CookDiagnostic,
+} from '../pattern/modifiers/engine';
+import {
+  MODIFIER_LABELS,
+  createModifierMask,
+  createModifierNode,
+  type ModifierMask,
+  type ModifierNode,
+  type ModifierNodeType,
+} from '../pattern/modifiers/types';
+import {
+  hasRestPose,
+  pieceRestPose,
+  setPieceRestPose,
+} from '../project/attributes';
 import { Environment, loadEnvironmentSettings } from '../render/environment';
 import { MaterialLibrary } from '../render/materials';
 import { Transform3dRuntime } from '../sim/Transform3dRuntime';
@@ -284,6 +303,292 @@ const WORLD_TO_CM = 10;
  */
 const MESH_STAGE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="2.3" y="2.3" width="11.4" height="11.4" rx="1.3"/><path d="M2.3 2.3 13.7 13.7"/><path d="M13.7 2.3 2.3 13.7"/></svg>`;
 const TRANSFORM_STAGE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7.1V2.5"/><path d="M6.4 4.1 8 2.5l1.6 1.6"/><path d="M8.9 8h4.6"/><path d="M11.9 6.4 13.5 8l-1.6 1.6"/><path d="M6.9 9.1 3.5 12.5"/><circle cx="8" cy="8" r="1.15"/></svg>`;
+
+/**
+ * One small mark per modifier kind, for the 2D chip.
+ *
+ * They are the same size and weight as the remesh and transform marks in the 3D
+ * chip, so a run of 2D nodes reads as one more row of stages: create, cut,
+ * subdivide, transform, displace, noise, attribute, anchor.
+ */
+const MODIFIER_ICONS: Record<ModifierNodeType, string> = {
+  create: `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="2.4" y="2.4" width="11.2" height="11.2" rx="1.4" opacity="0.45"/><path d="M8 5.6v4.8M5.6 8h4.8"/></svg>`,
+  cut: `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><rect x="2.6" y="3" width="10.8" height="10" rx="1.2" opacity="0.45"/><path d="M1.8 14.2 14.2 1.8" stroke-dasharray="2.6 2"/></svg>`,
+  subdivide: `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="2.4" y="2.4" width="11.2" height="11.2" rx="1.2"/><path d="M8 2.4v11.2M2.4 8h11.2"/></svg>`,
+  transform: TRANSFORM_STAGE_ICON,
+  displace: `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 13.6h11.2" opacity="0.55"/><path d="M8 12V3.6"/><path d="M5.5 6.1 8 3.6l2.5 2.5"/></svg>`,
+  noise: `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M1.8 8.6c1.5-4 3 4 4.5 0s3 4 4.5 0 1.6 4 3.4 0"/></svg>`,
+  attribute: `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M8.6 2.5h4.9v4.9l-6.1 6.1-4.9-4.9z"/><circle cx="10.9" cy="5.1" r="0.9"/></svg>`,
+  anchor: `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="4.2" r="1.9"/><path d="M8 6.2v7.3"/><path d="M4.9 9.3c0 2.7 1.4 4.2 3.1 4.2s3.1-1.5 3.1-4.2"/></svg>`,
+};
+
+
+/** Sliders-in-a-stack: the modifier panel's mark. */
+const MODIFIER_STACK_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 4.2h10M3 8h10M3 11.8h10"/><circle cx="6" cy="4.2" r="1.5" fill="var(--bg-elev)"/><circle cx="10.5" cy="8" r="1.5" fill="var(--bg-elev)"/><circle cx="5" cy="11.8" r="1.5" fill="var(--bg-elev)"/></svg>`;
+
+/** The order the Add menu offers the nodes in — the order a stack is built in. */
+const MODIFIER_ADD_ORDER: ModifierNodeType[] = [
+  'create',
+  'cut',
+  'subdivide',
+  'transform',
+  'displace',
+  'noise',
+  'attribute',
+  'anchor',
+];
+
+type ModifierField = {
+  /** Dotted path into the node, e.g. `translate.x` or `noise.frequency`. */
+  key: string;
+  label: string;
+  kind: 'number' | 'text' | 'select' | 'checkbox';
+  options?: Array<{ value: string; label: string }>;
+  step?: number;
+  min?: number;
+  max?: number;
+};
+
+function readPath(target: unknown, path: string): unknown {
+  let cursor: unknown = target;
+  for (const key of path.split('.')) {
+    if (cursor === null || typeof cursor !== 'object') return undefined;
+    cursor = (cursor as Record<string, unknown>)[key];
+  }
+  return cursor;
+}
+
+function writePath(target: unknown, path: string, value: unknown): void {
+  const keys = path.split('.');
+  let cursor = target as Record<string, unknown>;
+  for (let i = 0; i < keys.length - 1; i++) {
+    const next = cursor[keys[i]!];
+    if (!next || typeof next !== 'object') return;
+    cursor = next as Record<string, unknown>;
+  }
+  cursor[keys[keys.length - 1]!] = value;
+}
+
+/**
+ * The parameters a node shows, in the order a draughtsperson would reach for
+ * them. One schema for every node type keeps the panel a plain renderer — a new
+ * node only has to say what it has.
+ */
+function modifierFields(node: ModifierNode): ModifierField[] {
+  const num = (key: string, label: string, extra: Partial<ModifierField> = {}): ModifierField => ({
+    key,
+    label,
+    kind: 'number',
+    ...extra,
+  });
+  const vec = (key: string, label: string, step = 0.5): ModifierField[] => [
+    num(`${key}.x`, `${label} X`, { step }),
+    num(`${key}.y`, `${label} Y`, { step }),
+  ];
+  const noiseField = (key: string, label: string, extra: Partial<ModifierField> = {}) =>
+    num(`noise.${key}`, label, extra);
+
+  switch (node.type) {
+    case 'cut':
+      return [
+        // A cutter is an infinite line through two points — the same cut the Cut
+        // tool draws. The model also carries a polyline cutter; the panel offers
+        // the line until there is a way to pick its points here.
+        ...vec('a', 'Through'),
+        ...vec('b', 'Along'),
+        {
+          key: 'keep',
+          label: 'Keep',
+          kind: 'select',
+          options: [
+            { value: 'both', label: 'Both halves' },
+            { value: 'a', label: 'First half' },
+            { value: 'b', label: 'Second half' },
+          ],
+        },
+        { key: 'iterations', label: 'Repeat', kind: 'number', step: 1, min: 1, max: 24 },
+      ];
+    case 'transform':
+      return [
+        ...vec('translate', 'Move'),
+        num('rotateDeg', 'Turn °', { step: 5 }),
+        ...vec('scale', 'Scale', 0.1),
+        {
+          key: 'pivot',
+          label: 'Pivot',
+          kind: 'select',
+          options: [
+            { value: 'centroid', label: 'Centroid' },
+            { value: 'origin', label: 'Origin' },
+            { value: 'world', label: 'Point' },
+            { value: 'anchor', label: 'Anchor' },
+          ],
+        },
+        ...(node.pivot === 'world' ? vec('pivotAt', 'At') : []),
+        ...(node.pivot === 'anchor' ? [{ key: 'anchor', label: 'Anchor name', kind: 'text' as const }] : []),
+        { key: 'iterations', label: 'Repeat', kind: 'number', step: 1, min: 1, max: 24 },
+      ];
+    case 'subdivide':
+      return [
+        num('cuts', 'Cuts per edge', { step: 1, min: 0, max: 32 }),
+        num('every', 'Every Nth edge', { step: 1, min: 1, max: 32 }),
+        num('maxLengthCm', 'Max edge (cm)', { step: 1, min: 0 }),
+        { key: 'carryAttributes', label: 'Copy attributes', kind: 'checkbox' },
+        { key: 'iterations', label: 'Repeat', kind: 'number', step: 1, min: 1, max: 24 },
+      ];
+    case 'displace':
+      return [
+        {
+          key: 'direction',
+          label: 'Direction',
+          kind: 'select',
+          options: [
+            { value: 'normal', label: 'Outline normal' },
+            { value: 'angle', label: 'Fixed angle' },
+            { value: 'radial', label: 'From centre' },
+          ],
+        },
+        ...(node.direction === 'angle' ? [num('angleDeg', 'Angle °', { step: 5 })] : []),
+        num('amount', 'Amount (cm)', { step: 0.25 }),
+        { key: 'amountAttribute', label: 'Multiply by attribute', kind: 'text' },
+        { key: 'useNoise', label: 'Multiply by noise', kind: 'checkbox' },
+        ...(node.useNoise
+          ? [
+              noiseField('type', 'Noise', {
+                kind: 'select',
+                options: [
+                  { value: 'simplex', label: 'Simplex' },
+                  { value: 'perlin', label: 'Perlin' },
+                  { value: 'worley', label: 'Worley' },
+                ],
+              } as Partial<ModifierField>),
+              noiseField('frequency', 'Frequency', { step: 0.01, min: 0 }),
+              noiseField('amplitude', 'Noise amount', { step: 0.25 }),
+              noiseField('seed', 'Seed', { step: 1 }),
+            ]
+          : []),
+        { key: 'iterations', label: 'Repeat', kind: 'number', step: 1, min: 1, max: 24 },
+      ];
+    case 'noise':
+      return [
+        { key: 'attribute', label: 'Write to attribute', kind: 'text' },
+        noiseField('type', 'Noise', {
+          kind: 'select',
+          options: [
+            { value: 'simplex', label: 'Simplex' },
+            { value: 'perlin', label: 'Perlin' },
+            { value: 'worley', label: 'Worley' },
+          ],
+        } as Partial<ModifierField>),
+        noiseField('fractal', 'Fractal', {
+          kind: 'select',
+          options: [
+            { value: 'none', label: 'None' },
+            { value: 'fbm', label: 'fBm' },
+            { value: 'turbulence', label: 'Turbulence' },
+            { value: 'ridged', label: 'Ridged' },
+          ],
+        } as Partial<ModifierField>),
+        noiseField('octaves', 'Octaves', { step: 1, min: 1, max: 12 }),
+        noiseField('lacunarity', 'Lacunarity', { step: 0.1, min: 1 }),
+        noiseField('roughness', 'Roughness', { step: 0.05, min: 0, max: 1 }),
+        noiseField('frequency', 'Frequency', { step: 0.01, min: 0 }),
+        noiseField('amplitude', 'Amplitude', { step: 0.25 }),
+        noiseField('bias', 'Bias', { step: 0.25 }),
+        noiseField('seed', 'Seed', { step: 1 }),
+        { key: 'iterations', label: 'Repeat', kind: 'number', step: 1, min: 1, max: 24 },
+      ];
+    case 'create':
+      return [
+        {
+          key: 'shape',
+          label: 'Shape',
+          kind: 'select',
+          options: [
+            { value: 'rect', label: 'Rectangle' },
+            { value: 'circle', label: 'Circle' },
+            { value: 'polygon', label: 'Polygon' },
+            { value: 'line', label: 'Line' },
+          ],
+        },
+        { key: 'name', label: 'Name', kind: 'text' },
+        num('x', 'X', { step: 0.5 }),
+        num('y', 'Y', { step: 0.5 }),
+        ...(node.shape === 'circle' || node.shape === 'polygon'
+          ? [num('radius', 'Radius', { step: 0.5, min: 0 })]
+          : []),
+        ...(node.shape === 'polygon' ? [num('sides', 'Sides', { step: 1, min: 3, max: 128 })] : []),
+        ...(node.shape === 'line'
+          ? [num('width', 'Length X', { step: 0.5 }), num('height', 'Length Y', { step: 0.5 })]
+          : node.shape === 'rect'
+            ? [num('width', 'Width', { step: 0.5, min: 0 }), num('height', 'Height', { step: 0.5, min: 0 })]
+            : []),
+        ...(node.shape === 'rect' || node.shape === 'polygon'
+          ? [{ key: 'closed', label: 'Closed', kind: 'checkbox' as const }]
+          : []),
+        num('count', 'Copies', { step: 1, min: 1, max: 64 }),
+        num('spacing', 'Spacing', { step: 0.5 }),
+      ];
+    case 'attribute':
+      return [
+        { key: 'attribute', label: 'Attribute', kind: 'text' },
+        { key: 'value', label: 'Value', kind: 'text' },
+        { key: 'remove', label: 'Remove it instead', kind: 'checkbox' },
+        {
+          key: 'domain',
+          label: 'Run over',
+          kind: 'select',
+          options: [
+            { value: 'point', label: 'Points' },
+            { value: 'edge', label: 'Edges' },
+            { value: 'piece', label: 'Pieces' },
+          ],
+        },
+        { key: 'iterations', label: 'Repeat', kind: 'number', step: 1, min: 1, max: 24 },
+      ];
+    case 'anchor':
+      return [
+        { key: 'anchor', label: 'Anchor name', kind: 'text' },
+        ...vec('at', 'At'),
+        { key: 'move', label: 'Move the point here', kind: 'checkbox' },
+        num('maxDistanceCm', 'Within (cm, 0 = any)', { step: 1, min: 0 }),
+      ];
+  }
+}
+
+/** Escape a value going into an attribute, quotes included. */
+function escapeAttr(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Round a shown number so a field never reads 0.30000000000000004. */
+function round3(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+/** Move a node one place in the stack; the ends of the list are where they are. */
+function moveInStack(stack: ModifierNode[], id: string | undefined, delta: number): void {
+  if (!id) return;
+  const index = stack.findIndex((node) => node.id === id);
+  const next = index + delta;
+  if (index < 0 || next < 0 || next >= stack.length) return;
+  const [entry] = stack.splice(index, 1);
+  if (entry) stack.splice(next, 0, entry);
+}
+
+/** Fields whose value changes which other fields a node shows. */
+const STRUCTURAL_MODIFIER_FIELDS = new Set([
+  'mode',
+  'pivot',
+  'direction',
+  'shape',
+  'useNoise',
+  'domain',
+]);
 
 type WireSource = {
   kind: 'pattern' | 'mesh' | 'transform';
@@ -808,8 +1113,9 @@ export class StudioApp {
       if (node.type === 'patternFrame') {
         const pattern = this.project.patterns.find((p) => p.id === node.patternId);
         const editor = this.editors.get(node.id);
-        // Restoring history: keep the zoom/pan the user is looking through.
-        if (pattern && editor) editor.setPattern(pattern, { preserveView: true });
+        // Restoring history: keep the zoom/pan the user is looking through, and
+        // cook again — the stack or the geometry may be what changed.
+        if (pattern && editor) this.syncEditorDisplay(node.id);
         continue;
       }
       if (node.type === 'meshFrame') {
@@ -841,7 +1147,7 @@ export class StudioApp {
       rt.rebuildCloth(
         this.meshGeometryForTransform(transform.id),
         transform.pose,
-        transform.pieceTransforms,
+        this.pieceTransformsForRuntime(transform),
         this.patternForTransform(transform.id)
       );
     }
@@ -3378,7 +3684,7 @@ export class StudioApp {
     let mesh = chain.mesh;
     if (!mesh) {
       mesh = createMeshDocument(pattern.id, `Mesh ${this.project.meshes.length + 1}`);
-      remeshDocument(mesh, pattern);
+      this.remeshFromPattern(mesh, pattern);
       this.project.meshes.push(mesh);
       const node: MeshFrameNode = {
         type: 'meshFrame',
@@ -3396,7 +3702,7 @@ export class StudioApp {
     }
 
     mesh.patternId = pattern.id;
-    remeshDocument(mesh, pattern);
+    this.remeshFromPattern(mesh, pattern);
     for (const [nodeId, preview] of this.meshPreviews) {
       const node = this.project.canvas.nodes.find((c) => c.id === nodeId);
       if (node?.type === 'meshFrame' && node.meshId === mesh.id) preview.setMesh(mesh, pattern);
@@ -3714,6 +4020,23 @@ export class StudioApp {
       e.stopPropagation();
       this.toggleSplitView();
     });
+    tabs.querySelectorAll<HTMLElement>('[data-fs-modifiers]').forEach((button) => {
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const id = button.dataset.fsModifiers;
+        if (id) this.toggleModifierPanel(id);
+      });
+    });
+    tabs.querySelectorAll<HTMLElement>('[data-fs-modifier]').forEach((button) => {
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const container = button.dataset.fsModifierIn;
+        const modifier = button.dataset.fsModifier;
+        if (container && modifier) this.openModifierFromChip(container, modifier);
+      });
+    });
 
     // The strip scrolls horizontally; make sure the stage you are looking at is
     // the one in view (and that a stage is never clipped out of reach).
@@ -3757,12 +4080,24 @@ export class StudioApp {
     const chips: string[] = [];
     if (pattern) {
       const on = active.has(pattern.id);
+      const open = this.modifierPanelNodeId === pattern.id;
+      // The 2D chip carries the stack, the way the 3D chip carries its stages:
+      // a face that opens the pattern, and a button that opens its modifiers.
       chips.push(
-        `<button type="button" role="tab" class="node-fullscreen-tab is-2d${
-          on ? ' is-active' : ''
-        }${opts.split ? ' is-fixed' : ''}" ${attr}="${pattern.id}" aria-selected="${on}" title="${this.escapeHtml(
-          this.pipelineTabLabel(pattern)
-        )}">2D</button>`
+        `<span class="node-fullscreen-chip is-2d${on ? ' is-active' : ''}${
+          opts.split ? ' is-fixed' : ''
+        }">` +
+          `<button type="button" role="tab" class="node-fullscreen-chip-face" ${attr}="${
+            pattern.id
+          }" aria-selected="${on}" title="${this.escapeHtml(
+            this.pipelineTabLabel(pattern)
+          )}">2D</button>` +
+          `<span class="node-fullscreen-chip-sep" aria-hidden="true"></span>` +
+          this.modifierChipIconsHtml(pattern, open) +
+          `<button type="button" class="node-fullscreen-stage${
+            open ? ' is-active' : ''
+          }" data-fs-modifiers="${pattern.id}" title="Modifiers — the pattern's 2D geometry stack" aria-label="Modifiers" aria-pressed="${open}">${MODIFIER_STACK_ICON}</button>` +
+          `</span>`
       );
       // The 2D + 3D split toggle sits between the two dimensions it splits.
       if (opts.split || stages.length > 0) chips.push(this.splitToggleButtonHtml());
@@ -3783,6 +4118,35 @@ export class StudioApp {
       );
     }
     return chips.join('');
+  }
+
+  /**
+   * The container's modifier stack as marks in the 2D chip, one per node, in cook
+   * order — the same way the 3D chip lists the stages that build its drape.
+   * Pressing one opens the panel on that node; a bypassed node is dimmed, and the
+   * node the panel is showing is lit.
+   */
+  private modifierChipIconsHtml(patternNode: CanvasNode, panelOpen: boolean): string {
+    if (patternNode.type !== 'patternFrame') return '';
+    const pattern = this.project.patterns.find((p) => p.id === patternNode.patternId);
+    const stack = pattern?.modifiers ?? [];
+    if (stack.length === 0) return '';
+    const icons = stack
+      .map((entry) => {
+        const active = panelOpen && this.selectedModifierId === entry.id;
+        const label = entry.name?.trim() || MODIFIER_LABELS[entry.type];
+        return `<button type="button" class="node-fullscreen-stage${
+          active ? ' is-active' : ''
+        }${entry.enabled === false ? ' is-off' : ''}" data-fs-modifier="${
+          entry.id
+        }" data-fs-modifier-in="${patternNode.id}" title="${escapeAttr(
+          `${label} · ${MODIFIER_LABELS[entry.type]} — open the modifiers panel here`
+        )}" aria-label="${escapeAttr(label)}" aria-pressed="${active}">${
+          MODIFIER_ICONS[entry.type] ?? MODIFIER_STACK_ICON
+        }</button>`;
+      })
+      .join('');
+    return `${icons}<span class="node-fullscreen-chip-sep" aria-hidden="true"></span>`;
   }
 
   /** One stage of the run, as an icon inside the 3D chip. */
@@ -4120,6 +4484,23 @@ export class StudioApp {
       e.preventDefault();
       e.stopPropagation();
       this.exitSplitView();
+    });
+    tabs.querySelectorAll<HTMLElement>('[data-fs-modifiers]').forEach((button) => {
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const id = button.dataset.fsModifiers;
+        if (id) this.toggleModifierPanel(id);
+      });
+    });
+    tabs.querySelectorAll<HTMLElement>('[data-fs-modifier]').forEach((button) => {
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const container = button.dataset.fsModifierIn;
+        const modifier = button.dataset.fsModifier;
+        if (container && modifier) this.openModifierFromChip(container, modifier);
+      });
     });
   }
 
@@ -4701,6 +5082,12 @@ export class StudioApp {
         );
       });
       chrome!.querySelector('.node-chrome-right')?.prepend(clipBtn);
+      // The modifier stack's panel sits to the left of the canvas when it is open.
+      const panel = document.createElement('aside');
+      panel.className = 'pattern-modifier-panel';
+      panel.hidden = true;
+      panel.dataset.modifierNode = node.id;
+      body.appendChild(panel);
       const editorHost = document.createElement('div');
       editorHost.className = 'pattern-host';
       body.appendChild(editorHost);
@@ -4727,9 +5114,16 @@ export class StudioApp {
         onAddObject: (kind, box) => this.addObjectToContainer(node, kind, box),
         canPlaceObject: (kind) => kind === 'text' || kind === 'image',
         onTextSelectionChange: () => this.syncTextStyleBar(),
+        // A press on the cooked output is a press on a result: say how to get to
+        // the copy that can be edited.
+        onLockedPress: () =>
+          this.setStatus(
+            'The modifiers are cooking this view — switch Display to Input in the Modifiers panel to edit the pattern'
+          ),
       });
       this.editors.set(node.id, editor);
       this.syncContainer(node, el);
+      this.syncEditorDisplay(node.id);
     } else if (node.type === 'meshFrame') {
       const mesh = this.project.meshes.find((m) => m.id === node.meshId)!;
       chrome!.querySelector('.node-title')!.textContent = `Mesh · ${mesh.name}`;
@@ -4740,7 +5134,7 @@ export class StudioApp {
       previewHost.className = 'mesh-host';
       body.appendChild(previewHost);
       const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
-      if (!mesh.geometry) remeshDocument(mesh, pattern);
+      if (!mesh.geometry) this.remeshFromPattern(mesh, pattern);
       const preview = new MeshPreview(previewHost, mesh, this.project.displayUnit, pattern ?? null);
       this.meshPreviews.set(node.id, preview);
     } else if (node.type === 'simViewport') {
@@ -4774,6 +5168,7 @@ export class StudioApp {
       actions.innerHTML = `
         <button type="button" data-transform="reset">Reset layout</button>
         <button type="button" data-transform="rebuild">Rebuild</button>
+        <button type="button" data-transform="rest" title="Write this arrangement into the pattern as its per-piece rest pose — the drape starts from it, and a copy of the pattern carries it">Store rest pose</button>
       `;
       actions.addEventListener('click', (e) => {
         const b = (e.target as HTMLElement).closest('button[data-transform]') as HTMLButtonElement | null;
@@ -5179,7 +5574,7 @@ export class StudioApp {
       runtime.rebuildCloth(
         this.meshGeometryForTransform(transform.id),
         transform.pose,
-        transform.pieceTransforms,
+        this.pieceTransformsForRuntime(transform),
         this.patternForTransform(transform.id)
       );
       this.transformRuntimes.set(transform.id, runtime);
@@ -5236,21 +5631,723 @@ export class StudioApp {
     return this.project.meshes.find((m) => m.id === meshId);
   }
 
+  /**
+   * A pattern *as its modifier stack leaves it*.
+   *
+   * The stack is a 2D SOP chain: everything downstream — the mesh, the transform
+   * stage, the drape, the seams they sew — reads the cooked geometry, never the
+   * pieces the tools drew. A pattern with no enabled node comes back as itself,
+   * so the uncooked case costs one function call and changes nothing.
+   */
+  private cookedPattern(pattern: PatternDocument | undefined): PatternDocument | undefined {
+    if (!pattern || !hasEnabledModifiers(pattern)) return pattern;
+    const result = cookPattern(pattern);
+    return {
+      ...pattern,
+      pieces: result.pieces,
+      seams: result.seams,
+      pieceSuccessors: result.pieceSuccessors,
+    };
+  }
+
+  // ── Modifier panel ────────────────────────────────────────────────────────
+
+  /**
+   * The stack panel's state. The display choice is the host's, not the
+   * document's: which copy of the pattern is being *looked at* is a view.
+   */
+  private modifierDisplay = new Map<string, 'input' | 'output'>();
+  /** The container whose modifier panel is open, if any. */
+  private modifierPanelNodeId: string | null = null;
+  /** The node whose parameters the panel is showing. */
+  private selectedModifierId: string | null = null;
+  /** True between the first keystroke and the commit, so one edit is one undo. */
+  private modifierFieldEditing = false;
+
+  private modifierDisplayFor(nodeId: string): 'input' | 'output' {
+    return this.modifierDisplay.get(nodeId) ?? 'output';
+  }
+
+  /**
+   * Point a container's editor at the copy it should be drawing: the pattern
+   * itself when the stack is off or Input is chosen, or a cooked copy of it —
+   * read-only — when the stack's output is what is being looked at.
+   */
+  private syncEditorDisplay(nodeId: string): void {
+    const node = this.canvasNode(nodeId);
+    const editor = this.editors.get(nodeId);
+    if (!node || node.type !== 'patternFrame' || !editor) return;
+    const source = this.project.patterns.find((p) => p.id === node.patternId);
+    if (!source) return;
+    const output = hasEnabledModifiers(source) && this.modifierDisplayFor(nodeId) === 'output';
+    if (output) editor.setCookedPattern(structuredClone(source));
+    else editor.setPattern(source, { preserveView: true });
+  }
+
+  /**
+   * A modifier's mark in the 2D chip was pressed: open the panel on that node.
+   * The icons are the stack, so pressing one is asking to see it.
+   */
+  private openModifierFromChip(nodeId: string, modifierId: string): void {
+    this.modifierPanelNodeId = nodeId;
+    this.selectedModifierId = modifierId;
+    this.renderModifierPanel(nodeId);
+    this.refreshFullscreenTabs();
+  }
+
+  private toggleModifierPanel(nodeId: string, open?: boolean): void {
+    const next = open ?? this.modifierPanelNodeId !== nodeId;
+    this.modifierPanelNodeId = next ? nodeId : null;
+    if (next) {
+      const node = this.canvasNode(nodeId);
+      const pattern =
+        node?.type === 'patternFrame'
+          ? this.project.patterns.find((p) => p.id === node.patternId)
+          : undefined;
+      const stack = pattern?.modifiers ?? [];
+      this.selectedModifierId = stack[stack.length - 1]?.id ?? null;
+    }
+    this.renderModifierPanel(nodeId);
+    this.refreshFullscreenTabs();
+    if (next) this.setStatus('Modifiers — the stack cooks the pattern into the geometry the drape builds from');
+  }
+
+  /**
+   * The panel: the stack as a list of nodes, the parameters of the one in hand,
+   * and the display switch that says whether the canvas is showing the pattern or
+   * what the stack makes of it.
+   */
+  private renderModifierPanel(nodeId: string): void {
+    const node = this.canvasNode(nodeId);
+    if (!node || node.type !== 'patternFrame') return;
+    const panel = this.findNodeEl(nodeId)?.querySelector('.pattern-modifier-panel') as
+      | HTMLElement
+      | null;
+    if (!panel) return;
+    const pattern = this.project.patterns.find((p) => p.id === node.patternId);
+    if (!pattern) return;
+
+    const open = this.modifierPanelNodeId === nodeId;
+    panel.hidden = !open;
+    panel.parentElement?.classList.toggle('has-modifier-panel', open);
+    if (!open) {
+      panel.innerHTML = '';
+      return;
+    }
+
+    const stack = pattern.modifiers ?? [];
+    const enabled = hasEnabledModifiers(pattern);
+    const mode = this.modifierDisplayFor(nodeId);
+    if (!stack.some((entry) => entry.id === this.selectedModifierId)) {
+      this.selectedModifierId = stack[stack.length - 1]?.id ?? null;
+    }
+    const selected = stack.find((entry) => entry.id === this.selectedModifierId) ?? null;
+
+    const rows =
+      stack.length === 0
+        ? `<p class="modifier-empty">No modifiers — the pattern is drawn as it was drawn.</p>`
+        : stack
+            .map(
+              (entry, index) => `
+        <div class="modifier-row${entry.id === selected?.id ? ' is-selected' : ''}${
+          entry.enabled === false ? ' is-off' : ''
+        }">
+          <button type="button" class="modifier-eye" data-mod-toggle="${entry.id}" title="${
+            entry.enabled === false ? 'Bypassed — click to cook it' : 'Cooking — click to bypass'
+          }" aria-pressed="${entry.enabled !== false}">${entry.enabled === false ? '○' : '●'}</button>
+          <button type="button" class="modifier-row-name" data-mod-select="${entry.id}">${this.escapeHtml(
+            entry.name?.trim() || MODIFIER_LABELS[entry.type]
+          )}</button>
+          <button type="button" class="modifier-mini" data-mod-up="${entry.id}" ${
+            index === 0 ? 'disabled' : ''
+          } title="Move up">↑</button>
+          <button type="button" class="modifier-mini" data-mod-down="${entry.id}" ${
+            index === stack.length - 1 ? 'disabled' : ''
+          } title="Move down">↓</button>
+          <button type="button" class="modifier-mini modifier-remove" data-mod-remove="${entry.id}" title="Remove">×</button>
+        </div>`
+            )
+            .join('');
+
+    const fields = selected
+      ? [
+          `<label class="modifier-field is-wide"><span>Name</span><input type="text" data-mod-field="name" value="${this.escapeHtml(
+            selected.name ?? ''
+          )}" placeholder="${MODIFIER_LABELS[selected.type]}" /></label>`,
+          ...modifierFields(selected).map((field) => this.modifierFieldHtml(selected!, field)),
+        ].join('')
+      : `<p class="modifier-empty">Pick a node to set its parameters.</p>`;
+
+    const summary = this.cookSummary(pattern);
+    const diagnostics = summary.diagnostics
+      .slice(0, 4)
+      .map((d) => `<div class="modifier-diagnostic">${this.escapeHtml(d.message)}</div>`)
+      .join('');
+
+    panel.innerHTML = `
+      <div class="modifier-head">
+        <span class="modifier-title">Modifiers</span>
+        <div class="modifier-display" role="group" aria-label="Display">
+          <button type="button" data-mod-display="input" class="${
+            !enabled || mode === 'input' ? 'is-active' : ''
+          }" title="Show the pattern as the tools drew it">Input</button>
+          <button type="button" data-mod-display="output" class="${
+            enabled && mode === 'output' ? 'is-active' : ''
+          }" ${enabled ? '' : 'disabled'} title="Show what the stack makes of it">Output</button>
+        </div>
+        <button type="button" class="modifier-close" data-mod-close aria-label="Close modifiers">×</button>
+      </div>
+      <div class="modifier-stack">${rows}</div>
+      <div class="modifier-body">
+        <div class="modifier-params" data-mod-params>${fields}</div>
+        ${selected ? this.modifierMasksHtml(selected, pattern) : ''}
+      </div>
+      <div class="modifier-foot">
+        <button type="button" class="modifier-add" data-mod-add aria-expanded="false">＋ Add modifier</button>
+        <span class="modifier-readout" data-mod-readout>${summary.pieces} pieces · ${summary.points} points</span>
+      </div>
+      <div class="modifier-add-menu" data-mod-menu hidden>
+        ${MODIFIER_ADD_ORDER.map(
+          (type) => `<button type="button" data-mod-new="${type}">${MODIFIER_LABELS[type]}</button>`
+        ).join('')}
+      </div>
+      <div class="modifier-diagnostics" data-mod-diagnostics>${diagnostics}</div>
+    `;
+
+    this.bindModifierPanel(panel, nodeId, selected);
+  }
+
+  /**
+   * The mask section: a list of tests, each a window onto the work.
+   *
+   * A mask is a range that counts as true — over a point's order, a piece's
+   * number, or a named attribute — and an element has to fall inside every one of
+   * them to run. No masks means the node runs on everything.
+   */
+  private modifierMasksHtml(node: ModifierNode, pattern: PatternDocument): string {
+    const masks = node.masks ?? [];
+    const pointCount = Math.max(
+      1,
+      ...pattern.pieces.map(
+        (piece) =>
+          (piece.points?.length ?? 0) +
+          (piece.holes ?? []).reduce((n, ring) => n + ring.length, 0)
+      )
+    );
+    const pieceCount = Math.max(1, pattern.pieces.length);
+    const rows = masks
+      .map((mask, index) => {
+        const rangeMin = `<input type="number" step="${
+          mask.kind === 'attribute' ? 0.1 : 1
+        }" data-mask-field="min" value="${escapeAttr(String(round3(mask.min)))}" aria-label="Mask minimum" />`;
+        const rangeMax = `<input type="number" step="${
+          mask.kind === 'attribute' ? 0.1 : 1
+        }" data-mask-field="max" value="${escapeAttr(String(round3(mask.max)))}" aria-label="Mask maximum" />`;
+        const extra =
+          mask.kind === 'attribute'
+            ? `<select data-mask-field="attributeClass" aria-label="Read the attribute from">
+                 ${[
+                   ['point', 'Point'],
+                   ['edge', 'Edge'],
+                   ['piece', 'Piece'],
+                 ]
+                   .map(
+                     ([value, label]) =>
+                       `<option value="${value}" ${
+                         mask.attributeClass === value ? 'selected' : ''
+                       }>${label}</option>`
+                   )
+                   .join('')}
+               </select>
+               <input type="text" data-mask-field="name" value="${escapeAttr(
+                 mask.name
+               )}" placeholder="attribute" aria-label="Attribute name" />`
+            : '';
+        const fade =
+          mask.kind === 'attribute'
+            ? ''
+            : `<label class="modifier-mask-falloff" title="How far outside the range the mask fades from full to nothing"><span>fade</span><input type="number" min="0" step="${
+                mask.kind === 'piece' ? 1 : 1
+              }" data-mask-field="falloff" value="${escapeAttr(
+                String(round3(mask.falloff ?? 0))
+              )}" aria-label="Mask falloff" /></label>`;
+        const profile =
+          mask.kind === 'attribute'
+            ? ''
+            : this.maskProfileHtml(mask, mask.kind === 'piece' ? 1 : 0, mask.kind === 'piece' ? pieceCount : pointCount - 1);
+        return `<div class="modifier-mask" data-mask-index="${index}">
+          <select data-mask-field="kind" aria-label="Mask by">
+            ${[
+              ['point', 'Point order'],
+              ['piece', 'Piece no.'],
+              ['attribute', 'Attribute'],
+            ]
+              .map(
+                ([value, label]) =>
+                  `<option value="${value}" ${mask.kind === value ? 'selected' : ''}>${label}</option>`
+              )
+              .join('')}
+          </select>
+          ${extra}
+          <span class="modifier-mask-range">${rangeMin}<span>to</span>${rangeMax}</span>
+          ${fade}
+          ${profile}
+          <button type="button" class="modifier-mini modifier-remove" data-mask-remove="${index}" title="Remove mask">×</button>
+        </div>`;
+      })
+      .join('');
+
+    return `<div class="modifier-masks" data-mod-masks>
+      <div class="modifier-masks-head">
+        <span class="modifier-masks-title">Masks</span>
+        <span class="modifier-masks-note">${
+          masks.length === 0 ? 'none — runs on everything' : 'all must pass'
+        }</span>
+      </div>
+      ${rows}
+      <button type="button" class="modifier-add-mask" data-mod-add-mask>＋ Add mask</button>
+    </div>`;
+  }
+
+  /**
+   * The mask's profile as a picture: full height across the range, sloping to
+   * nothing over each falloff. It is drawn from the same function the cook uses,
+   * so what you see is what the modifiers do.
+   */
+  private maskProfileHtml(
+    mask: Extract<ModifierMask, { kind: 'point' | 'piece' }>,
+    domainMin: number,
+    domainMax: number
+  ): string {
+    const width = 62;
+    const height = 18;
+    const pad = 2;
+    // Always show at least a couple of steps either side of the range, so a fade
+    // that reaches past the work is still visible as a fade.
+    const fade = Math.max(0, mask.falloff ?? 0);
+    const low = Math.min(domainMin, mask.min - fade);
+    const high = Math.max(domainMax, mask.max + fade, low + 1);
+    const steps = 32;
+    const line: string[] = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const value = low + t * (high - low);
+      const density = rangeDensity(value, mask.min, mask.max, fade);
+      const x = pad + t * (width - pad * 2);
+      const y = height - pad - density * (height - pad * 2);
+      line.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+    }
+    const area = `M${pad},${height - pad} L${line.join(' L')} L${width - pad},${height - pad} Z`;
+    return `<svg class="modifier-mask-profile" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" aria-hidden="true"><path class="modifier-mask-profile-area" d="${area}" /><path class="modifier-mask-profile-line" d="M${line.join(' L')}" /></svg>`;
+  }
+
+  /** One parameter, as the control its kind calls for. */
+  private modifierFieldHtml(
+    node: ModifierNode,
+    field: ModifierField
+  ): string {
+    const value = readPath(node, field.key);
+    const label = this.escapeHtml(field.label);
+    if (field.kind === 'checkbox') {
+      return `<label class="modifier-field is-check"><input type="checkbox" data-mod-field="${
+        field.key
+      }" ${value ? 'checked' : ''} /><span>${label}</span></label>`;
+    }
+    if (field.kind === 'select') {
+      const options = (field.options ?? [])
+        .map(
+          (option) =>
+            `<option value="${option.value}" ${String(value) === option.value ? 'selected' : ''}>${this.escapeHtml(
+              option.label
+            )}</option>`
+        )
+        .join('');
+      return `<label class="modifier-field"><span>${label}</span><select data-mod-field="${field.key}">${options}</select></label>`;
+    }
+    const numeric = field.kind === 'number';
+    const shown = typeof value === 'number' ? round3(value) : String(value ?? '');
+    return `<label class="modifier-field"><span>${label}</span><input type="${
+      numeric ? 'number' : 'text'
+    }" data-mod-field="${field.key}" value="${this.escapeHtml(String(shown))}"${
+      numeric ? ` step="${field.step ?? 0.5}"` : ''
+    }${numeric && field.min !== undefined ? ` min="${field.min}"` : ''}${
+      numeric && field.max !== undefined ? ` max="${field.max}"` : ''
+    } /></label>`;
+  }
+
+  private bindModifierPanel(
+    panel: HTMLElement,
+    nodeId: string,
+    selected: ModifierNode | null
+  ): void {
+    const on = <T extends HTMLElement>(selector: string, handler: (el: T) => void) => {
+      panel.querySelectorAll<T>(selector).forEach((el) =>
+        el.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          handler(el);
+        })
+      );
+    };
+
+    on<HTMLElement>('[data-mod-display]', (el) => {
+      const mode = el.dataset.modDisplay === 'input' ? 'input' : 'output';
+      this.modifierDisplay.set(nodeId, mode);
+      this.syncEditorDisplay(nodeId);
+      this.renderModifierPanel(nodeId);
+      this.setStatus(
+        mode === 'output'
+          ? 'Showing what the modifiers make — switch to Input to edit the base pattern'
+          : 'Showing the pattern as drawn — edit it with the usual tools'
+      );
+    });
+    on('[data-mod-close]', () => this.toggleModifierPanel(nodeId, false));
+    on<HTMLElement>('[data-mod-select]', (el) => {
+      this.selectedModifierId = el.dataset.modSelect ?? null;
+      this.renderModifierPanel(nodeId);
+    });
+    on<HTMLElement>('[data-mod-toggle]', (el) => {
+      this.editModifierStack(nodeId, (stack) => {
+        const entry = stack.find((node) => node.id === el.dataset.modToggle);
+        if (entry) entry.enabled = entry.enabled === false;
+      });
+    });
+    on<HTMLElement>('[data-mod-up]', (el) => {
+      this.editModifierStack(nodeId, (stack) => moveInStack(stack, el.dataset.modUp, -1));
+    });
+    on<HTMLElement>('[data-mod-down]', (el) => {
+      this.editModifierStack(nodeId, (stack) => moveInStack(stack, el.dataset.modDown, 1));
+    });
+    on<HTMLElement>('[data-mod-remove]', (el) => {
+      this.editModifierStack(nodeId, (stack) => {
+        const index = stack.findIndex((node) => node.id === el.dataset.modRemove);
+        if (index >= 0) stack.splice(index, 1);
+      });
+    });
+    on('[data-mod-add]', () => {
+      const menu = panel.querySelector<HTMLElement>('[data-mod-menu]');
+      const button = panel.querySelector<HTMLElement>('[data-mod-add]');
+      if (!menu || !button) return;
+      menu.hidden = !menu.hidden;
+      button.setAttribute('aria-expanded', String(!menu.hidden));
+    });
+    on<HTMLElement>('[data-mod-new]', (el) => {
+      const type = el.dataset.modNew as ModifierNodeType;
+      if (!type) return;
+      this.editModifierStack(nodeId, (stack) => {
+        const centre = this.patternCentreCm(nodeId);
+        const created = createModifierNode(type, uid('mod'), centre);
+        stack.push(created);
+        this.selectedModifierId = created.id;
+      });
+    });
+
+    if (!selected) return;
+
+    // ── Masks ──────────────────────────────────────────────────────────────
+    on('[data-mod-add-mask]', () => {
+      this.editModifierStack(nodeId, () => {
+        if (!selected.masks) selected.masks = [];
+        selected.masks.push(createModifierMask('point'));
+      });
+    });
+    on<HTMLElement>('[data-mask-remove]', (el) => {
+      this.editModifierStack(nodeId, () => {
+        const index = Number(el.dataset.maskRemove);
+        if (Number.isInteger(index)) selected.masks?.splice(index, 1);
+      });
+    });
+    panel.querySelectorAll<HTMLElement>('[data-mask-index]').forEach((row) => {
+      const index = Number(row.dataset.maskIndex);
+      const mask = (): ModifierMask | undefined => selected.masks?.[index];
+      row.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-mask-field]').forEach((input) => {
+        const field = input.dataset.maskField!;
+        const apply = (rerender: boolean) => {
+          const current = mask();
+          if (!current) return;
+          if (!this.modifierFieldEditing) {
+            this.pushUndo();
+            this.modifierFieldEditing = true;
+          }
+          if (field === 'kind') {
+            // Changing the kind replaces the mask: a point range means nothing
+            // to an attribute test, so the new kind arrives with its own defaults.
+            selected.masks![index] = createModifierMask(
+              (input.value as ModifierMask['kind']) ?? 'point'
+            );
+          } else if (field === 'attributeClass') {
+            if (current.kind === 'attribute') {
+              current.attributeClass = input.value === 'edge' || input.value === 'piece' ? input.value : 'point';
+            }
+          } else if (field === 'name') {
+            if (current.kind === 'attribute') current.name = input.value;
+          } else if (field === 'min' || field === 'max') {
+            const number = Number(input.value);
+            if (!Number.isFinite(number)) return;
+            current[field] = number;
+          } else if (field === 'falloff') {
+            if (current.kind === 'attribute') return;
+            const number = Number(input.value);
+            if (!Number.isFinite(number)) return;
+            current.falloff = Math.max(0, number);
+          }
+          this.afterModifierChange(nodeId, { rerender });
+        };
+        input.addEventListener('input', () => apply(false));
+        input.addEventListener('change', () => {
+          this.modifierFieldEditing = false;
+          if (field === 'kind' || field === 'attributeClass') apply(true);
+        });
+        input.addEventListener('blur', () => {
+          this.modifierFieldEditing = false;
+        });
+      });
+    });
+
+    panel.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-mod-field]').forEach((input) => {
+      const key = input.dataset.modField!;
+      const read = (): unknown => {
+        if (input instanceof HTMLInputElement && input.type === 'checkbox') return input.checked;
+        if (input instanceof HTMLInputElement && input.type === 'number') {
+          const number = Number(input.value);
+          return Number.isFinite(number) ? number : undefined;
+        }
+        return input.value;
+      };
+      input.addEventListener('input', () => {
+        const value = read();
+        if (value === undefined) return;
+        // One undo for the edit, not one per keystroke.
+        if (!this.modifierFieldEditing) {
+          this.pushUndo();
+          this.modifierFieldEditing = true;
+        }
+        writePath(selected, key, value);
+        this.afterModifierChange(nodeId);
+      });
+      input.addEventListener('change', () => {
+        this.modifierFieldEditing = false;
+        // Options that reveal other parameters — or rename the row — need the
+        // panel drawn again. A `change` on a text field means the focus has
+        // already left it, so redrawing cannot steal the caret.
+        if (STRUCTURAL_MODIFIER_FIELDS.has(key) || key === 'name') {
+          this.renderModifierPanel(nodeId);
+        }
+      });
+      input.addEventListener('blur', () => {
+        this.modifierFieldEditing = false;
+      });
+    });
+  }
+
+  /**
+   * A structural change to the stack — add, remove, reorder, bypass — as one undo
+   * step that re-cooks everything downstream.
+   */
+  private editModifierStack(nodeId: string, mutate: (stack: ModifierNode[]) => void): void {
+    const node = this.canvasNode(nodeId);
+    if (!node || node.type !== 'patternFrame') return;
+    const pattern = this.project.patterns.find((p) => p.id === node.patternId);
+    if (!pattern) return;
+    this.pushUndo();
+    if (!pattern.modifiers) pattern.modifiers = [];
+    mutate(pattern.modifiers);
+    this.afterModifierChange(nodeId, { rerender: true });
+  }
+
+  /**
+   * Re-cook what the stack feeds and redraw what shows it.
+   *
+   * The panel is *not* rebuilt here: a parameter changes on every keystroke, and
+   * swapping the DOM under the caret would take the field away after one letter.
+   * The readout and the diagnostics are updated in place; the panel is only drawn
+   * again when the shape of it changes (see `bindModifierPanel`).
+   */
+  private afterModifierChange(nodeId: string, opts: { rerender?: boolean } = {}): void {
+    const node = this.canvasNode(nodeId);
+    if (!node || node.type !== 'patternFrame') return;
+    this.syncEditorDisplay(nodeId);
+    this.invalidateMeshesForPattern(node.patternId);
+    this.refreshFullscreenTabs();
+    if (opts.rerender) this.renderModifierPanel(nodeId);
+    else this.updateModifierReadout(nodeId);
+    this.markDirty();
+  }
+
+  /** Keep the footer's counts and the diagnostics line in step with the cook. */
+  private updateModifierReadout(nodeId: string): void {
+    const node = this.canvasNode(nodeId);
+    const panel = this.findNodeEl(nodeId)?.querySelector('.pattern-modifier-panel') as
+      | HTMLElement
+      | null;
+    const pattern =
+      node?.type === 'patternFrame'
+        ? this.project.patterns.find((p) => p.id === node.patternId)
+        : undefined;
+    if (!panel || !pattern || panel.hidden) return;
+    const summary = this.cookSummary(pattern);
+    const readout = panel.querySelector('[data-mod-readout]');
+    if (readout) {
+      readout.textContent = `${summary.pieces} ${summary.pieces === 1 ? 'piece' : 'pieces'} · ${
+        summary.points
+      } points`;
+    }
+    const diagnostics = panel.querySelector('[data-mod-diagnostics]');
+    if (diagnostics) {
+      diagnostics.innerHTML = summary.diagnostics
+        .slice(0, 4)
+        .map((d) => `<div class="modifier-diagnostic">${this.escapeHtml(d.message)}</div>`)
+        .join('');
+    }
+    const output = panel.querySelector<HTMLButtonElement>('[data-mod-display="output"]');
+    if (output) output.disabled = !hasEnabledModifiers(pattern);
+
+    // The mask pictures follow the numbers as they are typed: the range and its
+    // fade are what those little curves are, so they must not lag behind them.
+    const selected = (pattern.modifiers ?? []).find((node) => node.id === this.selectedModifierId);
+    if (selected) this.refreshMaskProfiles(panel, selected, pattern);
+  }
+
+  /** Redraw every mask's profile from the mask's current numbers, in place. */
+  private refreshMaskProfiles(
+    panel: HTMLElement,
+    node: ModifierNode,
+    pattern: PatternDocument
+  ): void {
+    const pointCount = Math.max(
+      1,
+      ...pattern.pieces.map(
+        (piece) =>
+          (piece.points?.length ?? 0) +
+          (piece.holes ?? []).reduce((n, ring) => n + ring.length, 0)
+      )
+    );
+    const pieceCount = Math.max(1, pattern.pieces.length);
+    panel.querySelectorAll<HTMLElement>('.modifier-mask').forEach((row) => {
+      const index = Number(row.dataset.maskIndex);
+      const mask = node.masks?.[index];
+      const holder = row.querySelector('.modifier-mask-profile');
+      if (!holder || !mask || mask.kind === 'attribute') return;
+      const low = mask.kind === 'piece' ? 1 : 0;
+      const high = mask.kind === 'piece' ? pieceCount : pointCount - 1;
+      holder.outerHTML = this.maskProfileHtml(mask, low, high);
+    });
+  }
+
+  /** The middle of a container's work, for a new node's cut line or shape. */
+  private patternCentreCm(nodeId: string): { x: number; y: number } {
+    const node = this.canvasNode(nodeId);
+    const pattern =
+      node?.type === 'patternFrame'
+        ? this.project.patterns.find((p) => p.id === node.patternId)
+        : undefined;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const piece of pattern?.pieces ?? []) {
+      for (const pt of piece.points ?? []) {
+        minX = Math.min(minX, pt.anchor.x);
+        minY = Math.min(minY, pt.anchor.y);
+        maxX = Math.max(maxX, pt.anchor.x);
+        maxY = Math.max(maxY, pt.anchor.y);
+      }
+    }
+    if (!Number.isFinite(minX)) return { x: 0, y: 0 };
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  }
+
+  /**
+   * Where a piece rests before it is draped: the pattern's own `restP`/`restQ`
+   * attributes when a piece has them, and the transform stage's arrangement
+   * otherwise. The attributes win, so a pattern carries its arrangement with it.
+   */
+  private pieceTransformsForRuntime(
+    transform: Transform3dInstance
+  ): Record<string, PieceTransform3d> {
+    const base: Record<string, PieceTransform3d> = structuredClone(transform.pieceTransforms ?? {});
+    const pattern = this.patternForTransform(transform.id);
+    for (const piece of pattern?.pieces ?? []) {
+      if (!hasRestPose(piece)) continue;
+      const pose = pieceRestPose(piece);
+      base[piece.id] = {
+        position: [...pose.position] as [number, number, number],
+        rotationDeg: quatToEulerDeg(pose.rotationQuat),
+        rotationQuat: [...pose.rotationQuat] as [number, number, number, number],
+      };
+    }
+    return base;
+  }
+
+  /**
+   * Write the transform stage's arrangement into the pattern as its rest pose:
+   * the per-piece `restP`/`restQ` attributes, so the drape starts from it and a
+   * copy of the pattern carries it.
+   */
+  private storeRestPose(transformId: string): void {
+    const transform = this.project.transforms.find((t) => t.id === transformId);
+    const mesh = this.meshForTransform(transformId);
+    const pattern = this.project.patterns.find((p) => p.id === mesh?.patternId);
+    if (!transform || !pattern) return;
+    this.pushUndo();
+    let stored = 0;
+    for (const piece of pattern.pieces) {
+      const placed = transform.pieceTransforms[piece.id];
+      if (!placed) continue;
+      setPieceRestPose(piece, {
+        position: [...placed.position] as [number, number, number],
+        rotationQuat: resolvePieceQuat(placed),
+      });
+      stored += 1;
+    }
+    this.markDirty();
+    this.renderInspector();
+    this.setStatus(
+      stored === 0
+        ? 'Nothing placed yet — arrange the pieces, then store the rest pose'
+        : `Stored the rest pose of ${stored} ${stored === 1 ? 'piece' : 'pieces'} on the pattern`
+    );
+  }
+
+  /** Build a mesh from the pattern's cooked geometry. */
+  private remeshFromPattern(mesh: MeshDocument, pattern: PatternDocument | undefined): void {
+    remeshDocument(mesh, this.cookedPattern(pattern));
+  }
+
+  /** What the stack makes of a pattern right now, for the panel's readout. */
+  private cookSummary(pattern: PatternDocument): {
+    pieces: number;
+    points: number;
+    diagnostics: CookDiagnostic[];
+  } {
+    if (!hasEnabledModifiers(pattern)) {
+      const points = pattern.pieces.reduce(
+        (n, piece) => n + (piece.points?.length ?? 0) + (piece.holes ?? []).reduce((m, ring) => m + ring.length, 0),
+        0
+      );
+      return { pieces: pattern.pieces.length, points, diagnostics: [] };
+    }
+    const result = cookPattern(pattern);
+    return { pieces: result.pieces.length, points: result.pointCount, diagnostics: result.diagnostics };
+  }
+
   private patternForTransform(transformId: string): PatternDocument | undefined {
     const mesh = this.meshForTransform(transformId);
     if (!mesh) return this.project.patterns[0];
-    return this.project.patterns.find((p) => p.id === mesh.patternId);
+    return this.cookedPattern(this.project.patterns.find((p) => p.id === mesh.patternId));
   }
 
   private meshGeometryForTransform(transformId: string) {
     const mesh = this.meshForTransform(transformId);
     if (!mesh) return null;
-    const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
+    const pattern = this.cookedPattern(
+      this.project.patterns.find((p) => p.id === mesh.patternId)
+    );
     if (
       !mesh.geometry ||
       mesh.geometry.vertexPieceIds?.length !== mesh.geometry.vertices.length
     ) {
-      remeshDocument(mesh, pattern);
+      this.remeshFromPattern(mesh, pattern);
     }
     return mesh.geometry;
   }
@@ -5282,12 +6379,15 @@ export class StudioApp {
         this.rebuildSimsFromTransform(transformId);
         this.setStatus('Transform layout reset to default arrangement (-90° X)');
         break;
+      case 'rest':
+        this.storeRestPose(transformId);
+        break;
       case 'rebuild':
         this.pushUndo();
         rt.rebuildCloth(
           this.meshGeometryForTransform(transformId),
           transform.pose,
-          transform.pieceTransforms,
+          this.pieceTransformsForRuntime(transform),
           this.patternForTransform(transformId)
         );
         this.rebuildSimsFromTransform(transformId);
@@ -5349,7 +6449,7 @@ export class StudioApp {
       !mesh.geometry ||
       mesh.geometry.vertexPieceIds?.length !== mesh.geometry.vertices.length
     ) {
-      remeshDocument(mesh, pattern);
+      this.remeshFromPattern(mesh, pattern);
     }
     return mesh.geometry;
   }
@@ -5359,7 +6459,7 @@ export class StudioApp {
     if (!mesh) return;
     if (opts.recordUndo !== false) this.pushUndo();
     const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
-    remeshDocument(mesh, pattern);
+    this.remeshFromPattern(mesh, pattern);
     for (const [nodeId, preview] of this.meshPreviews) {
       const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
       if (node?.type === 'meshFrame' && node.meshId === meshId) {
@@ -6125,7 +7225,7 @@ export class StudioApp {
           const mesh = this.project.meshes.find((candidate) => candidate.id === targetId);
           if (mesh && pattern) {
             mesh.patternId = pattern.id;
-            remeshDocument(mesh, pattern);
+            this.remeshFromPattern(mesh, pattern);
             for (const [nodeId, preview] of this.meshPreviews) {
               const node = this.project.canvas.nodes.find((candidate) => candidate.id === nodeId);
               if (node?.type === 'meshFrame' && node.meshId === mesh.id) {
