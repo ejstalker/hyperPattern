@@ -117,6 +117,8 @@ import {
   canvasAtCm,
   canvasCmScale,
   containerClips,
+  containerShowsDisplay,
+  isUnplaced,
   containerView,
   groupIntoContainer,
   movePiecesBetweenSpaces,
@@ -303,6 +305,15 @@ const WORLD_TO_CM = 10;
  */
 const MESH_STAGE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="2.3" y="2.3" width="11.4" height="11.4" rx="1.3"/><path d="M2.3 2.3 13.7 13.7"/><path d="M13.7 2.3 2.3 13.7"/></svg>`;
 const TRANSFORM_STAGE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7.1V2.5"/><path d="M6.4 4.1 8 2.5l1.6 1.6"/><path d="M8.9 8h4.6"/><path d="M11.9 6.4 13.5 8l-1.6 1.6"/><path d="M6.9 9.1 3.5 12.5"/><circle cx="8" cy="8" r="1.15"/></svg>`;
+
+/**
+ * The container's view mode, in the frame's top-right corner.
+ *
+ * An eye is what you press to see the pattern as the finished article; the pen
+ * brings the points, seams and tools back.
+ */
+const DISPLAY_VIEW_ICON = `<svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1.6 8c1.7-3.1 3.9-4.7 6.4-4.7S12.7 4.9 14.4 8c-1.7 3.1-3.9 4.7-6.4 4.7S3.3 11.1 1.6 8z"/><circle cx="8" cy="8" r="2.1"/></svg>`;
+const EDIT_VIEW_ICON = `<svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 2.6 13.4 5.6 6 13H3v-3z"/><path d="M9 4l3 3"/></svg>`;
 
 /**
  * One small mark per modifier kind, for the 2D chip.
@@ -1116,6 +1127,9 @@ export class StudioApp {
         // Restoring history: keep the zoom/pan the user is looking through, and
         // cook again — the stack or the geometry may be what changed.
         if (pattern && editor) this.syncEditorDisplay(node.id);
+        // The frame's own settings are document data too — an undone clip or view
+        // mode has to reach the frame, not just the node's copy of it.
+        this.syncContainer(node);
         continue;
       }
       if (node.type === 'meshFrame') {
@@ -3035,6 +3049,8 @@ export class StudioApp {
       // The page's own work thins out with the board like a frame's, but the page
       // is the drawing surface: it keeps the pointer and its grid at every zoom.
       detail: this.detailForScale(cmScale),
+      // The page is always the workbench — display view belongs to containers.
+      display: false,
       coarsePointer: 'editor',
     });
   }
@@ -4508,6 +4524,18 @@ export class StudioApp {
     return this.project.canvas.nodes.find((n) => n.id === nodeId);
   }
 
+  /**
+   * The container as the project holds it now.
+   *
+   * Node handlers are bound once, when the node is mounted; history replaces the
+   * project wholesale, so a closure over the node it was built with would go on
+   * writing to a copy nobody draws.
+   */
+  private liveFrame(nodeId: string): PatternFrameNode | null {
+    const node = this.canvasNode(nodeId);
+    return node && node.type === 'patternFrame' ? node : null;
+  }
+
   /** The mesh behind the split's pattern that still needs a rebuild, if any. */
   private staleMeshForSplit(): MeshDocument | undefined {
     const split = this.splitView;
@@ -4660,6 +4688,9 @@ export class StudioApp {
       // it draws the whole pattern, because at that point zooming out is a way of
       // looking at the work rather than a way of looking at the canvas.
       detail: expanded ? 'full' : this.detailForScale(view.cmScale * zoom),
+      // Display view: the finished article — no control points, no sewing marks,
+      // nothing to grab. The editor keeps pan and zoom; everything else is inert.
+      display: containerShowsDisplay(node),
       coarsePointer: expanded ? 'editor' : 'frame',
     };
   }
@@ -4692,7 +4723,16 @@ export class StudioApp {
     // the element it just built rather than have us look for it.
     const el = hostEl ?? this.findNodeEl(node.id);
     el?.classList.toggle('is-unclipped', !containerClips(node));
-    const clipBtn = el?.querySelector('.node-clip-btn') as HTMLButtonElement | null;
+    // Split view hoists the pattern's chrome to the top of the overlay, so the
+    // frame's own buttons are not inside the node element any more.
+    const chromeHost =
+      el?.querySelector('.node-chrome-right') != null
+        ? el
+        : this.splitView?.patternNodeId === node.id
+          ? this.splitView.chrome
+          : el;
+    const displayOn = containerShowsDisplay(node);
+    const clipBtn = chromeHost?.querySelector('.node-clip-btn') as HTMLButtonElement | null;
     if (clipBtn) {
       const on = containerClips(node);
       clipBtn.classList.toggle('is-active', on);
@@ -4701,9 +4741,20 @@ export class StudioApp {
         ? 'Clip contents to the frame (work outside is hidden)'
         : 'Contents spill past the frame';
     }
-    this.editors
-      .get(node.id)
-      ?.setContainer(this.containerModeFor(node, this.expandedNodeId === node.id));
+    const viewBtn = chromeHost?.querySelector('.node-viewmode-btn') as HTMLButtonElement | null;
+    if (viewBtn) {
+      viewBtn.classList.toggle('is-active', displayOn);
+      viewBtn.setAttribute('aria-pressed', String(displayOn));
+      viewBtn.title = displayOn
+        ? 'Display view — the pieces with no points or seams. Press for Edit'
+        : 'Edit view — points, seams and tools. Press for Display';
+      viewBtn.innerHTML = displayOn ? EDIT_VIEW_ICON : DISPLAY_VIEW_ICON;
+    }
+    const editor = this.editors.get(node.id);
+    editor?.setContainer(this.containerModeFor(node, this.expandedNodeId === node.id));
+    // Display view's arrangement lives on the frame, so it is handed over with the
+    // rest of the frame's settings — and comes back here after an undo.
+    editor?.setDisplayPlacements(node.displayPlacements ?? null);
   }
 
   /**
@@ -5070,18 +5121,49 @@ export class StudioApp {
       clipBtn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
+        // The closure's node can be a copy history has since replaced.
+        const frame = this.liveFrame(node.id);
+        if (!frame) return;
         this.pushUndo();
-        node.clip = !containerClips(node);
-        this.syncContainer(node);
+        frame.clip = !containerClips(frame);
+        this.syncContainer(frame);
         this.layoutNodes();
         this.markDirty();
         this.setStatus(
-          node.clip
+          frame.clip
             ? 'Clipping contents to the frame — nothing outside it is drawn'
             : 'Contents spill past the frame — the frame is unchanged'
         );
       });
       chrome!.querySelector('.node-chrome-right')?.prepend(clipBtn);
+      // Edit or display: the frame's own view mode. It sits at the far left of
+      // the header — it says what the whole view is — and only the full screen
+      // header shows it: a frame on the board is always the workbench.
+      const viewBtn = document.createElement('button');
+      viewBtn.type = 'button';
+      viewBtn.className = 'node-viewmode-btn';
+      viewBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        // The closure's node can be a copy history has since replaced.
+        const frame = this.liveFrame(node.id);
+        if (!frame) return;
+        this.pushUndo();
+        const display = !containerShowsDisplay(frame);
+        frame.viewMode = display ? 'display' : 'edit';
+        this.syncContainer(frame);
+        this.layoutNodes();
+        this.markDirty();
+        // The inspector carries the same toggle, so it has to show the new state.
+        if (this.selectedNodeId === frame.id) this.renderInspector();
+        this.setStatus(
+          display
+            ? 'Display view — the pieces as they finish, seam allowance and all. Switch to Edit to work on them'
+            : 'Edit view — points, seams and the tools to change them'
+        );
+      });
+      chrome!.prepend(viewBtn);
+      this.syncContainer(node, el);
       // The modifier stack's panel sits to the left of the canvas when it is open.
       const panel = document.createElement('aside');
       panel.className = 'pattern-modifier-panel';
@@ -5114,12 +5196,28 @@ export class StudioApp {
         onAddObject: (kind, box) => this.addObjectToContainer(node, kind, box),
         canPlaceObject: (kind) => kind === 'text' || kind === 'image',
         onTextSelectionChange: () => this.syncTextStyleBar(),
-        // A press on the cooked output is a press on a result: say how to get to
-        // the copy that can be edited.
+        // A press the editor will not act on — the cook of the stack, or a frame
+        // in display view — is a press on something you look at. Say which, and
+        // how to get back to the workbench.
         onLockedPress: () =>
           this.setStatus(
-            'The modifiers are cooking this view — switch Display to Input in the Modifiers panel to edit the pattern'
+            containerShowsDisplay(this.liveFrame(node.id) ?? node)
+              ? 'Display view — switch the container to Edit to change the pattern'
+              : 'The modifiers are cooking this view — switch Display to Input in the Modifiers panel to edit the pattern'
           ),
+        // Display view arranged a piece: the arrangement belongs to the frame, not
+        // to the pattern, so it is recorded here and the geometry never moves.
+        onPlacementChange: (pieceId, placement) => {
+          // Resolved now, not at mount: an undo replaces the node object.
+          const frame = this.liveFrame(node.id);
+          if (!frame) return;
+          const next = { ...(frame.displayPlacements ?? {}) };
+          if (isUnplaced(placement)) delete next[pieceId];
+          else next[pieceId] = placement;
+          this.pushUndo();
+          frame.displayPlacements = next;
+          this.markDirty();
+        },
       });
       this.editors.set(node.id, editor);
       this.syncContainer(node, el);
@@ -7990,17 +8088,42 @@ export class StudioApp {
 
     if (node.type === 'patternFrame') {
       const pattern = this.project.patterns.find((p) => p.id === node.patternId)!;
+      const display = containerShowsDisplay(node);
       this.inspector.innerHTML = `
         <h3>${pattern.name}</h3>
         <label>Name <input id="patName" value="${pattern.name}" /></label>
-        <button type="button" id="addPt">Add point</button>
-        <p class="muted">Tools: <b>V</b> Move · <b>A</b> Add (pen, rectangle, circle, block, SVG) · <b>M</b> Modify (extrude, join, bridge) · <b>C</b> Cut (line, circle, inset, curve, loop, dart) · <b>S</b> Sew (1:1, many : many) · <b>R</b> Ruler (ruler, measure line). Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.</p>
+        <label class="inspector-check"><input type="checkbox" id="patDisplay" ${
+          display ? 'checked' : ''
+        } /> Display view — the pieces without points or seams</label>
+        ${
+          display
+            ? ''
+            : '<button type="button" id="addPt">Add point</button>'
+        }
+        <p class="muted">${
+          display
+            ? 'Display view shows the finished pieces, seam allowance and all, with nothing to grab. Switch it off here or from the frame’s top-right button to draw on the pattern again.'
+            : 'Tools: <b>V</b> Move · <b>A</b> Add (pen, rectangle, circle, block, SVG) · <b>M</b> Modify (extrude, join, bridge) · <b>C</b> Cut (line, circle, inset, curve, loop, dart) · <b>S</b> Sew (1:1, many : many) · <b>R</b> Ruler (ruler, measure line). Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.'
+        }</p>
         ${this.deleteButtonHtml()}
       `;
       this.inspector.querySelector('#patName')?.addEventListener('change', (e) => {
         pattern.name = (e.target as HTMLInputElement).value;
         this.renderAll();
         void this.initGpuAndSims();
+      });
+      this.inspector.querySelector('#patDisplay')?.addEventListener('change', (e) => {
+        const on = (e.target as HTMLInputElement).checked;
+        this.pushUndo();
+        node.viewMode = on ? 'display' : 'edit';
+        this.syncContainer(node);
+        this.markDirty();
+        this.renderInspector();
+        this.setStatus(
+          on
+            ? 'Display view — the pieces as they finish, seam allowance and all'
+            : 'Edit view — points, seams and the tools to change them'
+        );
       });
       this.inspector.querySelector('#addPt')?.addEventListener('click', () => {
         this.editors.get(node.id)?.addPointOnEdge();
@@ -8353,7 +8476,12 @@ export class StudioApp {
     document.addEventListener(
       'pointerdown',
       (e) => {
-        const el = (e.target as Element | null)?.closest?.('.pattern-editor') as HTMLElement | null;
+        const target = e.target as Element | null;
+        // The text style bar is the host's chrome for the text picked *in* an
+        // editor, so reaching for it is still working in that editor — clearing
+        // the key here would leave the bar styling nothing.
+        if (target?.closest?.('.text-style-bar')) return;
+        const el = target?.closest?.('.pattern-editor') as HTMLElement | null;
         this.activeEditorKey = el ? this.editorKeyForElement(el) : null;
       },
       true

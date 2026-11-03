@@ -898,12 +898,12 @@ optgroup {
   left: 0;
 }
 
-.node-clip-btn {
+.node-clip-btn,
+.node-viewmode-btn {
   flex-shrink: 0;
   width: 26px;
   height: 24px;
   padding: 0;
-  display: inline-flex;
   align-items: center;
   justify-content: center;
   background: #3a342c;
@@ -913,13 +913,31 @@ optgroup {
   cursor: pointer;
 }
 
-.node-clip-btn.is-active {
+.node-clip-btn {
+  display: inline-flex;
+}
+
+/*
+ * The edit / display switch belongs to the full screen view of a container: a
+ * frame sitting on the board is always the workbench.
+ */
+.node-viewmode-btn {
+  display: none;
+}
+
+.node-fullscreen-overlay .node-viewmode-btn {
+  display: inline-flex;
+}
+
+.node-clip-btn.is-active,
+.node-viewmode-btn.is-active {
   color: var(--ink);
   border-color: var(--accent);
   background: #454038;
 }
 
-.node-clip-btn:hover {
+.node-clip-btn:hover,
+.node-viewmode-btn:hover {
   border-color: var(--accent);
 }
 
@@ -1081,6 +1099,7 @@ optgroup {
  * `display: flex` below would otherwise beat the UA `[hidden] { display: none }`.
  */
 .pattern-point-bar,
+.pattern-arrange-bar,
 .pattern-ruler-bar,
 .pattern-tool-settings,
 .pattern-allowance-bar,
@@ -1104,6 +1123,7 @@ optgroup {
 }
 
 .pattern-point-bar[hidden],
+.pattern-arrange-bar[hidden],
 .pattern-ruler-bar[hidden],
 .pattern-tool-settings[hidden],
 .pattern-allowance-bar[hidden],
@@ -1116,12 +1136,19 @@ optgroup {
 /* The picked point's own options: its own ribbon along the bottom middle, so it
    can be up while the tool's ribbon is in the top-left corner — the two used to
    fight over one slot, and Move always won it. */
-.pattern-point-bar {
+.pattern-point-bar,
+.pattern-arrange-bar {
   bottom: var(--node-bottom-inset, 10px);
   left: 50%;
   transform: translateX(-50%);
   gap: 14px;
   color: var(--muted, #8a8278);
+}
+
+/* Display view's arrange ribbon: the pieces' numbers, beside the sheet they
+   arrange. It carries fields rather than checkboxes, so it keeps their spacing. */
+.pattern-arrange-bar {
+  gap: 10px;
 }
 
 .pattern-point-bar label {
@@ -7535,4 +7562,45 @@ textarea:focus-visible {
 /* The editor is showing the stack's output: it is a result, not a document. */
 .pattern-editor.is-readonly .pattern-settings-menu {
   display: none;
+}
+
+/*
+ * Display view: the pattern as the finished article.
+ *
+ * Two tools stay — Move, which arranges the sheet, and Add, which writes notes
+ * onto it — because those are about presenting the pattern rather than drawing
+ * it. The rest of the rail and the workbench ribbons go with the control points.
+ * What stays is the drawing itself (pieces, measurements, allowance, notes,
+ * rulers), the view settings, and the ribbon Add needs to say what it draws.
+ */
+.pattern-editor.is-display .pattern-toolbar-tools button[data-tool]:not([data-tool='move']):not([data-tool='add']),
+.pattern-editor.is-display .pattern-point-bar,
+.pattern-editor.is-display .pattern-allowance-bar,
+.pattern-editor.is-display .pattern-ruler-bar,
+.pattern-editor.is-display .pattern-block-bar,
+.pattern-editor.is-display .pattern-sew-bar,
+.pattern-editor.is-display .pattern-join-bar,
+.pattern-editor.is-display .pattern-bridge-bar,
+.pattern-editor.is-display .pattern-simplify-bar,
+.pattern-editor.is-display .pattern-measure-bar,
+.pattern-editor.is-display .pattern-cut-bar,
+.pattern-editor.is-display .pattern-avatar-bar,
+.pattern-editor.is-display .pattern-xray-bar,
+.pattern-editor.is-display .pattern-context-menu {
+  display: none !important;
+}
+
+/* Only Add has anything to say in display view: Move arranges the sheet, and its
+   Free / Orbit modes are about points there are none of. */
+.pattern-editor.is-display:not([data-tool='add']) .pattern-tool-settings {
+  display: none !important;
+}
+
+/* And Add says one thing here: it writes text. */
+.pattern-editor.is-display .pattern-tool-settings [data-settings-for='move'],
+.pattern-editor.is-display .pattern-tool-settings [data-settings-for='add'] .pattern-settings-menu,
+.pattern-editor.is-display
+  .pattern-tool-settings
+  button[data-add-mode]:not([data-add-mode='text']) {
+  display: none !important;
 }

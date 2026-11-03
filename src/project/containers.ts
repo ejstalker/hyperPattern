@@ -14,6 +14,8 @@
 
 import type {
   CanvasNode,
+  ContainerViewMode,
+  DisplayPlacement,
   MeasureAnchor,
   MeasureItem,
   PatternDocument,
@@ -104,6 +106,48 @@ export function containerView(node: PatternFrameNode): ContainerView {
 /** Containers clip by default: a frame that shows everything shows nothing. */
 export function containerClips(node: PatternFrameNode): boolean {
   return node.clip !== false;
+}
+
+/** A container is a workbench unless it was put in display view. */
+export function containerViewMode(node: PatternFrameNode): ContainerViewMode {
+  return node.viewMode === 'display' ? 'display' : 'edit';
+}
+
+/** Is this container showing its pattern rather than offering it for editing? */
+export function containerShowsDisplay(node: PatternFrameNode): boolean {
+  return containerViewMode(node) === 'display';
+}
+
+/** A piece display view has not arranged: exactly where it was drawn. */
+export const DISPLAY_PLACEMENT_NONE: DisplayPlacement = {
+  x: 0,
+  y: 0,
+  rotationDeg: 0,
+  scale: 1,
+};
+
+/**
+ * Has this placement left the piece where it was drawn?
+ *
+ * A hair of float drift counts as unmoved: a drag that comes back to where it
+ * started is a drag that arranged nothing.
+ */
+export function isUnplaced(placement: DisplayPlacement): boolean {
+  const eps = 1e-6;
+  return (
+    Math.abs(placement.x) < eps &&
+    Math.abs(placement.y) < eps &&
+    Math.abs(placement.rotationDeg) < eps &&
+    Math.abs(placement.scale - 1) < eps
+  );
+}
+
+/** How display view places one piece — its own position when nothing was set. */
+export function displayPlacementFor(
+  node: PatternFrameNode,
+  pieceId: string
+): DisplayPlacement {
+  return node.displayPlacements?.[pieceId] ?? DISPLAY_PLACEMENT_NONE;
 }
 
 /**

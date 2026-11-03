@@ -4,18 +4,23 @@ import { rectPiece } from './createDefault';
 import {
   CONTAINER_PADDING_CM,
   DEFAULT_CANVAS_CM_SCALE,
+  DISPLAY_PLACEMENT_NONE,
   canvasAtCm,
   canvasCmAt,
   canvasCmScale,
   containerCanvasAt,
   containerCmAt,
+  containerShowsDisplay,
   containerView,
+  containerViewMode,
   fitContainerView,
   groupIntoContainer,
   movePiecesBetweenPatterns,
   movePiecesBetweenSpaces,
   piecesBoundsCm,
   containerViewShifted,
+  displayPlacementFor,
+  isUnplaced,
   rootPattern,
 } from './containers';
 
@@ -102,6 +107,65 @@ describe('container mapping', () => {
     expect(canvasCmScale(project)).toBe(DEFAULT_CANVAS_CM_SCALE);
     expect(board.x).toBeCloseTo(325, 10);
     expect(board.y).toBeCloseTo(130, 10);
+  });
+});
+
+describe('container view mode', () => {
+  const frame = (viewMode?: PatternFrameNode['viewMode']): PatternFrameNode => ({
+    type: 'patternFrame',
+    id: 'node',
+    patternId: 'p',
+    x: 0,
+    y: 0,
+    width: 100,
+    height: 100,
+    zIndex: 1,
+    ...(viewMode ? { viewMode } : {}),
+  });
+
+  it('is a workbench unless it was put in display view', () => {
+    expect(containerViewMode(frame())).toBe('edit');
+    expect(containerShowsDisplay(frame())).toBe(false);
+    expect(containerViewMode(frame('edit'))).toBe('edit');
+  });
+
+  it('shows the pattern when it is set to display', () => {
+    const node = frame('display');
+    expect(containerViewMode(node)).toBe('display');
+    expect(containerShowsDisplay(node)).toBe(true);
+    // The view mode is about how the frame draws, never where its work sits.
+    expect(containerView(node)).toEqual({
+      cmScale: DEFAULT_CANVAS_CM_SCALE,
+      viewX: 0,
+      viewY: 0,
+    });
+  });
+
+  it('places a piece where it was drawn until display view arranges it', () => {
+    const node = frame('display');
+    expect(displayPlacementFor(node, 'piece_a')).toEqual(DISPLAY_PLACEMENT_NONE);
+    expect(isUnplaced(displayPlacementFor(node, 'piece_a'))).toBe(true);
+
+    node.displayPlacements = { piece_a: { x: 4, y: -2, rotationDeg: 30, scale: 1.5 } };
+    expect(displayPlacementFor(node, 'piece_a')).toEqual({
+      x: 4,
+      y: -2,
+      rotationDeg: 30,
+      scale: 1.5,
+    });
+    expect(isUnplaced(displayPlacementFor(node, 'piece_a'))).toBe(false);
+    // Another piece is untouched by the first one's arrangement.
+    expect(displayPlacementFor(node, 'piece_b')).toEqual(DISPLAY_PLACEMENT_NONE);
+  });
+
+  it('takes an arrangement of nothing as the piece still in place', () => {
+    expect(isUnplaced({ x: 0, y: 0, rotationDeg: 0, scale: 1 })).toBe(true);
+    // Float drift from a drag that ended where it began is still "nothing".
+    expect(isUnplaced({ x: 1e-9, y: -1e-9, rotationDeg: 1e-9, scale: 1 + 1e-9 })).toBe(true);
+    // A turn, a scale or a move on its own is enough to count as arranged.
+    expect(isUnplaced({ x: 0, y: 0, rotationDeg: 0, scale: 1.01 })).toBe(false);
+    expect(isUnplaced({ x: 0.1, y: 0, rotationDeg: 0, scale: 1 })).toBe(false);
+    expect(isUnplaced({ x: 0, y: 0, rotationDeg: 1, scale: 1 })).toBe(false);
   });
 });
 

@@ -542,6 +542,34 @@ export type CanvasNodeBase = {
 };
 
 /**
+ * What a container is for.
+ *
+ * `edit` is the workbench: every point, handle and seam is on show and the tools
+ * can take hold of the work. `display` is the finished article — the pieces with
+ * their measurements and seam allowance, arranged as they are to be read, and no
+ * control points or sewing marks.
+ */
+export type ContainerViewMode = 'edit' | 'display';
+
+/**
+ * How display view shows one piece — a presentation transform, not geometry.
+ *
+ * Display view arranges the sheet: pieces are moved, turned and scaled to sit the
+ * way the pattern is meant to be read. None of it touches the pattern, so edit
+ * mode goes on showing the pieces exactly as they were drawn and the drape goes
+ * on using that geometry. The arrangement belongs to the frame.
+ */
+export type DisplayPlacement = {
+  /** Move across the sheet, in pattern centimetres. */
+  x: number;
+  y: number;
+  /** Turn about the piece's own centre, in degrees (clockwise on screen). */
+  rotationDeg: number;
+  /** Uniform scale about the piece's own centre. */
+  scale: number;
+};
+
+/**
  * A 2D container: a frame on the canvas showing a pattern's centimetre space.
  *
  * The pattern owns the work (pieces, seams, modifiers); the node is the frame
@@ -564,6 +592,13 @@ export type PatternFrameNode = CanvasNodeBase & {
    * changing the frame's extent. Off, the work spills over its neighbours.
    */
   clip?: boolean;
+  /** Edit the pattern in the frame, or show it. Absent means `edit`. */
+  viewMode?: ContainerViewMode;
+  /**
+   * Display view's arrangement, by piece id. A piece with no entry sits where it
+   * was drawn; see `DisplayPlacement`.
+   */
+  displayPlacements?: Record<string, DisplayPlacement>;
 };
 
 export type MeshFrameNode = CanvasNodeBase & {

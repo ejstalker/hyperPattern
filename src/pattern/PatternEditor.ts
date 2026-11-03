@@ -4,6 +4,7 @@ import type {
   BlockInstance,
   BlockVariableBinding,
   BlockVariableDecl,
+  DisplayPlacement,
   MeasureAnchor,
   MeasureItem,
   PatternDocument,
@@ -69,9 +70,11 @@ import {
   drawSeamConnectorPairs,
 } from '../mesh/meshSeamDraw';
 import { recordPieceSuccessors } from '../sim/pieceTransforms';
+import { isUnplaced } from '../project/containers';
 import { circlePiece, rectPiece, uid } from '../project/createDefault';
 import {
   anchorsBounds,
+  boundsOf,
   cloneBezierPoint,
   clonePatternPiece,
   dist,
@@ -244,11 +247,20 @@ export type PatternEditorCallbacks = {
    */
   onTextSelectionChange?: () => void;
   /**
-   * A press landed on a cooked document. The stack's output is a result, not a
-   * document, so the press does nothing — the host says how to get back to the
-   * editable copy.
+   * A press landed somewhere the editor will not act on — the cook of a modifier
+   * stack, or a pattern in display view. Either is something to look at rather
+   * than draw on, so the press does nothing; the host says why and how to get
+   * back to the editable copy.
    */
   onLockedPress?: () => void;
+  /**
+   * Display view finished arranging a piece: it was moved, turned or scaled.
+   *
+   * The arrangement is the frame's, not the pattern's, so the editor hands the
+   * new placement over rather than writing geometry — the host records it on the
+   * container and leaves the pieces where they were drawn.
+   */
+  onPlacementChange?: (pieceId: string, placement: DisplayPlacement) => void;
   onMarqueeRect?: (
     box: { x: number; y: number; w: number; h: number } | null,
     info: { additive: boolean; panels: boolean }
@@ -322,6 +334,15 @@ export type PatternEditorContainer = {
   /** How much of the pattern to draw — see `PatternDetail`. */
   detail: PatternDetail;
   /**
+   * Show the pattern rather than offer it for editing.
+   *
+   * Display view is the finished article: the pieces at their own transforms and
+   * scales, every edge's measurement, their seam allowance, and no control points
+   * or sewing marks. Nothing in it can be picked or changed, so a press belongs
+   * to whatever is behind the frame.
+   */
+  display: boolean;
+  /**
    * Who takes the pointer when `detail` is coarser than full.
    *
    * A container sitting on the canvas is a window: at the canvas's lowest zooms a
@@ -343,6 +364,7 @@ const CONTAINER_MODE_FIELDS = [
   'drawsGrid',
   'chromeScale',
   'detail',
+  'display',
   'coarsePointer',
 ] as const satisfies readonly (keyof PatternEditorContainer)[];
 
@@ -716,6 +738,35 @@ type DragKind =
       centerSize: Vec2;
       snapshots: PointSnapshot[];
     }
+  /**
+   * Display view arranging a piece. None of these touch the pattern: they write
+   * the frame's own placement, which is why they carry an `origin` to measure
+   * against instead of point snapshots.
+   */
+  | {
+      type: 'displayMove';
+      pieceId: string;
+      start: Vec2;
+      origin: DisplayPlacement;
+      /** The pointer has actually moved: a press and release is a pick. */
+      moved: boolean;
+    }
+  | {
+      type: 'displayScale';
+      pieceId: string;
+      /** The piece's centre as it is displayed: the pivot the scale grows about. */
+      centre: Vec2;
+      startDist: number;
+      origin: DisplayPlacement;
+    }
+  | {
+      type: 'displayRotate';
+      pieceId: string;
+      centre: Vec2;
+      /** Pointer angle about `centre` when the drag began, radians. */
+      startAngle: number;
+      origin: DisplayPlacement;
+    }
   | {
       /**
        * Orbit: the picked point swung about a pivot at a fixed radius. Shift pulls
@@ -861,6 +912,12 @@ export class PatternEditor {
   private toolbar: HTMLElement;
   private snapBtn: HTMLButtonElement;
   private pointBar: HTMLElement;
+  /**
+   * Display view's arrange ribbon, along the bottom middle: where the piece in
+   * hand sits and how it is turned and scaled, as numbers to type.
+   */
+  private arrangeBar!: HTMLElement;
+  private arrangeFields!: Record<'x' | 'y' | 'turn' | 'scale', HTMLInputElement>;
   /** The tool in hand's own options, top-left of the canvas. */
   private toolSettings: HTMLElement;
   private parallelCheck: HTMLInputElement;
@@ -1117,6 +1174,22 @@ export class PatternEditor {
    * itself: something to look at, not to draw on.
    */
   private readOnly = false;
+  /**
+   * Display view: the pattern as the finished article — pieces, allowance and
+   * notes, with none of the chrome that says "edit me". See
+   * `PatternEditorContainer.display`.
+   */
+  private displayOn = false;
+  /** The allowance setting display view took over, given back on the way out. */
+  private allowanceBeforeDisplay: boolean | null = null;
+  /**
+   * Display view's arrangement: how this frame exhibits each piece. Presentation
+   * only — the pieces themselves never move. The host owns the stored copy and
+   * hands it back here; a drag previews locally and reports once it is let go.
+   */
+  private placements = new Map<string, DisplayPlacement>();
+  /** The piece picked in display view: the one the arrange grips belong to. */
+  private displaySelectionId: string | null = null;
   private rulerBtn!: HTMLButtonElement;
   private cutBtn!: HTMLButtonElement;
   private settingsMenuOpen: SettingsMenuKey | null = null;
@@ -1457,6 +1530,50 @@ export class PatternEditor {
     this.parallelCheck.addEventListener('change', () => this.onParallelToggle());
     this.cornerCheck.addEventListener('change', () => this.onCornerToggle());
 
+    // Display view's arrange ribbon: the piece in hand, as numbers. It shares the
+    // bottom middle with the point's options — the two belong to different modes,
+    // so they are never up together.
+    this.arrangeBar = document.createElement('div');
+    this.arrangeBar.className = 'pattern-arrange-bar';
+    this.arrangeBar.hidden = true;
+    this.arrangeBar.innerHTML = `
+      <span class="pattern-settings-title">Arrange</span>
+      <label class="pattern-settings-field" title="Where the piece sits across the sheet, left to right">
+        <span>X</span>
+        <input type="number" data-arrange="x" step="0.1" inputmode="decimal" aria-label="Position X" />
+        <span class="pattern-settings-unit" data-arrange-unit="xy">in</span>
+      </label>
+      <label class="pattern-settings-field" title="Where the piece sits up the sheet">
+        <span>Y</span>
+        <input type="number" data-arrange="y" step="0.1" inputmode="decimal" aria-label="Position Y" />
+        <span class="pattern-settings-unit" data-arrange-unit="xy">in</span>
+      </label>
+      <label class="pattern-settings-field" title="How far the piece is turned about its centre">
+        <span>Turn</span>
+        <input type="number" data-arrange="turn" step="1" inputmode="decimal" aria-label="Rotation degrees" />
+        <span class="pattern-settings-unit">°</span>
+      </label>
+      <label class="pattern-settings-field" title="How big the piece is shown, about its centre">
+        <span>Scale</span>
+        <input type="number" data-arrange="scale" step="0.05" min="0.05" inputmode="decimal" aria-label="Scale" />
+        <span class="pattern-settings-unit">×</span>
+      </label>
+    `;
+    this.arrangeFields = {
+      x: this.arrangeBar.querySelector('input[data-arrange="x"]') as HTMLInputElement,
+      y: this.arrangeBar.querySelector('input[data-arrange="y"]') as HTMLInputElement,
+      turn: this.arrangeBar.querySelector('input[data-arrange="turn"]') as HTMLInputElement,
+      scale: this.arrangeBar.querySelector('input[data-arrange="scale"]') as HTMLInputElement,
+    };
+    this.sealOverlay(this.arrangeBar);
+    for (const field of Object.keys(this.arrangeFields) as Array<keyof typeof this.arrangeFields>) {
+      const input = this.arrangeFields[field];
+      // Typing arranges the piece as you go; letting go of the field is what makes
+      // it a step on the undo stack, so a number is one step however long it took.
+      input.addEventListener('input', () => this.applyArrangeField(field, false));
+      input.addEventListener('change', () => this.applyArrangeField(field, true));
+    }
+
     this.viewport = document.createElement('div');
     this.viewport.className = 'pattern-viewport';
     main.appendChild(this.viewport);
@@ -1464,6 +1581,7 @@ export class PatternEditor {
     // the viewport it used to shove the whole canvas down whenever you clicked
     // a point.
     this.viewport.appendChild(this.pointBar);
+    this.viewport.appendChild(this.arrangeBar);
 
     // Tool settings: the options the tool in hand needs, in the same top-left
     // slot as the point settings. The two are never up together — a tool with
@@ -2457,8 +2575,9 @@ export class PatternEditor {
       return;
     }
     if (this.handleToolKey(e)) return;
-    // A cooked document has nothing to delete: its contents are derived.
-    if (this.readOnly) return;
+    // A cooked document has nothing to delete: its contents are derived. Nor does
+    // a pattern being displayed — the same keys that would change it are inert.
+    if (this.readOnly || this.displayOn) return;
     if (e.key !== 'Delete' && e.key !== 'Backspace') return;
 
     const ae = document.activeElement as HTMLElement | null;
@@ -2495,6 +2614,9 @@ export class PatternEditor {
     if (e.key.length !== 1) return false;
     const tool = TOOL_KEYS[e.key.toLowerCase()];
     if (!tool) return false;
+    // A displayed pattern has no tools: the keys that would pick one up mean
+    // nothing until the container is back in edit view.
+    if (this.displayOn) return false;
     if (isTextEntry(e.target)) return false;
     const active = document.activeElement;
     if (!this.root.isConnected) return false;
@@ -2593,6 +2715,224 @@ export class PatternEditor {
   }
 
   /**
+   * Enter or leave display view.
+   *
+   * The mode owns the seam allowance: a finished piece is read with its seam
+   * allowance on, so display turns it on unless the draughtsperson had already
+   * asked for it, and hands the editor's own setting back on the way out. The
+   * selection goes with it — a control point you cannot grab must not stay drawn
+   * as though it were in hand. Display view keeps two tools: Move arranges the
+   * sheet, Add writes notes onto it.
+   */
+  private applyDisplayMode(on: boolean): void {
+    if (on === this.displayOn) return;
+    this.displayOn = on;
+    this.root.classList.toggle('is-display', on);
+    if (on) {
+      this.displaySelectionId = null;
+      this.allowanceBeforeDisplay = this.allowanceOn;
+      this.clearSelection();
+      this.allowanceEdge = null;
+      this.allowanceHover = null;
+      this.hideContextMenu();
+      this.hideSettingsMenus();
+      if (this.tool !== 'move' && this.tool !== 'add') this.setTool('move');
+      if (!this.allowanceOn) this.setSeamAllowanceEnabled(true);
+    } else {
+      this.displaySelectionId = null;
+      if (this.allowanceBeforeDisplay !== null) {
+        const previous = this.allowanceBeforeDisplay;
+        this.allowanceBeforeDisplay = null;
+        if (previous !== this.allowanceOn) this.setSeamAllowanceEnabled(previous);
+      }
+    }
+  }
+
+  /**
+   * Take display view's arrangement from the host.
+   *
+   * The host owns it — it is stored on the container — so this only replaces the
+   * working copy: on mount, and after undo has put an earlier arrangement back.
+   */
+  setDisplayPlacements(placements: Record<string, DisplayPlacement> | null): void {
+    const next = new Map(Object.entries(placements ?? {}));
+    const same =
+      next.size === this.placements.size &&
+      [...next].every(([id, p]) => {
+        const current = this.placements.get(id);
+        return (
+          !!current &&
+          current.x === p.x &&
+          current.y === p.y &&
+          current.rotationDeg === p.rotationDeg &&
+          current.scale === p.scale
+        );
+      });
+    if (same) return;
+    this.placements = next;
+    this.redraw();
+  }
+
+  /** How this frame currently exhibits a piece. */
+  private placementOf(pieceId: string): DisplayPlacement {
+    return this.placements.get(pieceId) ?? { x: 0, y: 0, rotationDeg: 0, scale: 1 };
+  }
+
+  /** The point a placement turns and scales a piece about: its outline's middle. */
+  private pieceCentre(piece: PatternPiece): Vec2 {
+    const poly = pieceToPolyline(piece.points, piece.closed);
+    if (poly.length === 0) return { x: 0, y: 0 };
+    const box = boundsOf(poly);
+    return { x: (box.min.x + box.max.x) / 2, y: (box.min.y + box.max.y) / 2 };
+  }
+
+  /** Where a placement puts a point of the piece, in pattern space. */
+  private placedPoint(piece: PatternPiece, point: Vec2, placement: DisplayPlacement): Vec2 {
+    const centre = this.pieceCentre(piece);
+    const rad = (placement.rotationDeg * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const dx = (point.x - centre.x) * placement.scale;
+    const dy = (point.y - centre.y) * placement.scale;
+    return {
+      x: centre.x + dx * cos - dy * sin + placement.x,
+      y: centre.y + dx * sin + dy * cos + placement.y,
+    };
+  }
+
+  /**
+   * Draw through the piece's display placement: everything the callback paints
+   * ends up in a group carrying the arrangement, so the fill, the measurements
+   * and the seam allowance all move together.
+   */
+  private withPlacement(piece: PatternPiece, draw: () => void): void {
+    const placement = this.placements.get(piece.id);
+    if (!placement || isUnplaced(placement)) {
+      draw();
+      return;
+    }
+    const start = this.svg.childNodes.length;
+    draw();
+    const drawn = Array.from(this.svg.childNodes).slice(start);
+    if (drawn.length === 0) return;
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('transform', this.placementTransform(piece, placement));
+    // The marks inside carry their own piece id; the group carries it too, so a
+    // press anywhere the arrangement has put the piece still knows the piece.
+    g.dataset.pieceId = piece.id;
+    for (const node of drawn) g.appendChild(node);
+    this.svg.appendChild(g);
+  }
+
+  /** The transform a display placement gives a piece: move, then turn and scale in place. */
+  private placementTransform(piece: PatternPiece, placement: DisplayPlacement): string {
+    const centre = this.pieceCentre(piece);
+    const scale = Math.max(0.01, placement.scale);
+    return (
+      `translate(${placement.x} ${placement.y}) translate(${centre.x} ${centre.y}) ` +
+      `rotate(${placement.rotationDeg}) scale(${scale}) ` +
+      `translate(${-centre.x} ${-centre.y})`
+    );
+  }
+
+  /** A piece as display view shows it, when the frame has arranged it. */
+  private placedPiece(
+    pieceId: string | null | undefined
+  ): { piece: PatternPiece; placement: DisplayPlacement } | null {
+    if (!pieceId) return null;
+    const placement = this.placements.get(pieceId);
+    if (!placement || isUnplaced(placement)) return null;
+    const piece = this.pattern.pieces.find((entry) => entry.id === pieceId);
+    return piece ? { piece, placement } : null;
+  }
+
+  /** A point of a piece as display view shows it. */
+  private placedPiecePoint(pieceId: string, point: Vec2): Vec2 {
+    const placed = this.placedPiece(pieceId);
+    return placed ? this.placedPoint(placed.piece, point, placed.placement) : point;
+  }
+
+  /** The box round a piece as display view shows it — the arrange grips live on it. */
+  private displayBox(piece: PatternPiece): BBox | null {
+    const poly = pieceToPolyline(piece.points, piece.closed);
+    if (poly.length === 0) return null;
+    const placement = this.placementOf(piece.id);
+    const placed = poly.map((point) => this.placedPoint(piece, point, placement));
+    const box = boundsOf(placed);
+    return { minX: box.min.x, minY: box.min.y, maxX: box.max.x, maxY: box.max.y };
+  }
+
+  /** Where a placement leaves the piece's centre: the pivot the grips turn about. */
+  private placementCentre(piece: PatternPiece): Vec2 {
+    const placement = this.placementOf(piece.id);
+    const centre = this.pieceCentre(piece);
+    return { x: centre.x + placement.x, y: centre.y + placement.y };
+  }
+
+  /**
+   * The arrange grips of the piece in hand: a dashed box, a grip at each corner
+   * for scale, and the rotate zone just outside them — the same language the
+   * editable selection uses.
+   */
+  private drawDisplayChrome(): void {
+    const id = this.displaySelectionId;
+    if (!id) return;
+    const piece = this.pattern.pieces.find((entry) => entry.id === id);
+    if (!piece) return;
+    const box = this.displayBox(piece);
+    if (!box) return;
+    const x = box.minX;
+    const y = box.minY;
+    const w = box.maxX - box.minX;
+    const h = box.maxY - box.minY;
+
+    const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    rect.setAttribute('x', String(x));
+    rect.setAttribute('y', String(y));
+    rect.setAttribute('width', String(w));
+    rect.setAttribute('height', String(h));
+    rect.setAttribute('class', 'pattern-selection-box');
+    rect.setAttribute('stroke-width', String(this.px(1.75)));
+    rect.setAttribute('stroke-dasharray', `${this.px(7)} ${this.px(4)}`);
+    rect.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(rect);
+
+    const hs = this.px(8);
+    const corners: Array<{ handle: ScaleHandle; cx: number; cy: number }> = [
+      { handle: 'nw', cx: x, cy: y },
+      { handle: 'ne', cx: x + w, cy: y },
+      { handle: 'sw', cx: x, cy: y + h },
+      { handle: 'se', cx: x + w, cy: y + h },
+    ];
+    for (const c of corners) {
+      const ring = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      const inner = this.rotateZoneInner();
+      const outer = this.rotateZoneOuter();
+      ring.setAttribute('cx', String(c.cx));
+      ring.setAttribute('cy', String(c.cy));
+      ring.setAttribute('r', String((inner + outer) / 2 - (outer - inner) / 4));
+      ring.setAttribute('class', 'pattern-rotate-ring');
+      ring.setAttribute('fill', 'none');
+      ring.setAttribute('stroke-width', String(this.px(1.25)));
+      ring.setAttribute('stroke-dasharray', `${this.px(3)} ${this.px(3)}`);
+      ring.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(ring);
+    }
+    for (const c of corners) {
+      const handle = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      handle.setAttribute('x', String(c.cx - hs / 2));
+      handle.setAttribute('y', String(c.cy - hs / 2));
+      handle.setAttribute('width', String(hs));
+      handle.setAttribute('height', String(hs));
+      handle.setAttribute('class', 'pattern-scale-handle');
+      handle.setAttribute('stroke-width', String(this.px(1.5)));
+      handle.dataset.kind = 'displayScale';
+      handle.dataset.handle = c.handle;
+      this.svg.appendChild(handle);
+    }
+  }
+
+  /**
    * Replace the document's geometry with the cooked stack.
    *
    * Only ever called on a copy: the stack itself, the notes, the images and the
@@ -2628,6 +2968,7 @@ export class PatternEditor {
     // panning the canvas.
     if (sameContainerMode(this.container, mode)) return;
     this.container = mode;
+    this.applyDisplayMode(mode?.display === true);
     // `redraw` re-applies the clip, so the frame's own box is up to date too.
     this.redraw();
   }
@@ -2648,6 +2989,7 @@ export class PatternEditor {
     const previous = this.container;
     if (sameContainerMode(previous, mode)) return;
     this.container = mode;
+    this.applyDisplayMode(mode?.display === true);
     // A different frame, or a different amount of it, is a different drawing.
     if (!sameContainerShape(previous, mode)) {
       this.redraw();
@@ -2839,7 +3181,17 @@ export class PatternEditor {
   }
 
   setTool(tool: PatternTool): void {
+    // Display view offers two tools: Move, which arranges the sheet, and Add,
+    // which writes notes onto it. Everything else is the workbench's, and Add
+    // only ever writes text here.
+    if (this.displayOn) {
+      if (tool !== 'move' && tool !== 'add') tool = 'move';
+      if (tool === 'add' && this.addMode !== 'text') this.addMode = 'text';
+    }
     this.tool = tool;
+    // The root carries the tool in hand, so the stylesheet can speak about it —
+    // display view shows the ribbon for Add alone.
+    this.root.dataset.tool = tool;
     if (tool !== 'add') {
       this.penStrokeId = null;
       this.hideSettingsMenus();
@@ -3040,7 +3392,9 @@ export class PatternEditor {
   private setAddMode(mode: AddMode): void {
     // Choosing a mode puts away any dropdown opened from it.
     this.hideSettingsMenus();
-    this.addMode = mode;
+    // Display view's Add writes notes and nothing else: it has no geometry to draw
+    // on, and the piece it would make is the workbench's to make.
+    this.addMode = this.displayOn ? 'text' : mode;
     // A pen stroke belongs to the mode that started it.
     this.penStrokeId = null;
     if (this.tool !== 'add') {
@@ -3823,6 +4177,38 @@ export class PatternEditor {
     // whole reason to bring one onto the sheet.
     this.drawImages();
 
+    // Display view: the pieces with their measurements and seam allowance,
+    // arranged the way the frame exhibits them, and nothing that says "edit me" —
+    // no control points, no sewing marks. Nothing can be edited here, so a frame
+    // on the board hands its presses to the canvas and a full-screen one keeps
+    // pan and zoom, plus the Move and Add tools that arrange the sheet.
+    if (this.displayOn) {
+      this.svg.style.pointerEvents = this.container?.locked ? 'none' : '';
+      // Which pieces came out of a block is a fact about the geometry, so it holds
+      // in display view too: the pieces keep their family colour. Only the block
+      // outlines — drafting guides — are dropped.
+      this.blockOwnership = new Map();
+      for (const instance of this.blocks()) {
+        for (const entry of instance.pieces) this.blockOwnership.set(entry.pieceId, instance);
+      }
+      for (const piece of this.pattern.pieces) {
+        this.withPlacement(piece, () => this.drawPiece(piece, 'display'));
+      }
+      this.drawSeamAllowances((piece) =>
+        this.withPlacement(piece, () => this.drawAllowanceRing(piece))
+      );
+      // Notes, pictures and the drafting references are the sheet's own contents,
+      // not chrome: a displayed pattern still shows what was written over it.
+      for (const reading of this.drawRulers()) this.svg.appendChild(reading);
+      this.drawMeasures();
+      this.drawTexts();
+      // The arrange grips belong to the piece in hand, in the same language as
+      // the editable selection box.
+      if (this.tool === 'move') this.drawDisplayChrome();
+      this.syncChrome();
+      return;
+    }
+
     // Zoomed far enough out that every mark would be a smear of chrome over the
     // work, there is less to draw — see `PatternDetail`. A frame on the canvas
     // hands the pointer over as well, so a press there moves the container.
@@ -3932,7 +4318,13 @@ export class PatternEditor {
       this.drawBridgePreview(this.bridgePreview.piece);
     }
 
+    this.syncChrome();
+  }
+
+  /** The readouts and ribbons that follow a redraw, whatever was drawn. */
+  private syncChrome(): void {
     this.updatePointBar();
+    this.updateArrangeBar();
     this.updateAllowanceBar();
     this.updateRulerReadout();
     this.updateBlockReadouts();
@@ -4024,6 +4416,75 @@ export class PatternEditor {
     this.cornerCheck.checked = corner;
     this.parallelCheck.checked = !!pt.handlesParallel;
     this.parallelCheck.disabled = corner;
+  }
+
+  /**
+   * Display view's arrange ribbon: where the piece in hand is, and how it is
+   * turned and scaled. It follows the piece as it is dragged, but never writes
+   * over the field being typed into — the caret would jump.
+   */
+  private updateArrangeBar(): void {
+    const id = this.displaySelectionId;
+    const piece =
+      this.displayOn && this.tool === 'move' && id
+        ? (this.pattern.pieces.find((entry) => entry.id === id) ?? null)
+        : null;
+    if (!piece) {
+      this.arrangeBar.hidden = true;
+      return;
+    }
+    this.arrangeBar.hidden = false;
+    const placement = this.placementOf(piece.id);
+    const centre = this.placementCentre(piece);
+    const values = {
+      x: cmToDisplay(centre.x, this.unit),
+      y: cmToDisplay(centre.y, this.unit),
+      turn: placement.rotationDeg,
+      scale: placement.scale,
+    };
+    for (const key of Object.keys(this.arrangeFields) as Array<keyof typeof this.arrangeFields>) {
+      const input = this.arrangeFields[key];
+      if (document.activeElement === input) continue;
+      input.value = this.arrangeText(values[key]);
+    }
+    this.arrangeBar
+      .querySelectorAll<HTMLElement>('[data-arrange-unit="xy"]')
+      .forEach((unit) => {
+        unit.textContent = this.unit;
+      });
+  }
+
+  /** A number as the arrange ribbon shows it: two decimals, no trailing zeroes. */
+  private arrangeText(value: number): string {
+    return String(Math.round(value * 100) / 100);
+  }
+
+  /**
+   * One arrange field, typed or stepped.
+   *
+   * The fields are the arrangement, not the geometry: X and Y are the piece's
+   * centre on the sheet, and turning or scaling is about that same centre, so a
+   * number here never moves a point of the pattern. `commit` is what makes the
+   * value a step on the undo stack — one step per field, not one per keystroke.
+   */
+  private applyArrangeField(
+    field: 'x' | 'y' | 'turn' | 'scale',
+    commit: boolean
+  ): void {
+    const id = this.displaySelectionId;
+    const piece = id ? this.pattern.pieces.find((entry) => entry.id === id) : null;
+    if (!piece) return;
+    const raw = Number.parseFloat(this.arrangeFields[field].value);
+    if (!Number.isFinite(raw)) return;
+    const placement = { ...this.placementOf(piece.id) };
+    const centre = this.pieceCentre(piece);
+    if (field === 'x') placement.x = displayToCm(raw, this.unit) - centre.x;
+    else if (field === 'y') placement.y = displayToCm(raw, this.unit) - centre.y;
+    else if (field === 'turn') placement.rotationDeg = raw;
+    else placement.scale = Math.max(0.05, Math.min(20, raw));
+    this.placements.set(piece.id, placement);
+    this.redraw();
+    if (commit) this.cbs.onPlacementChange?.(piece.id, { ...placement });
   }
 
   /** Snapshot host undo history once before the next mutation in this gesture. */
@@ -5390,11 +5851,13 @@ export class PatternEditor {
    * `mark` is what a zoomed-out canvas asks for. The outline is always drawn —
    * however far out you go, the shape of the work is the one thing worth showing —
    * and the marks that would be unreadable at that size are dropped: `silhouette`
-   * keeps a faint fill as well, `outline` is the bare line.
+   * keeps a faint fill as well, `outline` is the bare line. `display` is the
+   * finished piece: fill, outline, the edge measurements and the grainline, and
+   * none of the marks you would grab to change it.
    */
   private drawPiece(
     piece: PatternPiece,
-    mark: 'full' | 'silhouette' | 'outline' = 'full'
+    mark: 'full' | 'silhouette' | 'outline' | 'display' = 'full'
   ): void {
     const n = piece.points.length;
     // Generated geometry reads as one family: lavender lines and points say
@@ -5417,20 +5880,62 @@ export class PatternEditor {
       path.dataset.pieceId = piece.id;
       this.svg.appendChild(path);
     }
+    if (mark === 'display') {
+      // A displayed piece is still read by its edges: every one carries its
+      // length, the same numbers the editor shows, because that is what the sheet
+      // is measured by — at the detail at which numbers can actually be read.
+      // What it does not carry is anything you could take hold of — no points, no
+      // handles — so the marks below are skipped.
+      if ((this.container?.detail ?? 'full') === 'full') this.drawEdgeLengths(piece);
+      if (piece.grainline && this.grainOn) this.drawGrainline(piece, blockCls);
+      return;
+    }
     if (mark !== 'full') return;
 
-    // Every edge carries its length while the points are on show: an unlabelled
-    // edge is a measurement missing from the sheet, and the points are what you
-    // are reading the numbers against. Longest edges are placed first, in the
-    // middle of their edge, because those are the ones you actually measure. An
-    // edge too short to hold its own text there — a dart leg, a notch, the ease
-    // on a drafted block — is labelled just outside the piece instead, pushed
-    // further out until it is clear of the labels already placed.
-    //
-    // A piece with hundreds of edges is not one you read numbers off: a
-    // rasterised glyph is a staircase of one-pixel steps. Past that many edges
-    // only the ones long enough to hold their text are marked, which is what
-    // every piece used to do.
+    this.drawEdgeLengths(piece);
+    if (piece.grainline && this.grainOn) this.drawGrainline(piece, blockCls);
+
+    const showHandles =
+      (this.tool === 'add' && this.addMode === 'pen') ||
+      (this.tool === 'move' && this.selectedIds.size === 1);
+
+    const pointR = this.px(5);
+    const pointSw = this.px(1.5);
+    for (const pt of pieceRings(piece).flat()) {
+      if (showHandles && (pt.handleIn || pt.handleOut || this.selectedIds.has(pt.id))) {
+        this.drawHandles(piece, pt);
+      }
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', String(pt.anchor.x));
+      c.setAttribute('cy', String(pt.anchor.y));
+      c.setAttribute('r', String(pointR));
+      c.setAttribute('stroke-width', String(pointSw));
+      c.setAttribute(
+        'class',
+        `${this.selectedIds.has(pt.id) ? 'pattern-point selected' : 'pattern-point'}${blockCls}`
+      );
+      c.dataset.pointId = pt.id;
+      c.dataset.pieceId = piece.id;
+      c.dataset.kind = 'anchor';
+      this.svg.appendChild(c);
+    }
+  }
+
+  /**
+   * Every edge of a piece, labelled with its length.
+   *
+   * An unlabelled edge is a measurement missing from the sheet. Longest edges are
+   * placed first, in the middle of their edge, because those are the ones you
+   * actually measure. An edge too short to hold its own text there — a dart leg, a
+   * notch, the ease on a drafted block — is labelled just outside the piece
+   * instead, pushed further out until it is clear of the labels already placed.
+   *
+   * A piece with hundreds of edges is not one you read numbers off: a rasterised
+   * glyph is a staircase of one-pixel steps. Past that many edges only the ones
+   * long enough to hold their text are marked, which is what every piece used to
+   * do.
+   */
+  private drawEdgeLengths(piece: PatternPiece): void {
     const maxLabelledEdges = 80;
     const labelPx = 11;
     const fontSize = this.px(labelPx);
@@ -5542,47 +6047,6 @@ export class PatternEditor {
       label.textContent = p.text;
       this.svg.appendChild(label);
     }
-
-    if (piece.grainline && this.grainOn) {
-      const g = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      g.setAttribute('x1', String(piece.grainline.from.x));
-      g.setAttribute('y1', String(piece.grainline.from.y));
-      g.setAttribute('x2', String(piece.grainline.to.x));
-      g.setAttribute('y2', String(piece.grainline.to.y));
-      g.setAttribute('class', `pattern-grain${blockCls}`);
-      // Every mark belonging to a piece has to advertise it: the editor resolves
-      // "which piece was clicked" from the event target, so artwork without the
-      // id swallows the gesture and the piece looks dead under the cursor.
-      g.dataset.pieceId = piece.id;
-      g.setAttribute('stroke-width', String(this.px(2)));
-      g.setAttribute('stroke-dasharray', `${this.px(6)} ${this.px(4)}`);
-      this.svg.appendChild(g);
-    }
-
-    const showHandles =
-      (this.tool === 'add' && this.addMode === 'pen') ||
-      (this.tool === 'move' && this.selectedIds.size === 1);
-
-    const pointR = this.px(5);
-    const pointSw = this.px(1.5);
-    for (const pt of pieceRings(piece).flat()) {
-      if (showHandles && (pt.handleIn || pt.handleOut || this.selectedIds.has(pt.id))) {
-        this.drawHandles(piece, pt);
-      }
-      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-      c.setAttribute('cx', String(pt.anchor.x));
-      c.setAttribute('cy', String(pt.anchor.y));
-      c.setAttribute('r', String(pointR));
-      c.setAttribute('stroke-width', String(pointSw));
-      c.setAttribute(
-        'class',
-        `${this.selectedIds.has(pt.id) ? 'pattern-point selected' : 'pattern-point'}${blockCls}`
-      );
-      c.dataset.pointId = pt.id;
-      c.dataset.pieceId = piece.id;
-      c.dataset.kind = 'anchor';
-      this.svg.appendChild(c);
-    }
   }
 
   private piecePathD(piece: PatternPiece): string {
@@ -5633,6 +6097,29 @@ export class PatternEditor {
     };
     if (pt.handleIn) drawOne(pt.handleIn, 'in');
     if (pt.handleOut) drawOne(pt.handleOut, 'out');
+  }
+
+  /**
+   * The grainline: the direction the piece is cut on. A mark on the cloth rather
+   * than a handle on it, so it stays in display view too — when the view settings
+   * have it on.
+   */
+  private drawGrainline(piece: PatternPiece, blockCls: string): void {
+    const grain = piece.grainline;
+    if (!grain) return;
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    g.setAttribute('x1', String(grain.from.x));
+    g.setAttribute('y1', String(grain.from.y));
+    g.setAttribute('x2', String(grain.to.x));
+    g.setAttribute('y2', String(grain.to.y));
+    g.setAttribute('class', `pattern-grain${blockCls}`);
+    // Every mark belonging to a piece has to advertise it: the editor resolves
+    // "which piece was clicked" from the event target, so artwork without the
+    // id swallows the gesture and the piece looks dead under the cursor.
+    g.dataset.pieceId = piece.id;
+    g.setAttribute('stroke-width', String(this.px(2)));
+    g.setAttribute('stroke-dasharray', `${this.px(6)} ${this.px(4)}`);
+    this.svg.appendChild(g);
   }
 
   private svgPointFromClient(clientX: number, clientY: number): Vec2 {
@@ -8701,15 +9188,32 @@ export class PatternEditor {
       for (const item of measure.items) {
         const span = measureItemSpan(this.pattern.pieces, item);
         if (!span) continue;
-        group.appendChild(this.drawMeasureItem(item, span, hot));
+        group.appendChild(this.drawMeasureItem(item, this.shownMeasureSpan(item, span), hot));
       }
 
       const label = measureLabelText(reading, this.unit, measure);
+      const owner = this.measureOwnerPiece(measure);
+      const placed = this.displayOn ? this.placedPiece(owner) : null;
       const anchor = measureAnchorPoints(this.pattern.pieces, measure);
+      // Display view shows a measurement over one piece through that piece's own
+      // arrangement, the readout included — a value parked beside a panel is still
+      // that panel's value.
+      const shownMeasure = placed
+        ? { ...measure, label: this.placedPoint(placed.piece, measure.label, placed.placement) }
+        : measure;
+      const shownAnchor = placed
+        ? anchor.map((point) => this.placedPoint(placed.piece, point, placed.placement))
+        : anchor;
       // The readout goes into the group last so it draws over its own dimension
       // lines, and travels with them in the DOM.
       group.appendChild(
-        this.drawMeasureLabel(measure, label, hot, anchor, gathered || !!measure.sumOf)
+        this.drawMeasureLabel(
+          shownMeasure,
+          label,
+          hot,
+          shownAnchor,
+          gathered || !!measure.sumOf
+        )
       );
       this.svg.appendChild(group);
     }
@@ -8732,6 +9236,51 @@ export class PatternEditor {
     }
   }
 
+  /**
+   * A dimension's span as display view shows it.
+   *
+   * A span runs between two anchors, so each end follows the piece it sits on:
+   * two pieces arranged apart keep their measurement stretched between them. An
+   * edge item's span is both ends of that edge, so it follows the one piece.
+   * The measured length never changes — the arrangement is presentation, and the
+   * number is the pattern's.
+   */
+  private shownMeasureSpan(
+    item: MeasureItem,
+    span: { a: Vec2; b: Vec2; mid: Vec2; lengthCm: number }
+  ): { a: Vec2; b: Vec2; mid: Vec2; lengthCm: number } {
+    if (!this.displayOn) return span;
+    if (item.kind === 'edge') {
+      return {
+        a: this.placedPiecePoint(item.pieceId, span.a),
+        b: this.placedPiecePoint(item.pieceId, span.b),
+        mid: this.placedPiecePoint(item.pieceId, span.mid),
+        lengthCm: span.lengthCm,
+      };
+    }
+    const a = this.placedPiecePoint(item.a.pieceId, span.a);
+    const b = this.placedPiecePoint(item.b.pieceId, span.b);
+    return { a, b, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, lengthCm: span.lengthCm };
+  }
+
+  /**
+   * The one piece a measurement is attached to, or null when it runs between
+   * several. Only a measurement of one piece can have its readout ride the same
+   * arrangement as its dimension lines.
+   */
+  private measureOwnerPiece(measure: PatternMeasure): string | null {
+    const ids = new Set<string>();
+    for (const item of measure.items) {
+      if (item.kind === 'edge') ids.add(item.pieceId);
+      else {
+        ids.add(item.a.pieceId);
+        ids.add(item.b.pieceId);
+      }
+      if (ids.size > 1) return null;
+    }
+    return ids.size === 1 ? ([...ids][0] ?? null) : null;
+  }
+
   /** One dimension line: span, or the edge's own curve with its length on it. */
   private drawMeasureItem(
     item: MeasureItem,
@@ -8744,9 +9293,18 @@ export class PatternEditor {
       const samples = piece
         ? sampleEdgeByPointIds(piece, item.fromPointId, item.toPointId, 20)
         : null;
-      if (samples && samples.length > 1) {
-        let d = `M ${samples[0]!.x} ${samples[0]!.y}`;
-        for (let i = 1; i < samples.length; i++) d += ` L ${samples[i]!.x} ${samples[i]!.y}`;
+      // Display view shows the edge where the piece is shown. The curve follows
+      // the piece point for point; the number stays upright and the size it is
+      // drawn at, the way a dimension's text always does.
+      const placed = this.displayOn ? this.placedPiece(item.pieceId) : null;
+      const shown = samples
+        ? samples.map((point) =>
+            placed ? this.placedPoint(placed.piece, point, placed.placement) : point
+          )
+        : null;
+      if (shown && shown.length > 1) {
+        let d = `M ${shown[0]!.x} ${shown[0]!.y}`;
+        for (let i = 1; i < shown.length; i++) d += ` L ${shown[i]!.x} ${shown[i]!.y}`;
         const path = svgEl('path');
         path.setAttribute('d', d);
         path.setAttribute('class', 'pattern-measure-dim');
@@ -8872,6 +9430,16 @@ export class PatternEditor {
     path.setAttribute('fill', 'none');
     path.setAttribute('pointer-events', 'none');
     path.setAttribute('stroke-width', String(this.px(hot ? 4.5 : 3)));
+    // The edge it lights up is the piece's, so in display view it is shown where
+    // the piece is shown.
+    const placed = this.displayOn ? this.placedPiece(edge.pieceId) : null;
+    if (placed) {
+      const g = svgEl('g');
+      g.setAttribute('transform', this.placementTransform(placed.piece, placed.placement));
+      g.appendChild(path);
+      this.svg.appendChild(g);
+      return;
+    }
     this.svg.appendChild(path);
   }
 
@@ -9328,7 +9896,10 @@ export class PatternEditor {
     const hitEl = e.target as SVGElement;
     const onScaleHandle =
       this.tool === 'move' && hitEl.dataset?.kind === 'scale' && !!hitEl.dataset.handle;
-    const altPress = this.tool === 'move' && e.button === 0 && e.altKey && !onScaleHandle;
+    // Display view has no points to flip and no panels to duplicate, so Alt keeps
+    // its other meaning there: the pan gesture.
+    const altPress =
+      this.tool === 'move' && !this.displayOn && e.button === 0 && e.altKey && !onScaleHandle;
     const altAnchor = altPress ? this.anchorPointAt(this.svgPoint(e)) : null;
     const altPiece = altPress && !altAnchor ? this.pieceAt(hitEl, this.svgPoint(e)) : null;
 
@@ -9352,6 +9923,17 @@ export class PatternEditor {
     }
 
     if (e.button !== 0) return;
+
+    // Display view arranges the sheet rather than editing the pattern: the press
+    // is the piece in hand, the arrange grips, or a note. On the board the svg has
+    // already handed the pointer over (see `redraw`), so this is the full-screen
+    // case.
+    if (this.displayOn) {
+      e.stopPropagation();
+      e.preventDefault();
+      this.onDisplayDown(e, this.svgPoint(e));
+      return;
+    }
 
     // The stack's output is something to look at, not to draw on: panning and
     // zooming still work (above), every other press says how to get back to the
@@ -9780,6 +10362,180 @@ export class PatternEditor {
       e.preventDefault();
       this.redraw();
     }
+  }
+
+  /**
+   * A press in display view.
+   *
+   * Display view arranges the sheet rather than editing the pattern. Move picks a
+   * piece up and puts it where it is wanted, and turns and scales it from the
+   * grips on its own box; Add writes a note into the pattern, which is the one
+   * thing here that is document data. Everything either does is reported to the
+   * host — the arrangement on the frame, the note in the pattern — so the pieces
+   * themselves are left exactly as they were drawn.
+   */
+  private onDisplayDown(e: PointerEvent, p: Vec2): void {
+    const target = e.target as SVGElement;
+    const kind = target.dataset?.kind;
+
+    // A note is picked, carried, resized and typed into exactly as it is in the
+    // workbench: it is the sheet's own object, not a piece of the pattern. Notes
+    // are document data, so a cook — which is a copy — has none to give: the press
+    // says how to get to the copy that can be edited.
+    const noteEl = (e.target as Element | null)?.closest?.('[data-text-id]') as
+      | HTMLElement
+      | null;
+    const noteId = (this.tool === 'move' ? noteEl?.dataset.textId : null) ?? null;
+    if (noteId && !this.readOnly) {
+      this.onTextDown(e, p, noteId);
+      return;
+    }
+
+    if (this.tool === 'add') {
+      if (this.readOnly) {
+        this.cbs.onLockedPress?.();
+        return;
+      }
+      // Add is here to write a note: drag out its box and let the host make it.
+      this.drag = { type: 'objectBox', kind: 'text', start: p, current: p };
+      this.svg.setPointerCapture(e.pointerId);
+      this.redraw();
+      return;
+    }
+
+    const selected = this.displaySelectionId
+      ? (this.pattern.pieces.find((piece) => piece.id === this.displaySelectionId) ?? null)
+      : null;
+
+    // A scale grip on the piece in hand.
+    if (selected && kind === 'displayScale') {
+      const centre = this.placementCentre(selected);
+      this.drag = {
+        type: 'displayScale',
+        pieceId: selected.id,
+        centre,
+        startDist: Math.max(1e-3, dist(p, centre)),
+        origin: this.placementOf(selected.id),
+      };
+      this.svg.setPointerCapture(e.pointerId);
+      this.redraw();
+      return;
+    }
+
+    // Just outside a corner of its box: a drag turns the piece about its centre.
+    if (selected) {
+      const box = this.displayBox(selected);
+      const corner = box ? this.rotateCornerAt(p, box) : null;
+      if (box && corner) {
+        const centre = this.placementCentre(selected);
+        this.drag = {
+          type: 'displayRotate',
+          pieceId: selected.id,
+          centre,
+          startAngle: angleAbout(p, centre),
+          origin: this.placementOf(selected.id),
+        };
+        this.svg.setPointerCapture(e.pointerId);
+        this.redraw();
+        return;
+      }
+    }
+
+    // A piece: pick it up, and carry it if the pointer moves.
+    const pieceId = target.dataset?.pieceId ?? null;
+    const piece = pieceId ? this.pattern.pieces.find((entry) => entry.id === pieceId) : null;
+    if (piece) {
+      this.displaySelectionId = piece.id;
+      this.drag = {
+        type: 'displayMove',
+        pieceId: piece.id,
+        start: p,
+        origin: this.placementOf(piece.id),
+        moved: false,
+      };
+      this.svg.setPointerCapture(e.pointerId);
+      this.redraw();
+      return;
+    }
+
+    // Bare sheet: let the arrangement go.
+    if (this.displaySelectionId) {
+      this.displaySelectionId = null;
+      this.redraw();
+    }
+  }
+
+  /** A pointer move in display view: carry the drag, or light the grip under it. */
+  private onDisplayMove(e: PointerEvent): void {
+    const p = this.svgPoint(e);
+    const drag = this.drag;
+
+    // Panning is the same gesture here as in the workbench.
+    if (drag?.type === 'pan') {
+      this.applyPanDrag(drag, e);
+      return;
+    }
+
+    if (drag?.type === 'displayMove') {
+      const rawDx = p.x - drag.start.x;
+      const rawDy = p.y - drag.start.y;
+      if (rawDx === 0 && rawDy === 0) return;
+      drag.moved = true;
+      // Shift locks the carry to the axis it is already going along.
+      const lock = axisLockFromDelta(rawDx, rawDy, e.shiftKey);
+      this.placements.set(drag.pieceId, {
+        ...drag.origin,
+        x: drag.origin.x + (lock === 'y' ? 0 : rawDx),
+        y: drag.origin.y + (lock === 'x' ? 0 : rawDy),
+      });
+      this.redraw();
+      return;
+    }
+
+    if (drag?.type === 'displayScale') {
+      const reach = dist(p, drag.centre);
+      const scale = Math.max(0.05, Math.min(20, (drag.origin.scale * reach) / drag.startDist));
+      this.placements.set(drag.pieceId, { ...drag.origin, scale });
+      this.redraw();
+      return;
+    }
+
+    if (drag?.type === 'displayRotate') {
+      let delta = angleAbout(p, drag.centre) - drag.startAngle;
+      // Shift snaps the amount turned to 15° steps, like the selection's own turn.
+      if (e.shiftKey) delta = snapAngle(delta, Math.PI / 12);
+      this.placements.set(drag.pieceId, {
+        ...drag.origin,
+        rotationDeg: drag.origin.rotationDeg + (delta * 180) / Math.PI,
+      });
+      this.redraw();
+      return;
+    }
+
+    // No drag: say what the pointer is over.
+    const target = e.target as SVGElement;
+    if (target.dataset?.kind === 'displayScale' || target.dataset?.pieceId) {
+      this.applyCursor(null);
+      this.svg.style.cursor = target.dataset?.kind === 'displayScale' ? 'nwse-resize' : 'move';
+      return;
+    }
+    if (this.displaySelectionId) {
+      const piece = this.pattern.pieces.find((entry) => entry.id === this.displaySelectionId);
+      const box = piece ? this.displayBox(piece) : null;
+      if (box && this.rotateCornerAt(p, box)) {
+        this.svg.style.cursor = ROTATE_CURSOR;
+        return;
+      }
+    }
+    this.applyCursor(null);
+  }
+
+  /** Carry the view by a pan drag: the pattern follows the pointer. */
+  private applyPanDrag(drag: Extract<DragKind, { type: 'pan' }>, e: PointerEvent): void {
+    const scale = this.screenToPatternScale();
+    this.viewBox.x = drag.startView.x - (e.clientX - drag.startClient.x) / scale;
+    this.viewBox.y = drag.startView.y - (e.clientY - drag.startClient.y) / scale;
+    this.redraw();
   }
 
   private onDartDown(p: Vec2): void {
@@ -11217,30 +11973,38 @@ export class PatternEditor {
    * line is dashed the way a cutter reads one: the seam line is the piece, this
    * is what is left outside it.
    */
-  private drawSeamAllowances(): void {
+  private drawSeamAllowances(each?: (piece: PatternPiece) => void): void {
     // Hicon shows the allowance whether or not the allowance tool is in hand:
     // it is one of the three things that mode draws. The picking that the tool
     // adds stays behind `allowanceOn` — a projection is not a drafting session.
     if (!this.allowanceOn && !this.hiconOn) return;
     for (const piece of this.pattern.pieces) {
-      const d = seamAllowanceRings(piece).map((ring) => allowanceRingPath(ring)).join(' ');
-      if (!d) continue;
-      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      path.setAttribute('d', d);
-      path.setAttribute(
-        'class',
-        `pattern-allowance${this.blockOwnership.has(piece.id) ? ' is-block' : ''}`
-      );
-      path.setAttribute('fill', 'none');
-      path.setAttribute('pointer-events', 'none');
-      path.setAttribute('stroke-width', String(this.px(1.4)));
-      path.setAttribute('stroke-dasharray', `${this.px(6)} ${this.px(4)}`);
-      path.dataset.pieceId = piece.id;
-      this.svg.appendChild(path);
+      // Display view draws each ring through the piece's own arrangement, so the
+      // allowance travels with the piece it belongs to.
+      if (each) each(piece);
+      else this.drawAllowanceRing(piece);
     }
 
     this.drawAllowanceEdgeMark(this.allowanceHover, 'is-hover');
     this.drawAllowanceEdgeMark(this.allowanceEdge, 'is-picked');
+  }
+
+  /** One piece's seam allowance: the line its own allowance makes. */
+  private drawAllowanceRing(piece: PatternPiece): void {
+    const d = seamAllowanceRings(piece).map((ring) => allowanceRingPath(ring)).join(' ');
+    if (!d) return;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', d);
+    path.setAttribute(
+      'class',
+      `pattern-allowance${this.blockOwnership.has(piece.id) ? ' is-block' : ''}`
+    );
+    path.setAttribute('fill', 'none');
+    path.setAttribute('pointer-events', 'none');
+    path.setAttribute('stroke-width', String(this.px(1.4)));
+    path.setAttribute('stroke-dasharray', `${this.px(6)} ${this.px(4)}`);
+    path.dataset.pieceId = piece.id;
+    this.svg.appendChild(path);
   }
 
   /** One edge, and the allowance line that belongs to it. */
@@ -11685,6 +12449,12 @@ export class PatternEditor {
   }
 
   private onPointerMove(e: PointerEvent): void {
+    // Display view has its own gestures: carrying, turning and scaling the
+    // arrangement, and nothing else. A hover only says what the pointer is over.
+    if (this.displayOn) {
+      this.onDisplayMove(e);
+      return;
+    }
     // Hovering a readout lights everything it reads, under either of the tools
     // that can take hold of one.
     if (!this.drag && this.measureInteractive()) {
@@ -11835,10 +12605,7 @@ export class PatternEditor {
     const p = this.svgPoint(e);
 
     if (this.drag.type === 'pan') {
-      const scale = this.screenToPatternScale();
-      this.viewBox.x = this.drag.startView.x - (e.clientX - this.drag.startClient.x) / scale;
-      this.viewBox.y = this.drag.startView.y - (e.clientY - this.drag.startClient.y) / scale;
-      this.redraw();
+      this.applyPanDrag(this.drag, e);
       return;
     }
 
@@ -12278,6 +13045,22 @@ export class PatternEditor {
       if (this.orbit) this.orbit.radius = finished.radius;
       this.syncToolSettings();
       this.endHistoryGesture();
+      this.redraw();
+      return;
+    }
+
+    if (
+      finished.type === 'displayMove' ||
+      finished.type === 'displayScale' ||
+      finished.type === 'displayRotate'
+    ) {
+      // The arrangement is the frame's, not the pattern's: the drag previewed it
+      // here, and letting go is what hands it to the host to record. A press and
+      // release that never moved is a pick, and reports nothing.
+      const placement = this.placements.get(finished.pieceId);
+      if (placement && (finished.type !== 'displayMove' || finished.moved)) {
+        this.cbs.onPlacementChange?.(finished.pieceId, { ...placement });
+      }
       this.redraw();
       return;
     }
