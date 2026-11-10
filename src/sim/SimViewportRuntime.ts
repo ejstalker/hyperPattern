@@ -24,6 +24,8 @@ import type { AvatarBody } from '../mesh/AvatarBody';
 import { SelectionOverlay } from './SelectionOverlay';
 import { ClothSewTool } from './ClothSewTool';
 import { PlacementGesture, type PlacementCommit } from './placementGesture';
+import { carryParticles, poseFitsCloth } from './particleCarryOver';
+import { MOVE_ICON, POINTS_ICON, ROTATE_ICON, SEW_ICON } from './viewportIcons';
 import { viewportOwnsKey } from './viewportKeyGuard';
 import { ViewportShadingControl } from './ViewportShadingControl';
 import type { Environment } from '../render/environment';
@@ -131,7 +133,10 @@ export class SimViewportRuntime {
   private shadingControl: ViewportShadingControl | null = null;
   private moveGizmo: MoveGizmo | null = null;
   private selectionOverlay: SelectionOverlay | null = null;
-  private transformToggle: HTMLButtonElement | null = null;
+  /** The Move and Rotate mode buttons, and the column the tools sit in. */
+  private toolsColumn: HTMLElement | null = null;
+  private moveToggle: HTMLButtonElement | null = null;
+  private rotateToggle: HTMLButtonElement | null = null;
   /** "Draw pattern points" toggle + its marker layer and mini editor. */
   private pointsToggle: HTMLButtonElement | null = null;
   /** Sew tool toggle + the shared edge highlighting / picking behaviour. */
@@ -142,6 +147,9 @@ export class SimViewportRuntime {
   private patternPointsEnabled = false;
   private pointMarkers: PatternPointMarker[] = [];
   private pointMarkerEls: HTMLButtonElement[] = [];
+  /** What the cloth is busy with, when the app is re-cutting it under us. */
+  private busyLabel: string | null = null;
+  private busyEl: HTMLDivElement | null = null;
   private incidentTriangles: IncidentTriangles | null = null;
   private readonly markerNormal = new Float32Array(3);
   /**
@@ -254,8 +262,12 @@ export class SimViewportRuntime {
     this.moveGizmo = null;
     this.selectionOverlay?.destroy();
     this.selectionOverlay = null;
-    this.transformToggle?.remove();
-    this.transformToggle = null;
+    this.moveToggle?.remove();
+    this.moveToggle = null;
+    this.rotateToggle?.remove();
+    this.rotateToggle = null;
+    this.toolsColumn?.remove();
+    this.toolsColumn = null;
     this.pointsToggle?.remove();
     this.pointsToggle = null;
     this.sewTool?.destroy();
@@ -401,14 +413,14 @@ export class SimViewportRuntime {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'sim-points-toggle';
-    button.textContent = 'Draw pattern points';
+    button.innerHTML = `${POINTS_ICON}<span>Draw pattern points</span>`;
     button.addEventListener('pointerdown', (e) => e.stopPropagation());
     button.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       this.setPatternPointsEnabled(!this.patternPointsEnabled);
     });
-    this.host.appendChild(button);
+    (this.toolsColumn ?? this.host).appendChild(button);
     this.pointsToggle = button;
     this.setPatternPointsEnabled(this.patternPointsEnabled);
   }
@@ -435,6 +447,37 @@ export class SimViewportRuntime {
       this.refreshPointMarkers();
     }
     this.invalidate();
+  }
+
+  /**
+   * Announce work happening to this viewport's cloth from outside it.
+   *
+   * A re-cut runs on the main thread, so nothing here can animate while it does;
+   * the point is that the wait is shown *before* it starts, so the pane reads as
+   * busy rather than hung. Null clears it.
+   */
+  setBusy(label: string | null): void {
+    if (this.busyLabel === label) return;
+    this.busyLabel = label;
+    if (!label) {
+      this.busyEl?.remove();
+      this.busyEl = null;
+      this.host.classList.remove('is-busy');
+    } else {
+      if (!this.busyEl) {
+        const el = document.createElement('div');
+        el.className = 'sim-busy';
+        el.setAttribute('role', 'status');
+        el.innerHTML =
+          '<span class="sim-busy-spinner" aria-hidden="true"></span><span class="sim-busy-label"></span>';
+        this.host.appendChild(el);
+        this.busyEl = el;
+      }
+      const labelEl = this.busyEl.querySelector('.sim-busy-label');
+      if (labelEl) labelEl.textContent = label;
+      this.host.classList.add('is-busy');
+    }
+    this.refreshPointMarkers();
   }
 
   /** Map each pattern anchor to its nearest cloth vertex and index its triangles. */
@@ -508,6 +551,12 @@ export class SimViewportRuntime {
   /** Project the markers and hide the ones facing away from the camera. */
   private refreshPointMarkers(): void {
     if (!this.patternPointsEnabled || !this.pointMarkerEls.length) return;
+    if (this.busyLabel) {
+      // The cloth and the mesh are out of step while it is re-cut: the markers
+      // index the old particles, so they stay hidden until the new cloth exists.
+      for (const el of this.pointMarkerEls) el.style.display = 'none';
+      return;
+    }
     const positions = this.cloth?.getPositionsSnapshot?.() ?? null;
     const indices = this.mesh?.triangles ?? null;
     const incident = this.incidentTriangles;
@@ -548,33 +597,59 @@ export class SimViewportRuntime {
     }
   }
 
+  /** The column the viewport's tools hang in, top-left, one button per row. */
+  private mountToolsColumn(): HTMLElement {
+    this.toolsColumn?.remove();
+    const column = document.createElement('div');
+    column.className = 'sim-viewport-tools';
+    this.host.appendChild(column);
+    this.toolsColumn = column;
+    return column;
+  }
+
   private mountTransformToggle(): void {
-    this.transformToggle?.remove();
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'sim-transform-toggle';
-    button.addEventListener('pointerdown', (e) => e.stopPropagation());
-    button.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.setTransformMode(this.transformMode === 'translate' ? 'rotate' : 'translate');
-    });
-    this.host.appendChild(button);
-    this.transformToggle = button;
+    const column = this.mountToolsColumn();
+    const make = (mode: TransformMode, label: string, icon: string): HTMLButtonElement => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'sim-transform-toggle';
+      button.dataset.transformMode = mode;
+      button.innerHTML = `${icon}<span>${label}</span>`;
+      button.addEventListener('pointerdown', (e) => e.stopPropagation());
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.setTransformMode(mode);
+      });
+      column.appendChild(button);
+      return button;
+    };
+    this.moveToggle = make('translate', 'Move', MOVE_ICON);
+    this.rotateToggle = make('rotate', 'Rotate', ROTATE_ICON);
     this.setTransformMode(this.transformMode);
   }
 
   private setTransformMode(mode: TransformMode): void {
     this.transformMode = mode;
     this.moveGizmo?.setMode(mode);
-    if (this.transformToggle) {
-      const rotating = mode === 'rotate';
-      this.transformToggle.classList.toggle('is-rotate', rotating);
-      this.transformToggle.textContent = rotating ? 'Rotate' : 'Move';
-      this.transformToggle.title = rotating
-        ? 'Rotation mode (E) — drag a gizmo axis to rotate the selection around the group pivot'
-        : 'Move mode (W) — drag the selection or a gizmo axis to translate · Shift-click to multi-select';
-      this.transformToggle.setAttribute('aria-pressed', String(rotating));
+    const modes: Array<[HTMLButtonElement | null, TransformMode, string]> = [
+      [
+        this.moveToggle,
+        'translate',
+        'Move mode (W) — drag the selection or a gizmo axis to translate · Shift-click to multi-select',
+      ],
+      [
+        this.rotateToggle,
+        'rotate',
+        'Rotation mode (E) — drag a gizmo axis to rotate the selection around the group pivot',
+      ],
+    ];
+    for (const [button, target, tip] of modes) {
+      if (!button) continue;
+      const on = mode === target;
+      button.classList.toggle('is-active', on);
+      button.setAttribute('aria-pressed', String(on));
+      button.title = tip;
     }
     this.syncMoveGizmo();
   }
@@ -899,7 +974,11 @@ export class SimViewportRuntime {
     // before any saved drape is applied on top.
     this.computePointMarkers();
     this.computeMarkerNormalSign();
-    if (pose && pose.positions.length >= 12) {
+    // Only a pose that describes *this* cloth: a pose captured before the pattern
+    // was re-cut belongs to a mesh that no longer exists, and applying it index
+    // for index is what turns a rewind into a spray of spikes.
+    const restLength = this.cloth.getRestPositionsSnapshot?.()?.length ?? 0;
+    if (pose && poseFitsCloth(pose.positions, restLength ? restLength / 3 : null)) {
       this.cloth.applyPose(pose);
     }
     // Frozen pieces keep their captured pose even when a rebuild handed us a
@@ -922,6 +1001,59 @@ export class SimViewportRuntime {
   /** False while the fabric still lies where its cloth was built. */
   hasSteppedSimulation(): boolean {
     return this.hasStepped;
+  }
+
+  /**
+   * Swap in an edited pattern's mesh without dropping the drape.
+   *
+   * Fitting is a loop of nudges: move a point, look at the drape, move it again.
+   * A full rebuild would throw the drape away each time, so the cloth is rebuilt
+   * from the new geometry and every new particle takes over the live particle
+   * nearest it in the old layout — carrying the drape across, and carrying the
+   * fabric along with the part of the pattern that moved.
+   *
+   * Returns false, leaving the current cloth exactly as it was, when there is
+   * nothing to carry the drape onto. The caller then falls back to a full reload.
+   */
+  updateMeshKeepingDrape(
+    mesh: MeshGeometry | null | undefined,
+    pattern?: PatternDocument | null
+  ): boolean {
+    if (!this.cloth || !this.mesh || !this.avatarBody) return false;
+    if (!mesh || mesh.vertices.length < 3 || mesh.triangles.length < 3) return false;
+    // Everything that can refuse is decided before the old cloth is destroyed.
+    const rest = this.cloth.getRestPositionsSnapshot?.() ?? null;
+    const pieces = this.cloth.getVertexPieceIds();
+    const pose = this.cloth.exportPose();
+    const selected = [...this.selectedPieceIds];
+    const primary = this.selectedPieceId;
+
+    this.rebuildCloth(mesh, this.sim.params, null, pattern ?? this.pattern);
+    if (!this.cloth) return false;
+
+    const nextRest = this.cloth.getRestPositionsSnapshot?.() ?? null;
+    // Carried piece by piece: a panel keeps its own fabric even when the cut
+    // rolls every particle index over.
+    const carried =
+      rest && nextRest
+        ? carryParticles(
+            { positions: pose.positions, velocities: pose.velocities, rest, pieceIds: pieces },
+            nextRest,
+            this.cloth.getVertexPieceIds()
+          )
+        : null;
+    if (carried) this.cloth.applyPose(carried);
+    // The drape is under way: the pieces belong to the simulation, not to the
+    // upstream arrangement, so moving one is a nudge rather than a placement.
+    this.hasStepped = true;
+    // A rebuild clears the selection; the edit was made on the pieces that were
+    // picked, so they stay picked and the gizmo keeps following them.
+    const pieceIds = new Set(this.mesh?.vertexPieceIds ?? []);
+    const kept =
+      pieceIds.size === 0 ? selected : selected.filter((id) => pieceIds.has(id));
+    this.setPieceSelection(kept, primary && kept.includes(primary) ? primary : kept[0] ?? null);
+    this.invalidate();
+    return true;
   }
 
   setStrainMapEnabled(enabled: boolean): void {
@@ -1365,7 +1497,7 @@ export class SimViewportRuntime {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'sim-sew-toggle';
-    button.textContent = 'Sew edges';
+    button.innerHTML = `${SEW_ICON}<span>Sew edges</span>`;
     button.setAttribute('aria-pressed', 'false');
     button.addEventListener('pointerdown', (e) => e.stopPropagation());
     button.addEventListener('click', (e) => {
@@ -1373,7 +1505,7 @@ export class SimViewportRuntime {
       e.stopPropagation();
       this.setSewEnabled(!this.isSewEnabled());
     });
-    this.host.appendChild(button);
+    (this.toolsColumn ?? this.host).appendChild(button);
     this.sewToggle = button;
     this.syncSewToggle();
   }

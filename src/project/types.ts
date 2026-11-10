@@ -189,6 +189,23 @@ export type PatternMeasure = {
   sumOf?: number;
 };
 
+/**
+ * A group drawn round pieces inside a pattern.
+ *
+ * Like a group on the board it holds nothing of its own: membership is worked out
+ * from where the pieces are (see `patternGroups.ts`), so a piece dragged into the
+ * frame joins it and one dragged out leaves.
+ */
+export type PatternGroup = {
+  id: string;
+  label: string;
+  /** Top-left of the frame, in pattern centimetres. */
+  x: number;
+  y: number;
+  widthCm: number;
+  heightCm: number;
+};
+
 export type PatternDocument = {
   id: string;
   name: string;
@@ -207,6 +224,11 @@ export type PatternDocument = {
    * with the frame, scales with it, and never reaches a mesh.
    */
   texts?: PatternText[];
+  /**
+   * Frames drawn round pieces (see `PatternGroup`). They hold what lies inside
+   * them, worked out from where the pieces are, and never reach a mesh either.
+   */
+  groups?: PatternGroup[];
   /**
    * Reference images drafted over (see `PatternImage`). Like the notes, they
    * belong to the pattern: an image placed inside a container travels with the
@@ -658,17 +680,17 @@ export type ImageNode = CanvasNodeBase & {
  * box is measured in — so the text zooms with the board like any other work.
  */
 /**
- * A section: a big visual group, the way Figma draws one.
+ * A group: a big visual box drawn round a set of objects, the way Figma draws one.
  *
  * It is a label and a rectangle, nothing more. What it *holds* is worked out from
- * where the objects are (see `sections.ts`) rather than stored, so the grouping
+ * where the objects are (see `groups.ts`) rather than stored, so the grouping
  * can never disagree with the board: drag something in and it is in, drag it out
- * and it is not. A section paints behind everything, never clips and takes no
+ * and it is not. A group paints behind everything, never clips and takes no
  * pointer but on its label and its corners, so the canvas it covers is still
  * canvas.
  */
-export type SectionNode = CanvasNodeBase & {
-  type: 'section';
+export type GroupNode = CanvasNodeBase & {
+  type: 'group';
   label: string;
 };
 
@@ -707,7 +729,7 @@ export type CanvasNode =
   | SimViewportNode
   | ImageNode
   | TextAnnotationNode
-  | SectionNode;
+  | GroupNode;
 
 export type MeshSimAssignment = {
   id: string;

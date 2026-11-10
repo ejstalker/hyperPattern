@@ -88,6 +88,14 @@ export function normalizeProject(project: ProjectDocument): ProjectDocument {
     };
   }
 
+  // Groups used to be called sections. A board saved before the rename still
+  // says 'section', and a node of an unknown type would drop off the canvas.
+  for (const node of normalized.canvas.nodes) {
+    if ((node as { type: string }).type === 'section') {
+      (node as { type: string }).type = 'group';
+    }
+  }
+
   for (const transform of normalized.transforms) {
     if (!transform.pieceTransforms) transform.pieceTransforms = {};
   }

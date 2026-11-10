@@ -8,6 +8,7 @@ import type {
   MeasureAnchor,
   MeasureItem,
   PatternDocument,
+  PatternGroup,
   PatternImage,
   PatternMeasure,
   PatternPiece,
@@ -25,6 +26,7 @@ import {
   normalizePatternTexts,
   patternTextCss,
 } from './patternText';
+import { groupBoxForPieces, piecesInGroup } from './patternGroups';
 import { cookPattern } from './modifiers/engine';
 import {
   PATTERN_IMAGE_MIN_CM,
@@ -195,6 +197,14 @@ export type PatternEditorCallbacks = {
   /** Fired once before a gesture/mutation so the host can snapshot undo history. */
   onBeforeChange?: () => void;
   /**
+   * The gesture is over — a drag was let go or a click committed.
+   *
+   * `onChange` fires for every move *while* a drag happens; this fires once, when
+   * what it changed is final. Work too costly to repeat per move — remeshing a
+   * running drape — belongs here, so dragging stays light.
+   */
+  onChangeEnd?: () => void;
+  /**
    * Drafting references — rulers, seam allowance — never change geometry, so they
    * must not invalidate the mesh the way `onChange` does.
    */
@@ -238,7 +248,7 @@ export type PatternEditorCallbacks = {
   /**
    * Whether this host can place this kind of object *here*. A canvas that holds
    * both patterns and notes takes both; a pattern opened full screen takes a note
-   * over its work but has nowhere to put a section, which groups canvas objects.
+   * over its work but has nowhere to put a group, which frames pieces.
    */
   canPlaceObject?: (kind: PlacedObjectKind) => boolean;
   /**
@@ -246,6 +256,19 @@ export type PatternEditorCallbacks = {
    * host reads `getSelectedText()` and puts its style bar up when there is one.
    */
   onTextSelectionChange?: () => void;
+  /**
+   * A group frame was made, moved, resized or renamed.
+   *
+   * Groups are drafting structure, like rulers: they are drawn over the sheet and
+   * never reach a mesh, so this is deliberately not `onChange`. Moving a group
+   * *does* move its pieces, and that move reports through `onChange` as well.
+   */
+  onGroupChange?: () => void;
+  /**
+   * The group in hand changed. The host lights it in the 2D chip, the way a
+   * stage lights the chip it belongs to.
+   */
+  onGroupSelectionChange?: (groupId: string | null) => void;
   /**
    * A press landed somewhere the editor will not act on — the cook of a modifier
    * stack, or a pattern in display view. Either is something to look at rather
@@ -420,10 +443,10 @@ export type PatternTool =
  * the editor only draws the box and asks the host to fill it. Those modes are
  * offered only where a host says it can take one.
  */
-export type AddMode = 'pen' | 'rect' | 'circle' | 'text' | 'section' | 'image';
+export type AddMode = 'pen' | 'rect' | 'circle' | 'text' | 'group' | 'image';
 
 /** What an object box is for: the kinds of object a host can place. */
-export type PlacedObjectKind = 'text' | 'section' | 'image';
+export type PlacedObjectKind = 'text' | 'group' | 'image';
 
 /** A box dragged out on the canvas: pattern centimetres, `w`/`h` 0 for a click. */
 export type ObjectBoxPlace = { x: number; y: number; w: number; h: number };
@@ -556,11 +579,32 @@ const ADD_MODES: ReadonlyArray<{ mode: AddMode; label: string; tip: string }> = 
     tip: 'Add · Image — drag out the box for a reference image, or click to place one at its own size',
   },
   {
-    mode: 'section',
-    label: 'Section',
-    tip: 'Add · Section — drag out a group: anything inside it joins it',
+    mode: 'group',
+    label: 'Group',
+    tip: 'Add · Group — drag out a frame: the pieces inside it join it',
   },
 ];
+
+/**
+ * The modes of one tool as ribbon buttons, each carrying the number that picks it
+ * from the keyboard.
+ *
+ * A tool's modes are a list in a fixed order, so the number is simply its place in
+ * that list — the same order the ribbon shows and the shortcuts read.
+ */
+function modeButtonsHtml<T extends string>(
+  modes: ReadonlyArray<{ mode: T; label: string; tip: string }>,
+  attribute: string
+): string {
+  return modes
+    .map(
+      (entry, index) =>
+        `<button type="button" ${attribute}="${entry.mode}" title="${entry.tip} (${index + 1})">${
+          entry.label
+        }<span class="pattern-settings-key" aria-hidden="true">${index + 1}</span></button>`
+    )
+    .join('');
+}
 
 /**
  * How faint a silhouette is when the canvas is zoomed too far out to draw the work
@@ -690,6 +734,29 @@ type DragKind =
       current: Vec2;
     }
   | { type: 'rulerCreate'; start: Vec2; current: Vec2; snap: boolean }
+  /** A group frame being carried, which carries its pieces with it. */
+  | {
+      type: 'moveGroup';
+      id: string;
+      start: Vec2;
+      origin: { x: number; y: number };
+      /** The pieces inside it when the drag began, so the frame keeps them. */
+      pieceIds: string[];
+      /** Whether the pointer actually carried it anywhere. */
+      moved: boolean;
+      /** Their anchors at the start, keyed by point id. */
+      anchors: Map<string, Vec2>;
+    }
+  /** A corner of a group's frame being dragged out, in pattern centimetres. */
+  | {
+      type: 'resizeGroup';
+      id: string;
+      corner: 'nw' | 'ne' | 'se' | 'sw';
+      start: Vec2;
+      rect: { x: number; y: number; widthCm: number; heightCm: number };
+      /** Whether the frame ended up somewhere else. */
+      moved: boolean;
+    }
   /** The note in hand being carried, in pattern centimetres. */
   | { type: 'moveText'; id: string; start: Vec2; origin: Vec2 }
   /** A note's corner being dragged out, in pattern centimetres. */
@@ -1165,6 +1232,13 @@ export class PatternEditor {
   private selectedTextId: string | null = null;
   /** The note being typed into: its box is a live contenteditable while set. */
   private textEditingId: string | null = null;
+  /** The group frame in hand — document data on `pattern.groups`. */
+  private selectedGroupId: string | null = null;
+  /** The group label being typed into, as an input laid over the frame. */
+  private groupEditingId: string | null = null;
+  /** When a group's name was last pressed, for the double-press that types. */
+  private lastGroupNamePress = 0;
+  private lastGroupNameId: string | null = null;
   /** When the note in hand was last pressed, for the double-press that types. */
   private lastTextPress = 0;
   /** The image in hand — document data on `pattern.images`. */
@@ -1597,10 +1671,7 @@ export class PatternEditor {
       <div class="pattern-settings-set" data-settings-for="move" hidden>
         <span class="pattern-settings-title">Move</span>
         <div class="pattern-settings-group" role="group" aria-label="Move mode">
-          ${MOVE_MODES.map(
-            (entry) =>
-              `<button type="button" data-move-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
-          ).join('')}
+          ${modeButtonsHtml(MOVE_MODES, 'data-move-mode')}
         </div>
         <span class="pattern-orbit-hint" data-orbit-hint></span>
         <label class="pattern-settings-field" data-settings-extra="orbit" title="How far from the point it turns about the moving point may travel — Shift-drag the point to pull the tether in or out">
@@ -1612,12 +1683,10 @@ export class PatternEditor {
       <div class="pattern-settings-set" data-settings-for="add" hidden>
         <span class="pattern-settings-title">Add</span>
         <div class="pattern-settings-group" role="group" aria-label="Add mode">
-          ${ADD_MODES.filter((entry) => this.canPlaceObject(entry.mode))
-            .map(
-              (entry) =>
-                `<button type="button" data-add-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
-            )
-            .join('')}
+          ${modeButtonsHtml(
+            ADD_MODES.filter((entry) => this.canPlaceObject(entry.mode)),
+            'data-add-mode'
+          )}
         </div>
         <div class="pattern-settings-menu">
           <button type="button" class="pattern-settings-open" data-menu-open="block" title="Draft a piece from the block library" aria-haspopup="true" aria-expanded="false">Block… <span aria-hidden="true">▾</span></button>
@@ -1636,10 +1705,7 @@ export class PatternEditor {
       <div class="pattern-settings-set" data-settings-for="modify" hidden>
         <span class="pattern-settings-title">Modify</span>
         <div class="pattern-settings-group" role="group" aria-label="Modify mode">
-          ${MODIFY_MODES.map(
-            (entry) =>
-              `<button type="button" data-modify-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
-          ).join('')}
+          ${modeButtonsHtml(MODIFY_MODES, 'data-modify-mode')}
         </div>
         <div class="pattern-settings-group" data-settings-extra="join" role="group" aria-label="Edges to pick">
           ${EDGE_PAIR_MODES.map(
@@ -1666,19 +1732,16 @@ export class PatternEditor {
       <div class="pattern-settings-set" data-settings-for="cut" hidden>
         <span class="pattern-settings-title">Cut</span>
         <div class="pattern-settings-group" role="group" aria-label="Cut mode">
-          ${CUT_MODES.map(
-            (entry) =>
-              `<button type="button" data-cut-mode="${entry.mode}" title="${CUT_TIPS[entry.mode]}">${entry.label}</button>`
-          ).join('')}
+          ${modeButtonsHtml(
+            CUT_MODES.map((entry) => ({ ...entry, tip: CUT_TIPS[entry.mode] })),
+            'data-cut-mode'
+          )}
         </div>
       </div>
       <div class="pattern-settings-set" data-settings-for="ruler" hidden>
         <span class="pattern-settings-title">Ruler</span>
         <div class="pattern-settings-group" role="group" aria-label="Ruler mode">
-          ${RULER_MODES.map(
-            (entry) =>
-              `<button type="button" data-ruler-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
-          ).join('')}
+          ${modeButtonsHtml(RULER_MODES, 'data-ruler-mode')}
         </div>
         <!-- What the rail's ruler popup used to hold: the library of body
              measurements a rule can be laid out at, so the tool that picks one
@@ -1697,10 +1760,7 @@ export class PatternEditor {
       <div class="pattern-settings-set" data-settings-for="sew" hidden>
         <span class="pattern-settings-title">Sew</span>
         <div class="pattern-settings-group" role="group" aria-label="Sew mode">
-          ${EDGE_PAIR_MODES.map(
-            (entry) =>
-              `<button type="button" data-sew-mode="${entry.mode}" title="${entry.tip}">${entry.label}</button>`
-          ).join('')}
+          ${modeButtonsHtml(EDGE_PAIR_MODES, 'data-sew-mode')}
         </div>
       </div>
     `;
@@ -2609,11 +2669,61 @@ export class PatternEditor {
    * its own tool in hand. A modified key is never a tool key, so ⌘/Ctrl+V, ⌘/Ctrl+S
    * and the rest still mean what they always meant.
    */
+  /**
+   * The modes the tool in hand offers, in ribbon order — the same list the number
+   * keys walk. A tool with no modes of its own has nothing to pick.
+   */
+  private activeToolModes(): ReadonlyArray<{ mode: string; label: string; tip: string }> {
+    switch (this.tool) {
+      case 'move':
+        return MOVE_MODES;
+      case 'add':
+        return ADD_MODES.filter((entry) => this.canPlaceObject(entry.mode));
+      case 'modify':
+        return MODIFY_MODES;
+      case 'cut':
+        return CUT_MODES.map((entry) => ({ ...entry, tip: CUT_TIPS[entry.mode] }));
+      case 'ruler':
+        return RULER_MODES;
+      case 'sew':
+        return EDGE_PAIR_MODES;
+      default:
+        return [];
+    }
+  }
+
+  /** Put the tool in hand into one of its modes, by name. */
+  private applyToolMode(mode: string): void {
+    switch (this.tool) {
+      case 'move':
+        this.setMoveMode(mode as MoveMode);
+        return;
+      case 'add':
+        this.setAddMode(mode as AddMode);
+        return;
+      case 'modify':
+        this.setModifyMode(mode as ModifyMode);
+        return;
+      case 'cut':
+        this.setCutMode(mode as CutMode);
+        return;
+      case 'ruler':
+        this.setRulerMode(mode as RulerMode);
+        return;
+      case 'sew':
+        this.setSewMode(mode as SewMode);
+        return;
+      default:
+        return;
+    }
+  }
+
   private handleToolKey(e: KeyboardEvent): boolean {
     if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return false;
     if (e.key.length !== 1) return false;
+    const digit = /^[1-9]$/.test(e.key) ? Number(e.key) : 0;
     const tool = TOOL_KEYS[e.key.toLowerCase()];
-    if (!tool) return false;
+    if (!tool && !digit) return false;
     // A displayed pattern has no tools: the keys that would pick one up mean
     // nothing until the container is back in edit view.
     if (this.displayOn) return false;
@@ -2623,6 +2733,18 @@ export class PatternEditor {
     if (active !== this.root && !this.root.contains(active)) return false;
     e.preventDefault();
     e.stopPropagation();
+    // A number picks one of the modes the tool in hand is showing, in ribbon
+    // order: Add's pen, rectangle, circle… — the keys belong to the tool, so the
+    // same digit means something different under Cut.
+    if (digit) {
+      const entry = this.activeToolModes()[digit - 1];
+      if (!entry) return true;
+      this.closeViewMenu();
+      this.hideSettingsMenus();
+      this.hideContextMenu();
+      this.applyToolMode(entry.mode);
+      return true;
+    }
     // Taking a tool up is walking back to the canvas: whatever popover was in
     // the way closes, the way Escape would close it.
     this.closeViewMenu();
@@ -2678,6 +2800,9 @@ export class PatternEditor {
     this.textEditingId = null;
     // So does an image in hand.
     this.selectedImageId = null;
+    // And a group frame: the ids are the previous document's.
+    this.selectedGroupId = null;
+    this.groupEditingId = null;
     // A pick in flight belongs to the document that was on screen.
     this.clearJoin();
     this.clearBridge();
@@ -3378,13 +3503,12 @@ export class PatternEditor {
    * Whether the Add tool can place this kind of object here.
    *
    * The shapes and the pen are the pattern's own work and are always on offer.
-   * Text, images and sections are objects the *host* owns, so they need a host
-   * that can take one — and one that can take *this* one, since a pattern opened
-   * full screen has somewhere to put a note or a reference image but nowhere to
-   * put a section.
+   * Text, images and groups are objects the *host* owns, so they need a host that
+   * can take one — and one that can take *this* one: the page has room for all
+   * three, a container only for the ones it knows how to store.
    */
   private canPlaceObject(mode: AddMode): boolean {
-    if (mode !== 'text' && mode !== 'section' && mode !== 'image') return true;
+    if (mode !== 'text' && mode !== 'group' && mode !== 'image') return true;
     if (!this.cbs.onAddObject) return false;
     return this.cbs.canPlaceObject ? this.cbs.canPlaceObject(mode) : true;
   }
@@ -4235,6 +4359,9 @@ export class PatternEditor {
       this.drawOrbitGuide();
       return;
     }
+
+    // Group frames are ground: they go down before the work they surround.
+    this.drawGroups();
 
     // Ownership has to be known before anything is drawn, and the group boxes go
     // down first so a piece stroke can never be painted over by one.
@@ -8669,6 +8796,180 @@ export class PatternEditor {
    * container's frame on the board. It is drawn under the pieces (see `redraw`):
    * a reference is something to draft over, not something to cover the drafting.
    */
+  /** The frames drawn round pieces — `pattern.groups`. */
+  private groups(): PatternGroup[] {
+    return this.pattern.groups ?? [];
+  }
+
+  private findGroup(id: string | null): PatternGroup | null {
+    if (!id) return null;
+    return this.groups().find((group) => group.id === id) ?? null;
+  }
+
+  /** The group in hand, for the host's chip. */
+  getSelectedGroupId(): string | null {
+    return this.selectedGroupId;
+  }
+
+  /**
+   * Put a group in hand. The host does this from the 2D chip, which lists the
+   * pattern's groups as icons, so a click there is a click on the frame.
+   */
+  selectGroup(id: string | null): void {
+    this.setGroupSelection(id);
+    this.redraw();
+  }
+
+  private setGroupSelection(id: string | null): void {
+    const next = this.findGroup(id)?.id ?? null;
+    if (this.selectedGroupId === next) return;
+    this.selectedGroupId = next;
+    if (next) this.setSelection([]);
+    this.cbs.onGroupSelectionChange?.(next);
+  }
+
+  /**
+   * A group round whatever the Add tool's box was drawn over.
+   *
+   * The frame holds what lies inside it rather than a list of members, so a
+   * click-placed group (no box) simply frames everything there is, and a drawn
+   * one takes whichever pieces it landed round.
+   */
+  createGroup(box: ObjectBoxPlace): void {
+    this.markBeforeChange();
+    const groups = this.pattern.groups ?? (this.pattern.groups = []);
+    const dragged = box.w > 0.5 && box.h > 0.5;
+    const fitted = groupBoxForPieces(this.pattern.pieces);
+    const frame = dragged
+      ? { x: box.x, y: box.y, widthCm: box.w, heightCm: box.h }
+      : fitted
+        ? { x: fitted.x - 2, y: fitted.y - 2, widthCm: fitted.widthCm + 4, heightCm: fitted.heightCm + 4 }
+        : { x: 0, y: 0, widthCm: 20, heightCm: 20 };
+    const group: PatternGroup = {
+      id: uid('group'),
+      label: `Group ${groups.length + 1}`,
+      ...frame,
+    };
+    groups.push(group);
+    this.selectedGroupId = group.id;
+    this.setSelection([]);
+    this.cbs.onGroupSelectionChange?.(group.id);
+    this.cbs.onGroupChange?.();
+    this.endHistoryGesture();
+    this.redraw();
+  }
+
+  /** The pieces a group holds, as the host reports it in the status line. */
+  piecesOfGroup(group: PatternGroup): PatternPiece[] {
+    return piecesInGroup(this.pattern, group);
+  }
+
+  /**
+   * The group frames, drawn behind the work the way the board draws its own
+   * groups behind everything: a dashed frame with its name at the corner.
+   *
+   * Only the frame's line and its name take the pointer, so the sheet inside the
+   * frame is still the sheet — points are grabbed through it as usual.
+   */
+  private drawGroups(): void {
+    const groups = this.groups();
+    if (groups.length === 0) return;
+    const fontSize = this.px(11);
+    for (const group of groups) {
+      const selected = this.selectedGroupId === group.id;
+      const frame = document.createElementNS(SVG_NS, 'rect');
+      frame.setAttribute('x', String(group.x));
+      frame.setAttribute('y', String(group.y));
+      frame.setAttribute('width', String(group.widthCm));
+      frame.setAttribute('height', String(group.heightCm));
+      frame.setAttribute('rx', String(this.px(6)));
+      frame.setAttribute('class', `pattern-group-frame${selected ? ' is-selected' : ''}`);
+      frame.setAttribute('stroke-width', String(this.px(1.2)));
+      frame.setAttribute('stroke-dasharray', `${this.px(6)} ${this.px(4)}`);
+      frame.dataset.kind = 'group';
+      frame.dataset.groupId = group.id;
+      frame.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(frame);
+
+      // A hairline is a hard thing to hit, so the frame is grabbed by a wide
+      // invisible band along its edge instead of by the drawn line itself. The
+      // sheet inside stays the sheet.
+      const edge = document.createElementNS(SVG_NS, 'rect');
+      edge.setAttribute('x', String(group.x));
+      edge.setAttribute('y', String(group.y));
+      edge.setAttribute('width', String(group.widthCm));
+      edge.setAttribute('height', String(group.heightCm));
+      edge.setAttribute('rx', String(this.px(6)));
+      edge.setAttribute('class', 'pattern-group-edge');
+      edge.setAttribute('stroke-width', String(this.px(10)));
+      edge.dataset.kind = 'group';
+      edge.dataset.groupId = group.id;
+      this.svg.appendChild(edge);
+
+      if (this.groupEditingId === group.id) {
+        this.drawGroupNameEditor(group);
+        continue;
+      }
+
+      const pad = this.px(5);
+      const label = document.createElementNS(SVG_NS, 'text');
+      label.setAttribute('x', String(group.x + pad));
+      label.setAttribute('y', String(group.y + fontSize + pad));
+      label.setAttribute('class', `pattern-group-label${selected ? ' is-selected' : ''}`);
+      label.setAttribute('font-size', String(fontSize));
+      label.textContent = group.label;
+      label.dataset.kind = 'groupLabel';
+      label.dataset.groupId = group.id;
+      this.svg.appendChild(label);
+
+      // Glyphs are only hit where they are drawn, so the name gets a box of its
+      // own: pressing between two letters of "Group 1" still takes the group.
+      const bounds = label.getBBox();
+      const hit = document.createElementNS(SVG_NS, 'rect');
+      hit.setAttribute('x', String(bounds.x - pad / 2));
+      hit.setAttribute('y', String(bounds.y - pad / 2));
+      hit.setAttribute('width', String(bounds.width + pad));
+      hit.setAttribute('height', String(bounds.height + pad));
+      hit.setAttribute('rx', String(this.px(3)));
+      hit.setAttribute('class', 'pattern-group-label-hit');
+      hit.dataset.kind = 'groupLabel';
+      hit.dataset.groupId = group.id;
+      this.svg.insertBefore(hit, label);
+
+      if (selected && this.groupEditingId !== group.id) this.drawGroupGrips(group);
+    }
+  }
+
+  /** The corner grips that say the frame is in hand. */
+  private drawGroupGrips(group: PatternGroup): void {
+    const size = this.px(7);
+    const corners: Array<['nw' | 'ne' | 'se' | 'sw', number, number]> = [
+      ['nw', group.x, group.y],
+      ['ne', group.x + group.widthCm, group.y],
+      ['se', group.x + group.widthCm, group.y + group.heightCm],
+      ['sw', group.x, group.y + group.heightCm],
+    ];
+    for (const [corner, x, y] of corners) {
+      const grip = document.createElementNS(SVG_NS, 'rect');
+      grip.setAttribute('x', String(x - size / 2));
+      grip.setAttribute('y', String(y - size / 2));
+      grip.setAttribute('width', String(size));
+      grip.setAttribute('height', String(size));
+      grip.setAttribute('class', 'pattern-group-grip');
+      grip.setAttribute('stroke-width', String(this.px(1.2)));
+      grip.dataset.kind = 'groupGrip';
+      grip.dataset.groupId = group.id;
+      grip.dataset.groupCorner = corner;
+      this.svg.appendChild(grip);
+    }
+  }
+
+  /** The group whose name or frame line is under the pointer. */
+  private groupAt(target: SVGElement): PatternGroup | null {
+    const id = target.dataset?.groupId;
+    return id ? this.findGroup(id) : null;
+  }
+
   private drawImages(): void {
     const images = this.images();
     if (images.length === 0) return;
@@ -9854,6 +10155,18 @@ export class PatternEditor {
   }
 
   private handleDeleteKey(): void {
+    // A group frame in hand, with nothing else picked, means the group — and a
+    // group is "these pieces together", so they go with it.
+    if (
+      this.selectedGroupId &&
+      this.selectedIds.size === 0 &&
+      !this.selectedTextId &&
+      !this.selectedImageId &&
+      !this.selectedRulerId
+    ) {
+      this.deleteGroup(this.selectedGroupId);
+      return;
+    }
     // A note in hand is the nearest thing the key can be about.
     if (this.selectedTextId && this.selectedIds.size === 0) {
       this.deleteText(this.selectedTextId);
@@ -9882,6 +10195,214 @@ export class PatternEditor {
     // Anything less than a whole piece is a point edit on the piece in hand.
     if (this.selectedIds.size === 0) return;
     this.deleteSelectedPoints();
+  }
+
+  /**
+   * A press on a group frame.
+   *
+   * The name and the line carry the whole group — pieces and all — because that
+   * is what a group is for. The corner grips change the frame instead, which
+   * changes what it holds without touching a piece.
+   */
+  private onGroupDown(
+    e: PointerEvent,
+    p: Vec2,
+    group: PatternGroup,
+    kind: string | undefined
+  ): void {
+    e.preventDefault();
+    e.stopPropagation();
+    // Two presses on the name in quick succession is the rename, the way a note
+    // is typed into. It is read here rather than from a `dblclick`, because a
+    // press redraws the frame and the second click would land on a new element.
+    if (kind === 'groupLabel') {
+      const now = Date.now();
+      if (this.lastGroupNameId === group.id && now - this.lastGroupNamePress < 400) {
+        this.lastGroupNamePress = 0;
+        this.lastGroupNameId = null;
+        this.selectGroup(group.id);
+        this.markBeforeChange();
+        this.groupEditingId = group.id;
+        this.redraw();
+        return;
+      }
+      this.lastGroupNamePress = now;
+      this.lastGroupNameId = group.id;
+    }
+    this.selectGroup(group.id);
+
+    if (kind === 'groupGrip') {
+      const corner = ((e.target as SVGElement).dataset?.groupCorner ?? 'se') as
+        | 'nw'
+        | 'ne'
+        | 'se'
+        | 'sw';
+      this.markBeforeChange();
+      this.drag = {
+        type: 'resizeGroup',
+        id: group.id,
+        corner,
+        start: p,
+        rect: { x: group.x, y: group.y, widthCm: group.widthCm, heightCm: group.heightCm },
+        moved: false,
+      };
+      this.svg.setPointerCapture(e.pointerId);
+      this.redraw();
+      return;
+    }
+
+    const held = piecesInGroup(this.pattern, group);
+    const pieceIds = held.map((piece) => piece.id);
+    const anchors = new Map<string, Vec2>();
+    for (const piece of held) {
+      for (const point of piece.points) {
+        anchors.set(point.id, { x: point.anchor.x, y: point.anchor.y });
+      }
+    }
+    // Carrying the group moves its pieces, which is a change to the pattern.
+    this.markBeforeChange();
+    this.drag = {
+      type: 'moveGroup',
+      id: group.id,
+      start: p,
+      origin: { x: group.x, y: group.y },
+      pieceIds,
+      anchors,
+      moved: false,
+    };
+    this.svg.setPointerCapture(e.pointerId);
+    this.redraw();
+  }
+
+  /** A group frame follows the pointer, and its pieces travel with it. */
+  private onGroupMove(drag: Extract<DragKind, { type: 'moveGroup' }>, p: Vec2): void {
+    const group = this.findGroup(drag.id);
+    if (!group) return;
+    const dx = p.x - drag.start.x;
+    const dy = p.y - drag.start.y;
+    if (Math.abs(dx) + Math.abs(dy) > 1e-6) drag.moved = true;
+    group.x = drag.origin.x + dx;
+    group.y = drag.origin.y + dy;
+    for (const piece of this.pattern.pieces) {
+      if (!drag.pieceIds.includes(piece.id)) continue;
+      for (const point of piece.points) {
+        const from = drag.anchors.get(point.id);
+        if (from) point.anchor = { x: from.x + dx, y: from.y + dy };
+      }
+    }
+    this.redraw();
+  }
+
+  /** A corner of a group frame is dragged out, which changes what it holds. */
+  private onGroupResize(drag: Extract<DragKind, { type: 'resizeGroup' }>, p: Vec2): void {
+    const group = this.findGroup(drag.id);
+    if (!group) return;
+    const rect = drag.rect;
+    const right = rect.x + rect.widthCm;
+    const bottom = rect.y + rect.heightCm;
+    let { x, y, widthCm, heightCm } = rect;
+    if (drag.corner === 'nw' || drag.corner === 'sw') {
+      x = Math.min(p.x, right - 1);
+      widthCm = right - x;
+    } else {
+      widthCm = Math.max(1, p.x - rect.x);
+    }
+    if (drag.corner === 'nw' || drag.corner === 'ne') {
+      y = Math.min(p.y, bottom - 1);
+      heightCm = bottom - y;
+    } else {
+      heightCm = Math.max(1, p.y - rect.y);
+    }
+    if (x !== rect.x || y !== rect.y || widthCm !== rect.widthCm || heightCm !== rect.heightCm) {
+      drag.moved = true;
+    }
+    group.x = x;
+    group.y = y;
+    group.widthCm = widthCm;
+    group.heightCm = heightCm;
+    this.redraw();
+  }
+
+  /**
+   * Delete the group in hand, and the pieces it holds.
+   *
+   * A group is a way of saying "these pieces, together", so deleting it deletes
+   * what it means — the same reading the board takes of its own groups.
+   */
+  private deleteGroup(id: string): void {
+    const group = this.findGroup(id);
+    if (!group) return;
+    const held = piecesInGroup(this.pattern, group).map((piece) => piece.id);
+    this.markBeforeChange();
+    this.pattern.groups = this.groups().filter((entry) => entry.id !== id);
+    this.selectedGroupId = null;
+    this.groupEditingId = null;
+    this.cbs.onGroupSelectionChange?.(null);
+    this.cbs.onGroupChange?.();
+    if (held.length > 0) {
+      this.deletePieces(held);
+      return;
+    }
+    this.endHistoryGesture();
+    this.redraw();
+  }
+
+  /**
+   * The name field, drawn over the frame while it is being written in.
+   *
+   * It lives in the drawing the way a note's box does, so it sits on the frame at
+   * any zoom. Enter or a click elsewhere keeps what was typed; Escape puts the
+   * old name back.
+   */
+  private drawGroupNameEditor(group: PatternGroup): void {
+    const height = this.px(22);
+    const box = document.createElementNS(SVG_NS, 'foreignObject');
+    box.setAttribute('x', String(group.x + this.px(3)));
+    box.setAttribute('y', String(group.y + this.px(2)));
+    box.setAttribute('width', String(this.px(160)));
+    box.setAttribute('height', String(height));
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = group.label;
+    input.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
+    input.className = 'pattern-group-name-input';
+    input.style.fontSize = `${this.px(11)}px`;
+    input.style.padding = `0 ${this.px(4)}px`;
+    input.style.height = `${this.px(20)}px`;
+    box.appendChild(input);
+    this.svg.appendChild(box);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = (commit: boolean): void => {
+      if (done) return;
+      done = true;
+      // A redraw takes the field out from under the caret and fires one last
+      // blur as it goes: only a field still in the drawing may write back.
+      if (commit && this.svg.contains(input)) {
+        const next = input.value.trim();
+        if (next && next !== group.label) {
+          group.label = next;
+          this.cbs.onGroupChange?.();
+        }
+      }
+      this.groupEditingId = null;
+      this.redraw();
+    };
+    input.addEventListener('input', (event) => event.stopPropagation());
+    input.addEventListener('keydown', (event) => {
+      event.stopPropagation();
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        finish(true);
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        finish(false);
+      }
+    });
+    input.addEventListener('blur', () => finish(true));
   }
 
   private onPointerDown(e: PointerEvent): void {
@@ -9995,6 +10516,16 @@ export class PatternEditor {
         this.onImageDown(e, p, imageId);
         return;
       }
+      // A group frame takes its own presses: its name and its line are the
+      // handles, and the sheet inside it is still the sheet, so points drawn
+      // through the frame are grabbed as usual.
+      const group = this.groupAt(target);
+      if (group) {
+        this.onGroupDown(e, p, group, kind);
+        return;
+      }
+      // Anything else is work, not frame: the group in hand is let go.
+      if (this.selectedGroupId) this.setGroupSelection(null);
       // Any other press is done with the note being typed into, and lets go of
       // the one in hand: a note is picked one at a time, like a ruler.
       if (this.textEditingId) this.commitTextEditing();
@@ -10173,9 +10704,9 @@ export class PatternEditor {
         this.onPenDown(e, p);
         return;
       }
-      // Text, images and sections are not pattern work: drag out the box and hand
-      // it over, and let the host take the tool back afterwards.
-      if (this.addMode === 'text' || this.addMode === 'section' || this.addMode === 'image') {
+      // Text, images and groups are not drawn from points: drag out the box and
+      // hand it over, and let the host take the tool back afterwards.
+      if (this.addMode === 'text' || this.addMode === 'group' || this.addMode === 'image') {
         this.drag = { type: 'objectBox', kind: this.addMode, start: p, current: p };
         this.svg.setPointerCapture(e.pointerId);
         e.preventDefault();
@@ -12676,6 +13207,16 @@ export class PatternEditor {
       return;
     }
 
+    if (this.drag.type === 'moveGroup') {
+      this.onGroupMove(this.drag, p);
+      return;
+    }
+
+    if (this.drag.type === 'resizeGroup') {
+      this.onGroupResize(this.drag, p);
+      return;
+    }
+
     if (this.drag.type === 'moveText') {
       const d = this.drag;
       const note = this.findText(d.id);
@@ -12935,7 +13476,23 @@ export class PatternEditor {
     }
   }
 
+  /** A drag is in hand: pointer down and not yet let go. */
+  isGesturing(): boolean {
+    return this.drag !== null;
+  }
+
   private onPointerUp(e: PointerEvent): void {
+    try {
+      this.finishGesture(e);
+    } finally {
+      // The gesture is over and whatever it changed is final. A host that has
+      // expensive follow-up work — a running drape waiting for a re-cut — waits
+      // for this rather than doing it on every pointer move.
+      this.cbs.onChangeEnd?.();
+    }
+  }
+
+  private finishGesture(e: PointerEvent): void {
     if (!this.drag) {
       this.endHistoryGesture();
       return;
@@ -12998,6 +13555,27 @@ export class PatternEditor {
 
     if (finished.type === 'extrudeEdge') {
       this.finishExtrudeEdge(finished);
+      this.redraw();
+      return;
+    }
+
+    if (finished.type === 'moveGroup') {
+      // A press that never moved is a pick, not an edit — it must not send the
+      // pattern off to be rebuilt. A real move carries the pieces with the frame,
+      // which is a change to the pattern itself.
+      if (finished.moved) {
+        this.cbs.onGroupChange?.();
+        this.cbs.onChange();
+      }
+      this.endHistoryGesture();
+      this.redraw();
+      return;
+    }
+
+    if (finished.type === 'resizeGroup') {
+      // Only the frame changed, so the pieces themselves are untouched.
+      if (finished.moved) this.cbs.onGroupChange?.();
+      this.endHistoryGesture();
       this.redraw();
       return;
     }

@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { rectContains, sectionChildren, sectionsForNode, withSectionContents } from './sections';
-import type { CanvasNode, SectionNode } from './types';
+import { rectContains, groupChildren, groupsForNode, withGroupContents } from './groups';
+import type { CanvasNode, GroupNode } from './types';
 
-function section(id: string, x: number, y: number, width: number, height: number): SectionNode {
-  return { type: 'section', id, label: id, x, y, width, height, zIndex: 0 };
+function group(id: string, x: number, y: number, width: number, height: number): GroupNode {
+  return { type: 'group', id, label: id, x, y, width, height, zIndex: 0 };
 }
 
 function frame(id: string, x: number, y: number, width: number, height: number): CanvasNode {
@@ -20,55 +20,55 @@ describe('rectContains', () => {
   });
 });
 
-describe('section membership', () => {
+describe('group membership', () => {
   it('holds the objects lying wholly inside it and nothing else', () => {
-    const big = section('s1', 0, 0, 400, 300);
+    const big = group('s1', 0, 0, 400, 300);
     const nodes: CanvasNode[] = [
       big,
       frame('in', 50, 50, 100, 100),
       frame('straddling', 350, 250, 100, 100),
     ];
-    expect(sectionChildren(nodes, big).map((n) => n.id)).toEqual(['in']);
+    expect(groupChildren(nodes, big).map((n) => n.id)).toEqual(['in']);
   });
 
-  it('leaves sections out of each other', () => {
-    const outer = section('outer', 0, 0, 400, 300);
-    const inner = section('inner', 50, 50, 100, 100);
+  it('leaves groups out of each other', () => {
+    const outer = group('outer', 0, 0, 400, 300);
+    const inner = group('inner', 50, 50, 100, 100);
     const nodes: CanvasNode[] = [outer, inner, frame('in', 60, 60, 40, 40)];
-    // A section is never one of another section's objects, and an object inside
-    // the inner one belongs to the inner one — a section does not hoard its
+    // A group is never one of another group's objects, and an object inside
+    // the inner one belongs to the inner one — a group does not hoard its
     // neighbour's things.
-    expect(sectionChildren(nodes, outer)).toHaveLength(0);
-    expect(sectionChildren(nodes, inner).map((n) => n.id)).toEqual(['in']);
+    expect(groupChildren(nodes, outer)).toHaveLength(0);
+    expect(groupChildren(nodes, inner).map((n) => n.id)).toEqual(['in']);
   });
 
-  it('gives an object in two sections to the tighter one', () => {
-    const wide = section('wide', 0, 0, 800, 600);
-    const tight = section('tight', 100, 100, 200, 200);
+  it('gives an object in two groups to the tighter one', () => {
+    const wide = group('wide', 0, 0, 800, 600);
+    const tight = group('tight', 100, 100, 200, 200);
     const nodes: CanvasNode[] = [wide, tight, frame('shared', 120, 120, 50, 50)];
-    expect(sectionChildren(nodes, tight).map((n) => n.id)).toEqual(['shared']);
-    expect(sectionChildren(nodes, wide)).toHaveLength(0);
-    expect(sectionsForNode(nodes, nodes[2]).map((s) => s.id)).toEqual(['tight', 'wide']);
+    expect(groupChildren(nodes, tight).map((n) => n.id)).toEqual(['shared']);
+    expect(groupChildren(nodes, wide)).toHaveLength(0);
+    expect(groupsForNode(nodes, nodes[2]).map((s) => s.id)).toEqual(['tight', 'wide']);
   });
 
   it('is a question about where things are, not what they were told', () => {
-    const sec = section('s', 0, 0, 400, 300);
+    const sec = group('s', 0, 0, 400, 300);
     const moving = frame('a', 50, 50, 100, 100);
     const nodes: CanvasNode[] = [sec, moving];
-    expect(sectionChildren(nodes, sec)).toHaveLength(1);
-    // Dragged out of the section: it simply is not in it any more.
+    expect(groupChildren(nodes, sec)).toHaveLength(1);
+    // Dragged out of the group: it simply is not in it any more.
     moving.x = 500;
-    expect(sectionChildren(nodes, sec)).toHaveLength(0);
+    expect(groupChildren(nodes, sec)).toHaveLength(0);
   });
 });
 
-describe('withSectionContents', () => {
-  it('adds what a selected section holds, so one gesture moves the group', () => {
-    const sec = section('s', 0, 0, 400, 300);
+describe('withGroupContents', () => {
+  it('adds what a selected group holds, so one gesture moves the group', () => {
+    const sec = group('s', 0, 0, 400, 300);
     const nodes: CanvasNode[] = [sec, frame('a', 10, 10, 50, 50), frame('b', 100, 100, 50, 50)];
-    expect(withSectionContents(nodes, ['s']).sort()).toEqual(['a', 'b', 's']);
-    expect(withSectionContents(nodes, ['a'])).toEqual(['a']);
+    expect(withGroupContents(nodes, ['s']).sort()).toEqual(['a', 'b', 's']);
+    expect(withGroupContents(nodes, ['a'])).toEqual(['a']);
     // Ids that are not on the board are dropped rather than carried.
-    expect(withSectionContents(nodes, ['nope'])).toEqual(['nope']);
+    expect(withGroupContents(nodes, ['nope'])).toEqual(['nope']);
   });
 });

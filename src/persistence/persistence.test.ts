@@ -204,6 +204,26 @@ describe('projectCodec', () => {
     expect(parsed.patterns.length).toBe(project.patterns.length);
   });
 
+  it('reads a board saved when groups were called sections', () => {
+    const project = createSmallFixture();
+    const raw = JSON.parse(serializeProject(project)) as {
+      canvas: { nodes: Array<Record<string, unknown>> };
+    };
+    raw.canvas.nodes.push({
+      type: 'section',
+      id: 'node_legacy_section',
+      label: 'Old section',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      zIndex: 0,
+    });
+    const parsed = parseProject(JSON.stringify(raw));
+    const node = parsed.canvas.nodes.find((n) => n.id === 'node_legacy_section');
+    expect(node?.type).toBe('group');
+  });
+
   it('normalizes missing transform arrays', () => {
     const project = createSmallFixture();
     const raw = JSON.parse(serializeProject(project)) as Record<string, unknown>;

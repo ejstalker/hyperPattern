@@ -35,6 +35,7 @@ import type {
   ImageNode,
   MeshDocument,
   MeshFrameNode,
+  MeshGeometry,
   PatternDocument,
   PatternFrameNode,
   PatternPiece,
@@ -43,7 +44,7 @@ import type {
   ProjectDocument,
   SeamEdgeRef,
   SimInstance,
-  SectionNode,
+  GroupNode,
   SimViewportNode,
   TextAnnotationNode,
   Transform3dNode,
@@ -71,11 +72,11 @@ import {
   type TextStyle,
 } from './textObject';
 import {
-  isSection,
-  sectionChildren,
-  sectionsForNode,
-  withSectionContents,
-} from '../project/sections';
+  isGroup,
+  groupChildren,
+  groupsForNode,
+  withGroupContents,
+} from '../project/groups';
 import {
   clipboardPasteCount,
   copyNodes,
@@ -93,6 +94,7 @@ import {
   type PieceClipboard,
 } from '../project/clipboard';
 import { remapSeamAllowance, sameSeamBindingPair } from '../pattern/geometry';
+import { patternGeometrySignature } from '../pattern/geometrySignature';
 import { DEFAULT_SEAM_GAP_CM, resolveSeamParticlePairs } from '../mesh/triangulate';
 import { generateBlockPieces } from '../pattern/blocks/generate';
 import { getBlockDefinition } from '../pattern/blocks/registry';
@@ -298,6 +300,39 @@ import type { AvatarBody } from '../mesh/AvatarBody';
 const WORLD_TO_CM = 10;
 
 /**
+ * How long a running drape waits for edits that never end in a gesture.
+ *
+ * Dragging a point rebuilds the cloth when the point is let go, so the drag
+ * itself stays light. A change made some other way — a field, a nudge — has no
+ * release to wait for, so the drape catches up once the edits stop.
+ */
+const LIVE_REMESH_IDLE_MS = 600;
+
+/**
+ * The longest a rebuild may be held back by a drag that never ends.
+ *
+ * Waiting for the release is what keeps dragging light; a pointer-up that never
+ * arrives must not leave the drape on the old pattern forever.
+ */
+const LIVE_REMESH_MAX_DEFER_MS = 2000;
+
+/** A running simulation an edit to its pattern can be followed by. */
+type LiveDrape = { sim: SimInstance; rt: SimViewportRuntime; mesh: MeshDocument };
+
+/**
+ * Wait for the browser to paint what is on screen now.
+ *
+ * The live rebuild runs on the main thread, so a message shown in the same task
+ * as the work would never be seen. This hands a frame back first — the message
+ * lands, the pointer-up settles — and only then does the heavy part start.
+ */
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
+}
+
+/**
  * The stages between the pattern and the drape, as icons for the 3D chip.
  *
  * Remesh is a panel cut into triangles; transform is the three-axis gizmo a 3D
@@ -312,6 +347,9 @@ const TRANSFORM_STAGE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" ar
  * An eye is what you press to see the pattern as the finished article; the pen
  * brings the points, seams and tools back.
  */
+/** One group on the sheet, as it appears in the 2D chip: a dashed frame. */
+const GROUP_CHIP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="2.2" y="3.4" width="11.6" height="9.2" rx="1.7" stroke-dasharray="2.6 1.8"/></svg>`;
+
 const DISPLAY_VIEW_ICON = `<svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1.6 8c1.7-3.1 3.9-4.7 6.4-4.7S12.7 4.9 14.4 8c-1.7 3.1-3.9 4.7-6.4 4.7S3.3 11.1 1.6 8z"/><circle cx="8" cy="8" r="2.1"/></svg>`;
 const EDIT_VIEW_ICON = `<svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 2.6 13.4 5.6 6 13H3v-3z"/><path d="M9 4l3 3"/></svg>`;
 
@@ -770,8 +808,8 @@ export class StudioApp {
   private drapeOfferTimer: ReturnType<typeof setTimeout> | null = null;
   /** Per node, the chrome that has to be told the board's zoom — see `cacheBoardZoomChrome`. */
   private boardChrome = new Map<string, HTMLElement[]>();
-  /** Section labels, which sit beside their frames rather than inside them. */
-  private sectionLabels = new Map<string, HTMLElement>();
+  /** Group labels, which sit beside their frames rather than inside them. */
+  private groupLabels = new Map<string, HTMLElement>();
   /** The zoom those elements were last given, so a pan does not rewrite it. */
   private chromeVarZoom: number | null = null;
   /** Frames that were off the canvas when the board last moved — see `syncContainerDetail`. */
@@ -810,6 +848,30 @@ export class StudioApp {
   } | null = null;
   /** Guard so mirrored 2D ↔ 3D selection does not feed back on itself. */
   private splitSelectionSyncing = false;
+  /**
+   * The geometry each mesh was last built from. A pattern fires a change for far
+   * more than geometry, so a live remesh compares fingerprints before rebuilding.
+   */
+  private meshSignatures = new Map<string, string>();
+  /**
+   * Meshes whose geometry the pattern has moved on from.
+   *
+   * This is the single record of outstanding work: a rebuild clears the entry, so
+   * nothing depends on a particular callback arriving for an update to land.
+   */
+  private meshNeedsRebuild = new Set<string>();
+  /** The idle rebuild that catches edits with no gesture to end. */
+  private liveRemeshTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When the oldest outstanding rebuild was asked for. */
+  private liveRemeshSince = 0;
+  /** Frames left before the tick checks whether a rebuild is outstanding. */
+  private reconcileCountdown = 0;
+  /** A live rebuild is between its phases, holding the main thread on purpose. */
+  private liveRemeshRunning = false;
+  /** An edit landed while a rebuild was running: do it again when this one ends. */
+  private liveRemeshAgain = false;
+  /** What the rebuild is doing, while it does it, for every view that shows it. */
+  private remeshBusyLabel: string | null = null;
   private imageFileInput: HTMLInputElement;
   /**
    * Where an image asked for from a container goes: the pattern the Add tool drew
@@ -1116,6 +1178,9 @@ export class StudioApp {
   }
 
   private async syncLiveRuntimesFromProject(): Promise<void> {
+    // History hands back a whole document: what each mesh was built from is no
+    // longer what the project holds, so the live remesh starts from scratch.
+    this.meshSignatures.clear();
     // The page's editor is not a node, so it is not re-pointed by the loop below:
     // without this it would go on drawing the document the undo replaced. Its view
     // is the board's, restated every frame, so it is not fitted either.
@@ -1180,6 +1245,9 @@ export class StudioApp {
     this.ensureRenderLoop();
     this.layoutNodes();
     this.drawWires();
+    // The header's chips list what the document holds — the stack, the groups —
+    // so an undone group or modifier has to leave the strip with it.
+    this.refreshFullscreenTabs();
     if (this.expandedNodeId) {
       this.notifyNodeViewportResize(this.expandedNodeId);
     }
@@ -2519,7 +2587,7 @@ export class StudioApp {
       <button type="button" role="menuitem" data-board-act="pattern">New pattern <span class="board-menu-kind">2D</span></button>
       <button type="button" role="menuitem" data-board-act="sim">New drape <span class="board-menu-kind">3D</span></button>
       <button type="button" role="menuitem" data-board-act="text">Text</button>
-      <button type="button" role="menuitem" data-board-act="section">Section</button>
+      <button type="button" role="menuitem" data-board-act="group">Group</button>
       <button type="button" role="menuitem" data-board-act="image">Image reference…</button>
       <div class="app-menu-sep"></div>
       <button type="button" role="menuitem" data-board-act="paste"${
@@ -2544,10 +2612,10 @@ export class StudioApp {
       } else if (act === 'sim') {
         this.pushUndo();
         this.addSimViewport(at);
-      } else if (act === 'section') {
+      } else if (act === 'group') {
         const point = this.boardPointFromClient(at.clientX, at.clientY);
         const cm = canvasCmScale(this.project);
-        this.addSection({ x: point.x / cm, y: point.y / cm, w: 0, h: 0 });
+        this.addGroup({ x: point.x / cm, y: point.y / cm, w: 0, h: 0 });
       } else if (act === 'text') {
         // A click-placed text object: it sizes itself to what is typed.
         const point = this.boardPointFromClient(at.clientX, at.clientY);
@@ -2688,9 +2756,9 @@ export class StudioApp {
       // the file on the next autosave.
       if (this.draggingNodes || this.resizingNode) {
         this.markDirty();
-        // A section holds what is inside it, so a drag or a resize can change what
-        // it holds without touching the section at all — say so as it happens.
-        this.refreshSectionTally();
+        // A group holds what is inside it, so a drag or a resize can change what
+        // it holds without touching the group at all — say so as it happens.
+        this.refreshGroupTally();
       }
       this.panning = false;
       this.draggingNodes = null;
@@ -2964,7 +3032,7 @@ export class StudioApp {
     this.closeNodeFullscreen();
     this.teardownSims();
     this.board.innerHTML = '';
-    this.sectionLabels.clear();
+    this.groupLabels.clear();
     this.editors.clear();
     for (const preview of this.meshPreviews.values()) preview.destroy();
     this.meshPreviews.clear();
@@ -3010,7 +3078,7 @@ export class StudioApp {
       onGroupIntoContainer: (pieceIds) => this.groupCanvasPiecesIntoContainer(pieceIds),
       onMarqueeRect: (box, info) => this.mirrorPageMarquee(box, info),
       onAddObject: (kind, box) =>
-        kind === 'section' ? this.addSection(box) : this.addTextObject(box),
+        kind === 'group' ? this.addGroup(box) : this.addTextObject(box),
       // On the page an image is a canvas reference, placed from the board's own
       // Add menu — not something the pattern sheet holds.
       canPlaceObject: (kind) => kind !== 'image',
@@ -3140,7 +3208,7 @@ export class StudioApp {
    * and puts the caret in it, and the style bar comes up for it the same way it
    * does for a canvas text object.
    *
-   * A section is not offered here at all (see `canPlaceObject`): it groups things
+   * A group is not offered here at all (see `canPlaceObject`): it frames things
    * on the canvas, and the canvas is not what a container full of work is.
    *
    * An image is the other way round from a note: the editor can draw one but
@@ -3159,6 +3227,23 @@ export class StudioApp {
       // The picker writes into the same input paste and drop use. Cancelled, the
       // Add tool stays in hand so the box can be drawn again.
       this.imageFileInput.click();
+      return;
+    }
+    if (kind === 'group') {
+      const editor = this.editors.get(frame.id);
+      if (!editor) return;
+      // Back to Move, the way a new note leaves the tool: a group is picked,
+      // carried and renamed from Move.
+      editor.setTool('move');
+      editor.createGroup(box);
+      const groups = this.project.patterns.find((p) => p.id === frame.patternId)?.groups ?? [];
+      const group = groups[groups.length - 1];
+      const held = group ? editor.piecesOfGroup(group).length : 0;
+      this.setStatus(
+        held > 0
+          ? `Group — holding ${held} piece${held === 1 ? '' : 's'}`
+          : 'Group — drag pieces into it and they join it'
+      );
       return;
     }
     if (kind !== 'text') return;
@@ -3273,7 +3358,7 @@ export class StudioApp {
       el.style.width = `${node.width}px`;
       el.style.height = `${node.height}px`;
       el.classList.toggle('selected', this.isNodeSelected(node.id));
-      if (isSection(node)) this.placeSectionLabel(node);
+      if (isGroup(node)) this.placeGroupLabel(node);
       el.classList.toggle(
         'sim-active',
         node.type === 'simViewport' && (node as SimViewportNode).simId === this.project.activeSimId
@@ -4053,6 +4138,15 @@ export class StudioApp {
         if (container && modifier) this.openModifierFromChip(container, modifier);
       });
     });
+    tabs.querySelectorAll<HTMLElement>('[data-fs-group]').forEach((button) => {
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const container = button.dataset.fsGroupIn;
+        const group = button.dataset.fsGroup;
+        if (container && group) this.focusPatternGroup(container, group);
+      });
+    });
 
     // The strip scrolls horizontally; make sure the stage you are looking at is
     // the one in view (and that a stage is never clipped out of reach).
@@ -4113,6 +4207,7 @@ export class StudioApp {
           `<button type="button" class="node-fullscreen-stage${
             open ? ' is-active' : ''
           }" data-fs-modifiers="${pattern.id}" title="Modifiers — the pattern's 2D geometry stack" aria-label="Modifiers" aria-pressed="${open}">${MODIFIER_STACK_ICON}</button>` +
+          this.groupChipIconsHtml(pattern) +
           `</span>`
       );
       // The 2D + 3D split toggle sits between the two dimensions it splits.
@@ -4142,6 +4237,44 @@ export class StudioApp {
    * Pressing one opens the panel on that node; a bypassed node is dimmed, and the
    * node the panel is showing is lit.
    */
+  /**
+   * The pattern's groups as marks in the 2D chip, one per frame, beside the
+   * modifiers — the same way the 3D chip lists the stages that build its drape.
+   * Pressing one puts that group in hand.
+   */
+  private groupChipIconsHtml(patternNode: CanvasNode): string {
+    if (patternNode.type !== 'patternFrame') return '';
+    const pattern = this.project.patterns.find((p) => p.id === patternNode.patternId);
+    const groups = pattern?.groups ?? [];
+    if (groups.length === 0) return '';
+    const selected = this.editors.get(patternNode.id)?.getSelectedGroupId() ?? null;
+    const icons = groups
+      .map((group) => {
+        const active = selected === group.id;
+        return `<button type="button" class="node-fullscreen-stage${
+          active ? ' is-active' : ''
+        }" data-fs-group="${group.id}" data-fs-group-in="${
+          patternNode.id
+        }" title="${escapeAttr(`${group.label} — put this group in hand`)}" aria-label="${escapeAttr(
+          group.label
+        )}" aria-pressed="${active}">${GROUP_CHIP_ICON}</button>`;
+      })
+      .join('');
+    return `<span class="node-fullscreen-chip-sep" aria-hidden="true"></span>${icons}`;
+  }
+
+  /** A group pressed in the 2D chip: put it in hand in the pattern editor. */
+  private focusPatternGroup(nodeId: string, groupId: string): void {
+    const editor = this.editors.get(nodeId);
+    if (!editor) return;
+    editor.selectGroup(groupId);
+    const group = this.project.patterns
+      .flatMap((pattern) => pattern.groups ?? [])
+      .find((entry) => entry.id === groupId);
+    if (group) this.setStatus(`${group.label} — the frame is in hand`);
+    this.refreshFullscreenTabs();
+  }
+
   private modifierChipIconsHtml(patternNode: CanvasNode, panelOpen: boolean): string {
     if (patternNode.type !== 'patternFrame') return '';
     const pattern = this.project.patterns.find((p) => p.id === patternNode.patternId);
@@ -4227,9 +4360,14 @@ export class StudioApp {
     const pipeline = this.pipelineNodesFor(expandedId);
     const pattern = pipeline.find((n) => n.type === 'patternFrame');
     const stages = this.splitStageNodes(pipeline);
-    // Splitting from a 3D view keeps that view on the right; the pattern (or a
-    // pipeline with no stage to inherit) falls back to the run's first stage.
-    const stage = stages.find((n) => n.id === expandedId) ?? stages[0];
+    // Splitting from a 3D view keeps that view on the right. Splitting from the
+    // pattern opens the drape: the fabric is what the 2D work is *for*, and it is
+    // the face the 3D chip wears, so the split should agree with it rather than
+    // start at the mesher. A run with no drape falls back to its furthest stage.
+    const stage =
+      stages.find((n) => n.id === expandedId) ??
+      [...stages].reverse().find((n) => n.type === 'simViewport') ??
+      stages[stages.length - 1];
     if (!pattern || !stage) return;
     this.enterSplitView(pattern.id, stage.id);
   }
@@ -4441,13 +4579,16 @@ export class StudioApp {
     const nextStack = this.viewportActionStack(nextEl);
     if (!nextStack) return;
 
-    this.remeshIfStale(nextStageNodeId);
     if (prevEl && prevNode) this.restoreFromPane(prevEl, prevNode, split.stagePlaceholder);
     else split.stagePlaceholder.remove();
 
     split.stagePlaceholder = this.detachIntoPane(nextEl, nextNode, split.stagePane);
     nextStack.insertBefore(split.banner, nextStack.firstElementChild);
     split.stageNodeId = nextStageNodeId;
+    // A pattern edit may be outstanding for the drape we have just arrived at:
+    // re-cut it and keep its pose. Anything else takes the ordinary rebuild.
+    this.reconcileLiveDrape();
+    if (this.staleMeshForStage(nextStageNodeId)) this.remeshIfStale(nextStageNodeId);
     this.renderSplitHeader();
     this.syncSplitBanner();
     this.syncSplitSelectionFrom2d(this.editors.get(split.patternNodeId)?.getSelectedPieces() ?? []);
@@ -4518,6 +4659,15 @@ export class StudioApp {
         if (container && modifier) this.openModifierFromChip(container, modifier);
       });
     });
+    tabs.querySelectorAll<HTMLElement>('[data-fs-group]').forEach((button) => {
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const container = button.dataset.fsGroupIn;
+        const group = button.dataset.fsGroup;
+        if (container && group) this.focusPatternGroup(container, group);
+      });
+    });
   }
 
   private canvasNode(nodeId: string): CanvasNode | undefined {
@@ -4542,6 +4692,9 @@ export class StudioApp {
     if (!split) return undefined;
     const node = this.canvasNode(split.patternNodeId);
     if (node?.type !== 'patternFrame') return undefined;
+    // With a drape on screen the tick re-cuts it within a frame or two, so the
+    // build behind it is never out of date for long enough to warn about.
+    if (this.drapeForPattern(node.patternId)) return undefined;
     return this.project.meshes.find(
       (m) => m.patternId === node.patternId && !m.geometry
     );
@@ -4551,9 +4704,18 @@ export class StudioApp {
   private syncSplitBanner(): void {
     const split = this.splitView;
     if (!split) return;
+    const busy = this.remeshBusyLabel;
     const stale = this.staleMeshForSplit();
-    split.banner.hidden = !stale;
-    split.stagePane.classList.toggle('is-stale', !!stale);
+    // While the rebuild runs, the banner is its progress line: the work is on its
+    // way, so the Resync button would be an offer to start it a second time.
+    split.banner.hidden = !busy && !stale;
+    split.stagePane.classList.toggle('is-stale', !busy && !!stale);
+    if (busy) {
+      split.banner.innerHTML =
+        '<span class="node-split-spinner" aria-hidden="true"></span>' +
+        `<span class="node-split-banner-text">${this.escapeHtml(busy)}</span>`;
+      return;
+    }
     if (!stale) {
       split.banner.innerHTML = '';
       return;
@@ -4590,6 +4752,269 @@ export class StudioApp {
         ? `Resynced ${meshes.length} mesh${meshes.length === 1 ? '' : 'es'} from the pattern`
         : 'Resynced'
     );
+  }
+
+  /**
+   * A pattern change inside one of its containers: every mesh built from it is
+   * out of date.
+   *
+   * The rebuild itself is not done here. A drag fires this on every pointer move,
+   * and rebuilding under the drag is what made editing feel heavy, so the work is
+   * recorded and then reconciled — when the gesture ends, when the edits stop, and
+   * on the animation tick as a backstop, so the update cannot be lost.
+   */
+  private patternEdited(patternId: string): void {
+    this.invalidateMeshesForPattern(patternId);
+    // Flag the remesh chip immediately when editing inside fullscreen.
+    this.refreshFullscreenTabs();
+    // Pattern edits are document data — make sure they reach the file.
+    this.markDirty();
+    if (this.drapeForPattern(patternId)) {
+      this.scheduleIdleLiveRemesh();
+      return;
+    }
+    this.setStatus('Pattern edited — remesh to update');
+    // Nothing on screen is following the edit, so say that a rebuild is waiting.
+    this.syncSplitBanner();
+  }
+
+  /**
+   * The gesture is over — the point was let go — so the drape can be re-cut.
+   *
+   * This is the path that makes an edit land the moment it is finished; the tick
+   * and the idle timer are what make sure it lands at all.
+   */
+  private patternEditEnded(): void {
+    this.cancelIdleLiveRemesh();
+    this.reconcileLiveDrape();
+  }
+
+  /**
+   * The drape built from this pattern that is on screen: in the split's 3D pane,
+   * in the full screen drape view, or on the board.
+   *
+   * A paused drape counts. It is holding a pose worth keeping, and a rebuild that
+   * only happened while the simulation ran would leave the paused one showing a
+   * garment that no longer matches the pattern.
+   */
+  private drapeForPattern(patternId: string): LiveDrape | null {
+    for (const sim of this.project.sims) {
+      const rt = this.simRuntimes.get(sim.id);
+      if (!rt?.cloth) continue;
+      const mesh = this.meshForSim(sim.id);
+      if (!mesh || mesh.patternId !== patternId) continue;
+      // Only a viewport you can actually see: a rebuild is expensive, and an
+      // off-screen drape is rebuilt the ordinary way when it comes back.
+      if (!this.viewportIsVisible('simViewport', sim.id)) continue;
+      return { sim, rt, mesh };
+    }
+    return null;
+  }
+
+  /** Ask for the rebuild once the edits stop, whatever they were. */
+  private scheduleIdleLiveRemesh(): void {
+    if (this.liveRemeshTimer !== null) clearTimeout(this.liveRemeshTimer);
+    if (this.liveRemeshSince === 0) this.liveRemeshSince = Date.now();
+    this.liveRemeshTimer = setTimeout(() => {
+      this.liveRemeshTimer = null;
+      this.reconcileLiveDrape();
+    }, LIVE_REMESH_IDLE_MS);
+  }
+
+  private cancelIdleLiveRemesh(): void {
+    if (this.liveRemeshTimer !== null) clearTimeout(this.liveRemeshTimer);
+    this.liveRemeshTimer = null;
+    this.liveRemeshSince = 0;
+  }
+
+  /**
+   * Bring the drape on screen up to date with its pattern, if it has fallen
+   * behind.
+   *
+   * Everything that can ask for a rebuild ends up here, and the answer comes from
+   * the project rather than from remembered callbacks: the mesh either carries the
+   * geometry its pattern now makes, or it is rebuilt. That is what makes the
+   * update impossible to lose — a paused drape, a stage switched while the pattern
+   * was being edited, a gesture whose release never arrived.
+   */
+  private reconcileLiveDrape(): void {
+    // Walk the outstanding work rather than any one view: the answer comes from
+    // the project, so it does not matter how the rebuild came to be asked for.
+    for (const meshId of this.meshNeedsRebuild) {
+      const mesh = this.project.meshes.find((m) => m.id === meshId);
+      if (!mesh) continue;
+      const drape = this.drapeForPattern(mesh.patternId);
+      if (!drape || drape.mesh.id !== meshId) continue;
+      if (!this.canRebuildLive()) {
+        this.scheduleIdleLiveRemesh();
+        return;
+      }
+      void this.runLiveRemesh(mesh.patternId);
+      return;
+    }
+    // No drape on screen for it: every other stale mesh can wait for the ordinary
+    // Resync, which is what the chip and the banner are for.
+  }
+
+  /** A drag in hand defers the rebuild, but not forever. */
+  private canRebuildLive(): boolean {
+    if (!this.patternEditorIsGesturing()) return true;
+    return this.liveRemeshSince > 0 && Date.now() - this.liveRemeshSince > LIVE_REMESH_MAX_DEFER_MS;
+  }
+
+  /** Some pattern editor has a pointer gesture in hand. */
+  private patternEditorIsGesturing(): boolean {
+    for (const editor of this.editors.values()) {
+      if (editor.isGesturing()) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Rebuild the pattern's meshes and carry the drape onto the new geometry.
+   *
+   * Undo snapshots belong to the edit that caused this, so none are taken here,
+   * and the drape is not marked as new: it is the same cloth, re-cut.
+   *
+   * Two phases, with a paint between them: re-cutting the pattern and rebuilding
+   * the cloth each hold the main thread for a moment, and the pointer-up that
+   * asked for this needs to reach the browser first. The wait is announced before
+   * it starts — in the status bar, on the 3D pane and in the split's banner — so
+   * the edit lands with a busy viewport rather than a frozen one.
+   */
+  private async runLiveRemesh(patternId: string): Promise<void> {
+    // One rebuild at a time: a second request arriving between the phases would
+    // re-cut the same mesh twice for one edit.
+    if (this.liveRemeshRunning) {
+      this.liveRemeshAgain = true;
+      return;
+    }
+    this.cancelIdleLiveRemesh();
+    const pattern = this.project.patterns.find((p) => p.id === patternId);
+    if (!this.drapeForPattern(patternId) || !pattern) return;
+    this.liveRemeshRunning = true;
+    try {
+      this.setRemeshBusy('Re-cutting the pattern…');
+      await nextPaint();
+      // The paint gave the view time to change under us: ask again rather than
+      // re-cut a drape that is no longer on screen.
+      const live = this.drapeForPattern(patternId);
+      if (!live) return;
+      await this.remeshLiveDrape(live, pattern, patternId);
+    } finally {
+      this.liveRemeshRunning = false;
+      this.setRemeshBusy(null);
+      if (this.liveRemeshAgain) {
+        this.liveRemeshAgain = false;
+        this.reconcileLiveDrape();
+      }
+    }
+  }
+
+  /** The cut, then the cloth that carries the drape onto it. */
+  private async remeshLiveDrape(
+    live: LiveDrape,
+    pattern: PatternDocument,
+    patternId: string
+  ): Promise<void> {
+    const cooked = this.cookedPattern(pattern);
+    const signature = patternGeometrySignature(cooked);
+    // Whether the cloth itself is out of date, as opposed to merely the mesh: a
+    // note, a ruler or a re-selection invalidates the mesh but moves nothing.
+    const moved = this.meshSignatures.get(live.mesh.id) !== signature;
+    for (const mesh of this.project.meshes) {
+      if (mesh.patternId !== patternId) continue;
+      if (mesh.geometry && this.meshSignatures.get(mesh.id) === signature) continue;
+      this.remeshFromPattern(mesh, pattern);
+      for (const [nodeId, preview] of this.meshPreviews) {
+        const node = this.canvasNode(nodeId);
+        if (node?.type === 'meshFrame' && node.meshId === mesh.id) {
+          preview.setMesh(mesh, pattern);
+        }
+      }
+      // The arrangement views of this mesh hold no drape, so they take the new
+      // geometry whenever they are next on screen.
+      if (mesh.geometry) this.queueTransformRebuilds(mesh.id, mesh.geometry, cooked);
+    }
+    const geom = live.mesh.geometry;
+    if (!geom) {
+      this.syncSplitBanner();
+      this.refreshFullscreenTabs();
+      return;
+    }
+    if (moved) {
+      this.setRemeshBusy('Carrying the drape…');
+      await nextPaint();
+      // The runtime this started on can be gone by now — a stage switched away,
+      // a viewport closed. The mesh is cut either way; the next one built from it
+      // takes the new geometry.
+      if (this.simRuntimes.get(live.sim.id) !== live.rt) return;
+      if (live.rt.updateMeshKeepingDrape(geom, cooked)) {
+        this.setStatus('Pattern edited — the drape is following');
+      } else {
+        // Nothing to carry the drape onto: fall back to the ordinary reload.
+        this.rebuildConnectedSim(live.sim.id, false);
+        this.setStatus('Pattern edited — the drape was rebuilt from the new pattern');
+      }
+      // Any other drape of the same mesh is re-cut the same way: it holds a pose
+      // of its own worth keeping, even while it is paused.
+      for (const [simId, rt] of this.simRuntimes) {
+        if (simId === live.sim.id) continue;
+        if (this.meshForSim(simId)?.id !== live.mesh.id) continue;
+        rt.updateMeshKeepingDrape(geom, cooked);
+      }
+      // A saved pose is what a later reload or rewind restores, so it has to
+      // describe the cloth that is on screen now, not the one before the re-cut.
+      this.refreshSavedPose(live.sim);
+      for (const other of this.project.sims) {
+        if (other.id === live.sim.id) continue;
+        if (this.meshForSim(other.id)?.id !== live.mesh.id) continue;
+        this.refreshSavedPose(other);
+      }
+      // A transform's vertex pose belongs to the mesh that was re-cut; the
+      // arrangement is per piece and survives, so the pose is re-taken when the
+      // transform view next rebuilds rather than carried across as old numbers.
+      for (const transform of this.project.transforms) {
+        if (transform.meshId === live.mesh.id) transform.pose = null;
+      }
+    }
+    this.syncSplitBanner();
+    this.refreshFullscreenTabs();
+  }
+
+  /**
+   * Say what the live rebuild is doing, everywhere it can be seen: the status
+   * bar, the split's banner and the 3D pane itself. Null clears it.
+   */
+  private setRemeshBusy(label: string | null): void {
+    this.remeshBusyLabel = label;
+    for (const [simId, rt] of this.simRuntimes) {
+      rt.setBusy(label !== null && this.viewportIsVisible('simViewport', simId) ? label : null);
+    }
+    if (label) this.setStatus(label);
+    this.syncSplitBanner();
+  }
+
+  /** Keep a drape's stored pose describing the cloth it is actually holding. */
+  private refreshSavedPose(sim: SimInstance): void {
+    const pose = this.simRuntimes.get(sim.id)?.cloth?.exportPose();
+    if (pose) sim.pose = pose;
+  }
+
+  /** Hand a mesh's new geometry to every Transform 3D view built from it. */
+  private queueTransformRebuilds(
+    meshId: string,
+    geom: MeshGeometry,
+    pattern: PatternDocument | undefined
+  ): void {
+    const ids = new Set<string>();
+    for (const link of this.project.meshTransformAssignments) {
+      if (link.meshId === meshId) ids.add(link.transformId);
+    }
+    for (const transform of this.project.transforms) {
+      if (transform.meshId === meshId) ids.add(transform.id);
+    }
+    for (const id of ids) this.transformRuntimes.get(id)?.queueRebuild(geom, pattern);
   }
 
   /** 2D → 3D: mirror the pattern editor's picked pieces onto the 3D stage. */
@@ -4708,10 +5133,10 @@ export class StudioApp {
    * under whichever neighbour happened to be stacked next.
    */
   private nodeZIndex(node: CanvasNode): number {
-    // A section is the ground the board stands on: it always paints behind every
+    // A group is the ground the board stands on: it always paints behind every
     // other node, however its own layer number reads, and its own order among
-    // sections is all its z-index is used for.
-    if (isSection(node)) return node.zIndex - 1000;
+    // groups is all its z-index is used for.
+    if (isGroup(node)) return node.zIndex - 1000;
     return node.type === 'patternFrame' && !containerClips(node)
       ? node.zIndex + 1000
       : node.zIndex;
@@ -4905,9 +5330,9 @@ export class StudioApp {
     }
     this.pushUndo();
 
-    // A section is moved by moving everything inside it: the objects belong to it
+    // A group is moved by moving everything inside it: the objects belong to it
     // by virtue of where they are, so they travel with it and stay in it.
-    let targets = withSectionContents(
+    let targets = withGroupContents(
       this.project.canvas.nodes,
       this.selectedNodeIds,
       (entry) => this.isEmbeddedNode(entry)
@@ -5021,10 +5446,10 @@ export class StudioApp {
     let chrome: HTMLElement | null = null;
 
     // Image refs are chrome-less: drag the image itself (no title / fullscreen).
-    // Sections are too — a section has no view to open and its name is its own
-    // element on the board (see `mountSectionLabel`), so a header would only be a
-    // second title bar with a full-screen button that has nothing to show.
-    if (node.type !== 'image' && node.type !== 'section') {
+    // Groups are too — a group has no view to open and its name is its own element
+    // on the board (see `mountGroupLabel`), so a header would only be a second
+    // title bar with a full-screen button that has nothing to show.
+    if (node.type !== 'image' && node.type !== 'group') {
       chrome = document.createElement('div');
       chrome.className = 'node-chrome';
       // Only the close / fullscreen button lives in the header; the node's own
@@ -5175,14 +5600,11 @@ export class StudioApp {
       body.appendChild(editorHost);
       const editor = new PatternEditor(editorHost, pattern, this.project.displayUnit, {
         onBeforeChange: () => this.pushUndo(),
-        onChange: () => {
-          this.setStatus('Pattern edited — remesh to update');
-          this.invalidateMeshesForPattern(pattern.id);
-          // Flag the remesh chip immediately when editing inside fullscreen.
-          this.refreshFullscreenTabs();
-          // Pattern edits are document data — make sure they reach the file.
-          this.markDirty();
-        },
+        // A pattern edit is stale geometry everywhere it is used; a running
+        // drape is rebuilt under the edit rather than stopped by it — but only
+        // once the gesture ends, so the drag itself stays light.
+        onChange: () => this.patternEdited(pattern.id),
+        onChangeEnd: () => this.patternEditEnded(),
         // Rulers are drafting references: they repaint, but never invalidate.
         onRulerChange: () => this.markDirty(),
         getMeasurementLibrary: () => cachedMeasurementLibrary(),
@@ -5192,10 +5614,17 @@ export class StudioApp {
         onPiecesDropped: (drop) => this.handOverDroppedPieces(node, drop),
         // A note is written into the pattern itself, so it rides inside the
         // frame on the board. An image is the pattern's too, drawn under the
-        // work to draft over. A section has nothing to group here.
+        // work to draft over. A group has nothing to frame here.
         onAddObject: (kind, box) => this.addObjectToContainer(node, kind, box),
-        canPlaceObject: (kind) => kind === 'text' || kind === 'image',
+        canPlaceObject: (kind) => kind === 'text' || kind === 'image' || kind === 'group',
         onTextSelectionChange: () => this.syncTextStyleBar(),
+        // Groups are drafting structure, like rulers: they are saved and listed in
+        // the 2D chip, and they never invalidate a mesh of their own.
+        onGroupChange: () => {
+          this.markDirty();
+          this.refreshFullscreenTabs();
+        },
+        onGroupSelectionChange: () => this.refreshFullscreenTabs(),
         // A press the editor will not act on — the cook of the stack, or a frame
         // in display view — is a press on something you look at. Say which, and
         // how to get back to the workbench.
@@ -5321,9 +5750,9 @@ export class StudioApp {
           { once: true }
         );
       }
-    } else if (node.type === 'section') {
-      // A section is nothing but a frame: its label is mounted beside it on the
-      // board (see `mountSectionLabel`), because the frame has to paint behind
+    } else if (node.type === 'group') {
+      // A group is nothing but a frame: its label is mounted beside it on the
+      // board (see `mountGroupLabel`), because the frame has to paint behind
       // every node and its label has to paint over every node.
     } else if (node.type === 'text') {
       chrome!.querySelector('.node-title')!.textContent = this.textNodeLabel(node);
@@ -5368,7 +5797,7 @@ export class StudioApp {
 
     this.mountNodePorts(el, node);
     this.board.appendChild(el);
-    if (isSection(node)) this.mountSectionLabel(node);
+    if (isGroup(node)) this.mountGroupLabel(node);
     this.cacheBoardZoomChrome(node.id, el);
   }
 
@@ -5397,21 +5826,21 @@ export class StudioApp {
   }
 
   /**
-   * A section's name, as its own element beside the frame.
+   * A group's name, as its own element beside the frame.
    *
-   * It cannot live inside the section: the frame has to paint behind every node
+   * It cannot live inside the group: the frame has to paint behind every node
    * (so the canvas stays canvas), and anything inside it would be behind them
    * too — including the label, which has to be the one thing you can always
    * click. So it is a sibling, pinned to the frame's top-left corner and layered
    * over the board.
    */
-  private mountSectionLabel(node: SectionNode): void {
+  private mountGroupLabel(node: GroupNode): void {
     const label = document.createElement('div');
-    label.className = 'node-section-label';
-    label.dataset.sectionId = node.id;
+    label.className = 'node-group-label';
+    label.dataset.groupId = node.id;
     label.textContent = node.label;
-    label.title = 'Double-click to rename · drag to move the section and everything in it';
-    // A press drags the section; a second press in the same breath renames it.
+    label.title = 'Double-click to rename · drag to move the group and everything in it';
+    // A press drags the group; a second press in the same breath renames it.
     // Counted here rather than left to `dblclick`, which never arrives: a press
     // on a draggable thing has its default taken away, and the click that a
     // double-click is built from goes with it.
@@ -5423,7 +5852,7 @@ export class StudioApp {
         lastPress = 0;
         e.preventDefault();
         e.stopPropagation();
-        this.renameSection(node, label);
+        this.renameGroup(node, label);
         return;
       }
       lastPress = now;
@@ -5433,7 +5862,7 @@ export class StudioApp {
       // drag that is already under way.
       e.stopPropagation();
     });
-    // The frame itself is see-through, so its label is also where the section is
+    // The frame itself is see-through, so its label is also where the group is
     // right-clicked for its menu.
     label.addEventListener('contextmenu', (e) => {
       e.preventDefault();
@@ -5441,13 +5870,13 @@ export class StudioApp {
       this.showNodeMenu(node, e.clientX, e.clientY);
     });
     this.board.appendChild(label);
-    this.sectionLabels.set(node.id, label);
-    this.placeSectionLabel(node);
+    this.groupLabels.set(node.id, label);
+    this.placeGroupLabel(node);
   }
 
-  /** Pin a section's label to its frame's top-left corner. */
-  private placeSectionLabel(node: SectionNode): void {
-    const label = this.sectionLabels.get(node.id);
+  /** Pin a group's label to its frame's top-left corner. */
+  private placeGroupLabel(node: GroupNode): void {
+    const label = this.groupLabels.get(node.id);
     if (!label) return;
     label.style.left = `${node.x}px`;
     label.style.top = `${node.y}px`;
@@ -6409,7 +6838,12 @@ export class StudioApp {
 
   /** Build a mesh from the pattern's cooked geometry. */
   private remeshFromPattern(mesh: MeshDocument, pattern: PatternDocument | undefined): void {
-    remeshDocument(mesh, this.cookedPattern(pattern));
+    const cooked = this.cookedPattern(pattern);
+    remeshDocument(mesh, cooked);
+    // What this mesh is built from, so a live remesh can tell a real geometry
+    // change from a change that never reached the cloth.
+    this.meshSignatures.set(mesh.id, patternGeometrySignature(cooked));
+    this.meshNeedsRebuild.delete(mesh.id);
   }
 
   /** What the stack makes of a pattern right now, for the panel's readout. */
@@ -6597,6 +7031,12 @@ export class StudioApp {
       this.editors.get(node.id)?.setPattern(target);
     }
     const meshes = this.project.meshes.filter((m) => m.patternId === patternId);
+    // A point moved in the drape's own overlay is fitted the same way as one
+    // moved beside it: re-cut the cloth, keep the drape.
+    if (this.drapeForPattern(patternId)) {
+      void this.runLiveRemesh(patternId);
+      return;
+    }
     for (const mesh of meshes) {
       this.remesh(mesh.id, { recordUndo: false });
     }
@@ -6682,7 +7122,11 @@ export class StudioApp {
   private invalidateMeshesForPattern(patternId: string): void {
     const pattern = this.project.patterns.find((p) => p.id === patternId);
     for (const mesh of this.project.meshes) {
-      if (mesh.patternId === patternId) mesh.geometry = null;
+      if (mesh.patternId !== patternId) continue;
+      mesh.geometry = null;
+      // Remembered, not merely nulled: a null geometry is the *state*, and this
+      // set is what makes something act on it.
+      this.meshNeedsRebuild.add(mesh.id);
     }
     for (const [nodeId, preview] of this.meshPreviews) {
       const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
@@ -6699,6 +7143,13 @@ export class StudioApp {
     }
     for (const [transformId, rt] of this.transformRuntimes) {
       rt.frame(this.viewportIsVisible('transform3d', transformId));
+    }
+    // A backstop, checked a few times a second: if the pattern has moved on from
+    // what a drape on screen was built from, rebuild it. Every other route to a
+    // rebuild is an event that might not arrive; this one always does.
+    if (this.meshNeedsRebuild.size > 0 && --this.reconcileCountdown <= 0) {
+      this.reconcileCountdown = 6;
+      this.reconcileLiveDrape();
     }
   }
 
@@ -7143,7 +7594,17 @@ export class StudioApp {
         sim.simulated = false;
         this.setStatus(`Reset: ${sim.name}`);
         break;
-      case 'rebuild':
+      case 'rebuild': {
+        // Rewind promises the Transform 3D node's layout, so ask that node to lay
+        // the pieces out again and take the pose from it. Its arrangement is per
+        // piece, so it survives a re-cut — while a pose captured from an older
+        // mesh would describe a cloth that no longer exists.
+        const transform = this.transformForSim(simId);
+        if (transform) {
+          this.rebuildConnectedTransform(transform.id);
+          this.setStatus('Drape laid out from the Transform 3D node');
+          break;
+        }
         this.persistSimStates();
         const initialPose = this.poseForSim(simId);
         sim.pose = initialPose;
@@ -7157,9 +7618,10 @@ export class StudioApp {
           this.patternForSim(simId)
         );
         this.setStatus(
-          initialPose ? 'Drape rebuilt from Transform 3D layout' : 'Drape rebuilt from mesh node'
+          initialPose ? 'Drape rebuilt from mesh pose' : 'Drape rebuilt from mesh node'
         );
         break;
+      }
       case 'snap':
         await this.snapshotSim(simId);
         break;
@@ -8132,17 +8594,17 @@ export class StudioApp {
       return;
     }
 
-    if (isSection(node)) {
-      const held = sectionChildren(
+    if (isGroup(node)) {
+      const held = groupChildren(
         this.project.canvas.nodes,
         node,
         (entry) => this.isEmbeddedNode(entry)
       );
       const names = held.map((child) => this.nodeLabel(child)).slice(0, 8);
       this.inspector.innerHTML = `
-        <h3>${this.escapeHtml(node.label || 'Section')}</h3>
-        <p class="muted">A section is a visual group. Anything dragged inside it joins it, and moving, copying or deleting the section takes it along.</p>
-        <label>Label <input id="sectionLabel" value="${this.escapeHtml(node.label)}" /></label>
+        <h3>${this.escapeHtml(node.label || 'Group')}</h3>
+        <p class="muted">A group is a visual frame. Anything dragged inside it joins it, and moving, copying or deleting the group takes it along.</p>
+        <label>Label <input id="groupLabel" value="${this.escapeHtml(node.label)}" /></label>
         <p class="muted">${
           held.length === 0
             ? 'Nothing inside it yet.'
@@ -8152,12 +8614,12 @@ export class StudioApp {
         }</p>
         ${this.deleteButtonHtml()}
       `;
-      this.inspector.querySelector('#sectionLabel')?.addEventListener('change', (e) => {
+      this.inspector.querySelector('#groupLabel')?.addEventListener('change', (e) => {
         const value = (e.target as HTMLInputElement).value.trim();
         if (!value || value === node.label) return;
         this.pushUndo();
         node.label = value;
-        const label = this.findNodeEl(node.id)?.querySelector('.node-section-label');
+        const label = this.findNodeEl(node.id)?.querySelector('.node-group-label');
         if (label) label.textContent = value;
         this.markDirty();
         this.renderInspector();
@@ -8286,9 +8748,9 @@ export class StudioApp {
    * the document behind a node is only dropped once the last node using it goes.
    */
   private deleteNodes(nodeIds: readonly string[]): void {
-    // A section is the group, so deleting it deletes what it holds — the same
-    // reading of "the section" that copy and move use.
-    const nodes = withSectionContents(
+    // A group is what it holds, so deleting it deletes what it contains — the same
+    // reading of "the group" that copy and move use.
+    const nodes = withGroupContents(
       this.project.canvas.nodes,
       nodeIds,
       (entry) => this.isEmbeddedNode(entry)
@@ -8520,7 +8982,7 @@ export class StudioApp {
     const inContainer = this.activeEditorKey !== null && this.activeEditorKey !== 'canvas';
     if (inContainer && pattern && pieceIds.length > 0) return copyPieces(pattern, pieceIds);
     if (this.selectedNodeIds.length > 0) {
-      const ids = withSectionContents(
+      const ids = withGroupContents(
         this.project.canvas.nodes,
         this.selectedNodeIds,
         (node) => this.isEmbeddedNode(node)
@@ -8683,11 +9145,11 @@ export class StudioApp {
       announce?: boolean;
     } = {}
   ): CanvasNode[] {
-    // The section and its contents travel together, and the copies land inside the
+    // The group and its contents travel together, and the copies land inside the
     // copy, because where an object is *is* the membership.
     const plan = planNodeDuplicates(
       this.project,
-      withSectionContents(this.project.canvas.nodes, nodeIds, (n) => this.isEmbeddedNode(n)),
+      withGroupContents(this.project.canvas.nodes, nodeIds, (n) => this.isEmbeddedNode(n)),
       uid
     );
     if (plan.sources.length === 0) return [];
@@ -8754,8 +9216,8 @@ export class StudioApp {
         return node.label ?? 'Image';
       case 'text':
         return this.textNodeLabel(node);
-      case 'section':
-        return node.label || 'Section';
+      case 'group':
+        return node.label || 'Group';
     }
   }
 
@@ -8937,9 +9399,9 @@ export class StudioApp {
         };
         break;
       }
-      case 'section': {
+      case 'group': {
         node = {
-          type: 'section',
+          type: 'group',
           id: uid('node'),
           x: src.x + ox,
           y: src.y + oy,
@@ -9349,29 +9811,29 @@ export class StudioApp {
   }
 
   /**
-   * A section where the Add tool asked for one.
+   * A group where the Add tool asked for one.
    *
-   * Nothing is "put into" it: a section holds whatever lies inside it, worked out
-   * from the board every time it matters (see `sections.ts`). So the drag that
+   * Nothing is "put into" it: a group holds whatever lies inside it, worked out
+   * from the board every time it matters (see `groups.ts`). So the drag that
    * makes it is also the gesture that gathers what it lands on — if the objects
    * were already there, they are in it the moment the rectangle closes round them.
    */
-  private addSection(box: { x: number; y: number; w: number; h: number }): void {
+  private addGroup(box: { x: number; y: number; w: number; h: number }): void {
     const topLeft = canvasAtCm(this.project, box.x, box.y);
     const dragged = box.w > 0.5 && box.h > 0.5;
     const scale = canvasCmScale(this.project);
     const width = Math.round(dragged ? box.w * scale : 480);
     const height = Math.round(dragged ? box.h * scale : 320);
-    const node: SectionNode = {
-      type: 'section',
+    const node: GroupNode = {
+      type: 'group',
       id: uid('node'),
       x: Math.round(topLeft.x),
       y: Math.round(topLeft.y),
       width,
       height,
-      // Behind everything: a section is the ground its objects stand on.
+      // Behind everything: a group is the ground its objects stand on.
       zIndex: this.project.canvas.nodes.reduce((low, entry) => Math.min(low, entry.zIndex), 0) - 1,
-      label: `Section ${this.project.canvas.nodes.filter(isSection).length + 1}`,
+      label: `Group ${this.project.canvas.nodes.filter(isGroup).length + 1}`,
     };
     this.pushUndo();
     this.project.canvas.nodes.push(node);
@@ -9379,23 +9841,23 @@ export class StudioApp {
     this.selectNodes([node.id]);
     this.canvasEditor?.setTool('move');
     this.markDirty();
-    const held = sectionChildren(
+    const held = groupChildren(
       this.project.canvas.nodes,
       node,
       (entry) => this.isEmbeddedNode(entry)
     ).length;
     this.setStatus(
       held > 0
-        ? `Section — holding ${held} object${held === 1 ? '' : 's'}`
-        : 'Section — drag objects into it and they join it'
+        ? `Group — holding ${held} object${held === 1 ? '' : 's'}`
+        : 'Group — drag objects into it and they join it'
     );
   }
 
   /**
-   * Rename a section in place, the way a Figma section renames: the label becomes
+   * Rename a group in place, the way a Figma group renames: the label becomes
    * a field, Enter or a click elsewhere keeps it, Escape puts the old one back.
    */
-  private renameSection(node: SectionNode, label: HTMLElement): void {
+  private renameGroup(node: GroupNode, label: HTMLElement): void {
     if (label.isContentEditable) return;
     const before = node.label;
     label.contentEditable = 'true';
@@ -9437,30 +9899,30 @@ export class StudioApp {
   }
 
   /**
-   * Bring the section the board is working in up to date.
+   * Bring the group the board is working in up to date.
    *
    * Membership is geometry, so it changes when *other* things move. Anything that
-   * shifts a node calls this: the selected section's panel is re-rendered and the
+   * shifts a node calls this: the selected group's panel is re-rendered and the
    * status line carries its tally, which is the answer to "did that land inside?".
    */
-  private refreshSectionTally(): void {
-    const section = this.project.canvas.nodes.find(
-      (node): node is SectionNode => isSection(node) && this.isNodeSelected(node.id)
+  private refreshGroupTally(): void {
+    const group = this.project.canvas.nodes.find(
+      (node): node is GroupNode => isGroup(node) && this.isNodeSelected(node.id)
     );
-    if (!section) {
-      if (this.project.canvas.nodes.some(isSection)) this.renderInspector();
+    if (!group) {
+      if (this.project.canvas.nodes.some(isGroup)) this.renderInspector();
       return;
     }
-    const held = sectionChildren(
+    const held = groupChildren(
       this.project.canvas.nodes,
-      section,
+      group,
       (entry) => this.isEmbeddedNode(entry)
     ).length;
     this.renderInspector();
     this.setStatus(
       held === 0
-        ? `${section.label} — nothing inside it yet`
-        : `${section.label} — holding ${held} object${held === 1 ? '' : 's'}`
+        ? `${group.label} — nothing inside it yet`
+        : `${group.label} — holding ${held} object${held === 1 ? '' : 's'}`
     );
   }
 
@@ -9557,8 +10019,8 @@ export class StudioApp {
   /** Take one node's element off the board, chrome and all. */
   private removeNodeEl(nodeId: string): void {
     this.findNodeEl(nodeId)?.remove();
-    this.sectionLabels.get(nodeId)?.remove();
-    this.sectionLabels.delete(nodeId);
+    this.groupLabels.get(nodeId)?.remove();
+    this.groupLabels.delete(nodeId);
     this.boardChrome.delete(nodeId);
   }
 

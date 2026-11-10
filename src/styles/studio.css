@@ -1209,6 +1209,10 @@ optgroup {
 
 .pattern-settings-title {
   color: var(--muted);
+  /* The tool's own name: the one word in the ribbon that says what you are
+     holding, so it carries the weight the settings beside it do not. */
+  font-weight: 800;
+  font-size: .75rem;
 }
 
 /* One set of settings per tool: the ribbon shows the one belonging to the tool in
@@ -1272,28 +1276,46 @@ optgroup {
 
 /* Segmented toggle: one button per setting, the one in force filled in — the
    same control the block bar's mode and division rows are made of. */
+/*
+ * A tool's modes: separate buttons that share one selection, not a segmented
+ * control. They wrap onto another line rather than being squeezed, which is what
+ * a narrow ribbon — a split pane, a small container — needs: Cut alone has seven
+ * of them, and a joined strip either overflows or breaks its own border.
+ */
 .pattern-settings-group {
-  display: inline-flex;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  overflow: hidden;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
 }
 
 .pattern-settings-group button {
   padding: 3px 8px;
-  border: none;
-  border-radius: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
   background: var(--panel);
   color: var(--muted);
   font: inherit;
   cursor: pointer;
+  white-space: nowrap;
 }
 
-.pattern-settings-group button + button {
-  border-left: 1px solid var(--border);
+/* The number that picks a mode from the keyboard, to the right of its name. */
+.pattern-settings-key {
+  margin-left: 5px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  opacity: 0.55;
+}
+
+.pattern-settings-group button.is-active .pattern-settings-key {
+  opacity: 0.8;
 }
 
 .pattern-settings-group button:hover {
+  border-color: var(--accent);
   color: var(--ink);
 }
 
@@ -1403,6 +1425,7 @@ optgroup {
 
 .pattern-settings-group button.is-active {
   background: var(--accent);
+  border-color: var(--accent);
   color: #fff;
 }
 
@@ -3710,38 +3733,30 @@ optgroup {
   position: relative;
 }
 
-.sim-transform-toggle {
+/*
+ * The viewport's tools: one column at the top-left, a button per row, each with
+ * its mark to the left of its name — the same reading as the pattern's rail.
+ *
+ * They used to be placed one by one with hand-counted offsets, which is why the
+ * drape's second row sat beside the first rather than under it. A column puts
+ * them where the eye expects them and lets a tool be added without arithmetic.
+ */
+.sim-viewport-tools {
   position: absolute;
   top: var(--node-top-inset, 8px);
   left: 8px;
   z-index: 6;
-  min-width: 62px;
-  padding: 4px 9px;
-  border-radius: 4px;
-  border: 1px solid rgba(242, 235, 227, 0.25);
-  background: rgba(28, 26, 23, 0.82);
-  color: #f2ebe3;
-  cursor: pointer;
-  font: 11px var(--mono);
-  user-select: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
 }
 
-.sim-transform-toggle:hover {
-  border-color: var(--accent);
-}
-
-.sim-transform-toggle.is-rotate {
-  border-color: #d4a017;
-  color: #f1cf65;
-}
-
-/* Quadrant snap tool — sits directly under the Move/Rotate toggle. */
-.sim-snap-toggle {
-  position: absolute;
-  top: 36px;
-  left: 8px;
-  z-index: 6;
-  padding: 4px 9px;
+.sim-viewport-tools button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px 4px 7px;
   border-radius: 4px;
   border: 1px solid rgba(242, 235, 227, 0.25);
   background: rgba(28, 26, 23, 0.82);
@@ -3752,55 +3767,75 @@ optgroup {
   user-select: none;
 }
 
-.sim-snap-toggle:hover {
+.sim-viewport-tools button:hover:not(:disabled) {
   border-color: var(--accent);
 }
 
-.sim-snap-toggle.is-active {
-  border-color: #d4a017;
-  background: rgba(212, 160, 23, 0.18);
-  color: #f1cf65;
-}
-
-/* Sew tool — third in the column, under Move/Rotate and Snap to quadrant. */
-.sim-sew-toggle {
-  position: absolute;
-  top: 64px;
-  left: 8px;
-  z-index: 6;
-  padding: 4px 9px;
-  border-radius: 4px;
-  border: 1px solid rgba(242, 235, 227, 0.25);
-  background: rgba(28, 26, 23, 0.82);
-  color: #f2ebe3;
-  cursor: pointer;
-  font: 11px var(--mono);
-  white-space: nowrap;
-  user-select: none;
-}
-
-.sim-sew-toggle:hover:not(:disabled) {
-  border-color: var(--accent);
-}
-
-.sim-sew-toggle.is-active {
-  border-color: #d4a017;
-  background: rgba(212, 160, 23, 0.18);
-  color: #f1cf65;
-}
-
-.sim-sew-toggle:disabled {
+.sim-viewport-tools button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
 
+/* The mode or tool in hand: the grid gold the viewport's own chrome uses. */
+.sim-viewport-tools button.is-active,
+.sim-viewport-tools button.is-on {
+  border-color: #d4a017;
+  background: rgba(212, 160, 23, 0.18);
+  color: #f1cf65;
+}
+
+.sim-tool-icon {
+  flex: 0 0 13px;
+  width: 13px;
+  height: 13px;
+  opacity: 0.9;
+}
+
 /*
- * The drape viewport's tools are one row of Moves plus the points toggle, so its
- * sew button sits on the next row rather than under a whole column of its own.
+ * Re-cut in progress: the cloth is rebuilt from the pattern on the main thread,
+ * so the pane says what it is waiting for instead of freezing without a word.
  */
-.node-simViewport .sim-sew-toggle {
-  top: 36px;
-  left: 8px;
+.sim-busy {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(212, 160, 23, 0.6);
+  border-radius: 999px;
+  background: rgba(28, 26, 23, 0.92);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+  color: #f1cf65;
+  font: 11px var(--mono);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.sim-busy-spinner,
+.node-split-spinner {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(241, 207, 101, 0.3);
+  border-top-color: #f1cf65;
+  border-radius: 50%;
+  animation: sim-busy-spin 0.8s linear infinite;
+}
+
+/* The gizmo follows cloth that is about to be replaced: dim it, don't hide it. */
+.sim-body.is-busy .move-gizmo {
+  opacity: 0.35;
+}
+
+@keyframes sim-busy-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /*
@@ -4056,33 +4091,6 @@ optgroup {
   stroke-dasharray: 3 2.5;
   fill: none;
   pointer-events: none;
-}
-
-/* "Draw pattern points" — sits to the right of the Move/Rotate toggle. */
-.sim-points-toggle {
-  position: absolute;
-  top: var(--node-top-inset, 8px);
-  left: 78px;
-  z-index: 6;
-  padding: 4px 9px;
-  border-radius: 4px;
-  border: 1px solid rgba(242, 235, 227, 0.25);
-  background: rgba(28, 26, 23, 0.82);
-  color: #f2ebe3;
-  cursor: pointer;
-  font: 11px var(--mono);
-  white-space: nowrap;
-  user-select: none;
-}
-
-.sim-points-toggle:hover {
-  border-color: var(--accent);
-}
-
-.sim-points-toggle.is-on {
-  border-color: #d4a017;
-  background: rgba(212, 160, 23, 0.18);
-  color: #f1cf65;
 }
 
 /* Marker layer: transparent to pointer events except on the markers themselves. */
@@ -4687,12 +4695,12 @@ optgroup {
   left: 0;
 }
 
-/* ── Sections ───────────────────────────────────────────────────────────────
-   Figma's section, on the board: a large tinted frame with its name above it.
+/* ── Groups ─────────────────────────────────────────────────────────────────
+   Figma's group, on the board: a large tinted frame with its name above it.
    It is ground, not furniture — it paints behind every node, never clips and
    takes no pointer but on its label and its corners, so the canvas it covers is
    still canvas to draw and drop on. */
-.canvas-node.node-section {
+.canvas-node.node-group {
   background: rgba(242, 235, 227, 0.035);
   border: 1px solid rgba(242, 235, 227, 0.14);
   border-radius: 14px;
@@ -4702,21 +4710,21 @@ optgroup {
   pointer-events: none;
 }
 
-.canvas-node.node-section.selected {
+.canvas-node.node-group.selected {
   border-color: var(--accent);
   background: rgba(196, 92, 38, 0.06);
 }
 
-.canvas-node.node-section > .node-body {
+.canvas-node.node-group > .node-body {
   position: static;
   background: none;
   border-radius: 14px;
 }
 
 /* The label sits above the frame, outside it, exactly where it does in Figma —
-   and on its own layer, because a section's frame paints behind every node while
+   and on its own layer, because a group's frame paints behind every node while
    its name has to stay clickable over all of them. */
-.node-section-label {
+.node-group-label {
   position: absolute;
   z-index: 9999;
   transform: translateY(calc(-100% - 4px / var(--board-zoom, 1)));
@@ -4736,12 +4744,12 @@ optgroup {
   user-select: none;
 }
 
-.node-section-label:hover,
-.node-section-label.selected {
+.node-group-label:hover,
+.node-group-label.selected {
   color: var(--ink);
 }
 
-.node-section-label[contenteditable='true'] {
+.node-group-label[contenteditable='true'] {
   cursor: text;
   user-select: text;
   background: rgba(0, 0, 0, 0.45);
@@ -4750,9 +4758,81 @@ optgroup {
 }
 
 /* Its corners are handles like any other node's, which is the one place the
-   section takes the pointer over its own rectangle. */
-.canvas-node.node-section > .resize-handle {
+   group takes the pointer over its own rectangle. */
+.canvas-node.node-group > .resize-handle {
   pointer-events: auto;
+}
+
+/* ── Group frames inside a pattern ─────────────────────────────────────────
+   A group on the sheet: a dashed frame with its name at the corner, drawn under
+   the work. Only the frame's line and its name take the pointer, so the pieces
+   inside are still grabbed through it — the same reading as a group on the
+   board, where the sheet inside stays sheet. */
+.pattern-group-frame {
+  fill: rgba(196, 92, 38, 0.035);
+  stroke: rgba(242, 235, 227, 0.22);
+  pointer-events: none;
+}
+
+/* An invisible band along the frame, so the line can actually be grabbed. */
+.pattern-group-edge {
+  fill: none;
+  stroke: transparent;
+  pointer-events: stroke;
+  cursor: move;
+}
+
+.pattern-group-frame:hover {
+  stroke: rgba(242, 235, 227, 0.45);
+}
+
+.pattern-group-frame.is-selected {
+  fill: rgba(196, 92, 38, 0.06);
+  stroke: var(--accent);
+}
+
+.pattern-group-label {
+  fill: var(--muted);
+  font-family: var(--font);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  paint-order: stroke;
+  stroke: rgba(20, 18, 16, 0.75);
+  stroke-width: 2px;
+  pointer-events: auto;
+  cursor: move;
+  user-select: none;
+}
+
+.pattern-group-label:hover,
+.pattern-group-label.is-selected {
+  fill: var(--ink);
+}
+
+/* The name's own box, so a press between two glyphs still takes the group. */
+.pattern-group-label-hit {
+  fill: transparent;
+  pointer-events: auto;
+  cursor: move;
+}
+
+.pattern-group-grip {
+  fill: var(--bg-elev);
+  stroke: var(--accent);
+  pointer-events: auto;
+  cursor: nwse-resize;
+}
+
+.pattern-group-name-input {
+  box-sizing: border-box;
+  width: 100%;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--ink);
+  font-family: var(--font);
+  font-weight: 600;
+  outline: none;
 }
 
 /* ── Text objects ───────────────────────────────────────────────────────────
@@ -6041,9 +6121,7 @@ body:has(.node-fullscreen-overlay) .text-style-bar {
  * where there is room to work with them. Transform 3D keeps its board tools —
  * Snap to quadrant is a canvas gesture.
  */
-.node-simViewport:not(.is-expanded) .sim-transform-toggle,
-.node-simViewport:not(.is-expanded) .sim-points-toggle,
-.node-simViewport:not(.is-expanded) .sim-sew-toggle,
+.node-simViewport:not(.is-expanded) .sim-viewport-tools,
 .node-simViewport:not(.is-expanded) .viewport-gnomon {
   display: none !important;
 }

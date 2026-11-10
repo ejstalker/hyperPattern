@@ -27,6 +27,7 @@ import { createViewportRenderer } from './SimViewportRuntime';
 import { SelectionOverlay } from './SelectionOverlay';
 import { ClothSewTool } from './ClothSewTool';
 import { viewportOwnsKey } from './viewportKeyGuard';
+import { MOVE_ICON, ROTATE_ICON, SNAP_ICON, SEW_ICON } from './viewportIcons';
 import {
   arrangementBelongsTo,
   eulerDegToQuat,
@@ -114,7 +115,10 @@ export class Transform3dRuntime {
   private materialsUnsubscribe: (() => void) | null = null;
   private moveGizmo: MoveGizmo | null = null;
   private selectionOverlay: SelectionOverlay | null = null;
-  private transformToggle: HTMLButtonElement | null = null;
+  /** The Move and Rotate mode buttons, and the column the tools sit in. */
+  private toolsColumn: HTMLElement | null = null;
+  private moveToggle: HTMLButtonElement | null = null;
+  private rotateToggle: HTMLButtonElement | null = null;
   private snapToggle: HTMLButtonElement | null = null;
   private sewToggle: HTMLButtonElement | null = null;
   /** Edge highlighting, clicking and reversing, shared with the drape viewport. */
@@ -164,6 +168,13 @@ export class Transform3dRuntime {
    * slower compositors.
    */
   private needsRender = true;
+  /**
+   * Geometry handed over by an edited pattern, waiting for the viewport to be on
+   * screen. The arrangement is stored per piece so it survives the rebuild; only
+   * the rebuild itself is deferred, so a drag that moves a point sixty times does
+   * not build sixty cloths.
+   */
+  private pendingMesh: { mesh: MeshGeometry; pattern: PatternDocument | null } | null = null;
   private resizeObserver: ResizeObserver | null = null;
 
   constructor(
@@ -226,8 +237,12 @@ export class Transform3dRuntime {
     this.selectionOverlay = null;
     this.sewTool?.destroy();
     this.sewTool = null;
-    this.transformToggle?.remove();
-    this.transformToggle = null;
+    this.moveToggle?.remove();
+    this.moveToggle = null;
+    this.rotateToggle?.remove();
+    this.rotateToggle = null;
+    this.toolsColumn?.remove();
+    this.toolsColumn = null;
     this.snapToggle?.remove();
     this.snapToggle = null;
     this.sewToggle?.remove();
@@ -522,7 +537,7 @@ export class Transform3dRuntime {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'sim-sew-toggle';
-    button.textContent = 'Sew edges';
+    button.innerHTML = `${SEW_ICON}<span>Sew edges</span>`;
     button.setAttribute('aria-pressed', 'false');
     button.addEventListener('pointerdown', (e) => e.stopPropagation());
     button.addEventListener('click', (e) => {
@@ -530,7 +545,7 @@ export class Transform3dRuntime {
       e.stopPropagation();
       this.setSewEnabled(!this.isSewEnabled());
     });
-    this.host.appendChild(button);
+    (this.toolsColumn ?? this.host).appendChild(button);
     this.sewToggle = button;
     this.syncSewToggle();
   }
@@ -574,7 +589,7 @@ export class Transform3dRuntime {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'sim-snap-toggle';
-    button.textContent = 'Snap to quadrant';
+    button.innerHTML = `${SNAP_ICON}<span>Snap to quadrant</span>`;
     button.title =
       'Snap to quadrant — show the 2 × 8 grids, click a piece then click a cell to centre it there';
     button.setAttribute('aria-pressed', 'false');
@@ -584,7 +599,7 @@ export class Transform3dRuntime {
       e.stopPropagation();
       this.setSnapToQuadrant(!this.snapToQuadrantEnabled);
     });
-    this.host.appendChild(button);
+    (this.toolsColumn ?? this.host).appendChild(button);
     this.snapToggle = button;
     this.syncSnapToggle();
   }
@@ -725,33 +740,59 @@ export class Transform3dRuntime {
     window.addEventListener('keydown', this.keyHandler, true);
   }
 
+  /** The column the viewport's tools hang in, top-left, one button per row. */
+  private mountToolsColumn(): HTMLElement {
+    this.toolsColumn?.remove();
+    const column = document.createElement('div');
+    column.className = 'sim-viewport-tools';
+    this.host.appendChild(column);
+    this.toolsColumn = column;
+    return column;
+  }
+
   private mountTransformToggle(): void {
-    this.transformToggle?.remove();
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'sim-transform-toggle';
-    button.addEventListener('pointerdown', (e) => e.stopPropagation());
-    button.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.setTransformMode(this.transformMode === 'translate' ? 'rotate' : 'translate');
-    });
-    this.host.appendChild(button);
-    this.transformToggle = button;
+    const column = this.mountToolsColumn();
+    const make = (mode: TransformMode, label: string, icon: string): HTMLButtonElement => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'sim-transform-toggle';
+      button.dataset.transformMode = mode;
+      button.innerHTML = `${icon}<span>${label}</span>`;
+      button.addEventListener('pointerdown', (e) => e.stopPropagation());
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.setTransformMode(mode);
+      });
+      column.appendChild(button);
+      return button;
+    };
+    this.moveToggle = make('translate', 'Move', MOVE_ICON);
+    this.rotateToggle = make('rotate', 'Rotate', ROTATE_ICON);
     this.setTransformMode(this.transformMode);
   }
 
   private setTransformMode(mode: TransformMode): void {
     this.transformMode = mode;
     this.moveGizmo?.setMode(mode);
-    if (this.transformToggle) {
-      const rotating = mode === 'rotate';
-      this.transformToggle.classList.toggle('is-rotate', rotating);
-      this.transformToggle.textContent = rotating ? 'Rotate' : 'Move';
-      this.transformToggle.title = rotating
-        ? 'Rotation mode (E) — drag a gizmo axis to rotate the selection around the group pivot · R = 90° on local X'
-        : 'Move mode (W) — drag the selection or a gizmo axis to translate · Shift-click to multi-select · R = 90° on local X';
-      this.transformToggle.setAttribute('aria-pressed', String(rotating));
+    const modes: Array<[HTMLButtonElement | null, TransformMode, string]> = [
+      [
+        this.moveToggle,
+        'translate',
+        'Move mode (W) — drag the selection or a gizmo axis to translate · Shift-click to multi-select · R = 90° on local X',
+      ],
+      [
+        this.rotateToggle,
+        'rotate',
+        'Rotation mode (E) — drag a gizmo axis to rotate the selection around the group pivot · R = 90° on local X',
+      ],
+    ];
+    for (const [button, target, tip] of modes) {
+      if (!button) continue;
+      const on = mode === target;
+      button.classList.toggle('is-active', on);
+      button.setAttribute('aria-pressed', String(on));
+      button.title = tip;
     }
     this.syncMoveGizmo();
   }
@@ -1023,6 +1064,37 @@ export class Transform3dRuntime {
       this.camera.setAspect(w / h);
       this.needsRender = true;
     }
+  }
+
+  /**
+   * Take the geometry of an edited pattern, and rebuild when this view is next
+   * on screen. The drape in another view is unaffected: this viewport only ever
+   * holds an arrangement.
+   */
+  queueRebuild(mesh: MeshGeometry | null | undefined, pattern?: PatternDocument | null): void {
+    if (!mesh || mesh.vertices.length < 3 || mesh.triangles.length < 3) return;
+    this.pendingMesh = { mesh, pattern: pattern ?? null };
+    this.invalidate();
+  }
+
+  /** Rebuild the cloth on a handed-over geometry, once the view can use it. */
+  private flushPendingRebuild(): void {
+    const pending = this.pendingMesh;
+    // Without an avatar there is nothing to build against; keep it queued.
+    if (!pending || !this.avatarBody) return;
+    this.pendingMesh = null;
+    const selected = [...this.selectedPieceIds];
+    const primary = this.selectedPieceId;
+    this.rebuildCloth(
+      pending.mesh,
+      null,
+      structuredClone(this.transform.pieceTransforms ?? {}),
+      pending.pattern
+    );
+    // The arrangement survives the rebuild, and so should the pieces in hand.
+    const liveIds = new Set(this.getPieceIds());
+    const kept = selected.filter((id) => liveIds.has(id));
+    this.setPieceSelection(kept, primary && kept.includes(primary) ? primary : kept[0] ?? null);
   }
 
   rebuildCloth(
@@ -1385,6 +1457,7 @@ export class Transform3dRuntime {
 
   frame(visible = true): void {
     if (!visible) return;
+    if (this.pendingMesh) this.flushPendingRebuild();
     if (!this.renderer || !this.cloth) return;
     if (!this.needsRender) return;
     this.needsRender = false;
