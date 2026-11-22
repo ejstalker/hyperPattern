@@ -130,6 +130,7 @@ import {
   seamCoversEdge,
   type EdgeParamHit,
 } from './seamHit';
+import { seamEdgeLengthGaps } from './seamMismatch';
 import {
   cutterCrossings,
   cutterPathThrough,
@@ -1156,6 +1157,12 @@ export class PatternEditor {
   private xrayOn = false;
   /** Show dashed links between paired seam edges. */
   private seamConnectorsOn = false;
+  /**
+   * The signed length difference beside each sewn edge, where the two sides of a
+   * seam disagree. On to begin with: it is the number a mismatched seam is evened
+   * out by, and nothing is said where the lengths already match.
+   */
+  private seamLengthsOn = true;
   /** Show each piece's seam allowance, and pick edges to set their own. */
   private allowanceOn = false;
   /** Edge under the pointer while the allowance is shown. */
@@ -1187,6 +1194,7 @@ export class PatternEditor {
   private viewMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
   private xrayBtn: HTMLButtonElement;
   private seamLinksBtn: HTMLButtonElement;
+  private seamLengthsBtn: HTMLButtonElement;
   private allowanceBtn: HTMLButtonElement;
   private grainBtn: HTMLButtonElement;
   /**
@@ -1463,6 +1471,13 @@ export class PatternEditor {
             </svg>
             <span class="pattern-view-name">Seam links</span>
           </button>
+          <button type="button" class="pattern-view-row active" role="menuitemcheckbox" data-opt="seam-lengths" aria-label="Seam lengths" aria-pressed="true">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" d="M2.6 4.4h10.8M2.6 11.6h7.4"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" opacity="0.75" d="M2.6 3.1v2.6M13.4 3.1v2.6M2.6 10.3v2.6M10 10.3v2.6"/>
+            </svg>
+            <span class="pattern-view-name">Seam lengths</span>
+          </button>
           <button type="button" class="pattern-view-row" role="menuitemcheckbox" data-opt="xray" aria-label="X-ray" aria-pressed="false">
             <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
               <path fill="none" stroke="currentColor" stroke-width="1.3" d="M2.5 8c1.8-3.2 4-4.8 5.5-4.8S11.7 4.8 13.5 8c-1.8 3.2-4 4.8-5.5 4.8S4.3 11.2 2.5 8z"/>
@@ -1502,6 +1517,9 @@ export class PatternEditor {
     this.bindToolbarTips();
     this.snapBtn = this.toolbar.querySelector('button[data-opt="snap"]') as HTMLButtonElement;
     this.seamLinksBtn = this.toolbar.querySelector('button[data-opt="seam-links"]') as HTMLButtonElement;
+    this.seamLengthsBtn = this.toolbar.querySelector(
+      'button[data-opt="seam-lengths"]'
+    ) as HTMLButtonElement;
     this.allowanceBtn = this.toolbar.querySelector(
       'button[data-opt="allowance"]'
     ) as HTMLButtonElement;
@@ -1550,6 +1568,13 @@ export class PatternEditor {
       ) as HTMLButtonElement | null;
       if (seamLinksBtn) {
         this.setSeamConnectorsEnabled(!this.seamConnectorsOn);
+        return;
+      }
+      const seamLengthsBtn = (e.target as HTMLElement).closest(
+        'button[data-opt="seam-lengths"]'
+      ) as HTMLButtonElement | null;
+      if (seamLengthsBtn) {
+        this.setSeamLengthsEnabled(!this.seamLengthsOn);
         return;
       }
       const xrayBtn = (e.target as HTMLElement).closest(
@@ -4170,6 +4195,14 @@ export class PatternEditor {
     this.seamConnectorsOn = on;
     this.seamLinksBtn.classList.toggle('active', on);
     this.seamLinksBtn.setAttribute('aria-pressed', String(on));
+    this.redraw();
+  }
+
+  /** Show or hide the length difference beside each sewn edge. */
+  private setSeamLengthsEnabled(on: boolean): void {
+    this.seamLengthsOn = on;
+    this.seamLengthsBtn.classList.toggle('active', on);
+    this.seamLengthsBtn.setAttribute('aria-pressed', String(on));
     this.redraw();
   }
 
@@ -12640,6 +12673,98 @@ export class PatternEditor {
         }
       }
     }
+
+    this.drawSeamLengthGaps();
+  }
+
+  /**
+   * How far each sewn edge is from the fabric it is sewn to, as a small signed
+   * number beside it: the longer edge says how much it has to give, the shorter
+   * how much it is missing. Both carry the same magnitude, so a seam that will not
+   * sit flat reads as "these two need evening out" and the number says by how
+   * much — move the points that shape either side until it goes away.
+   */
+  private drawSeamLengthGaps(): void {
+    if (!this.seamLengthsOn) return;
+    for (const gap of seamEdgeLengthGaps(this.pattern.pieces, this.pattern.seams)) {
+      // Below a tenth of the display unit the readout would say nothing at all.
+      if (Math.abs(cmToDisplay(gap.differenceCm, this.unit)) < 0.05) continue;
+      const piece = this.pattern.pieces.find((p) => p.id === gap.ref.pieceId);
+      if (!piece) continue;
+      const at = this.seamLengthGapAnchor(piece, gap.ref);
+      if (!at) continue;
+      const longer = gap.differenceCm > 0;
+      const text = `${longer ? '+' : '\u2212'}${formatLength(Math.abs(gap.differenceCm), this.unit, 1)}`;
+      const fontPx = 10;
+      const width = this.px(Math.max(30, text.length * fontPx * 0.62 + 10));
+      const height = this.px(14);
+      const group = svgEl('g');
+      group.setAttribute('class', `pattern-seam-gap ${longer ? 'is-long' : 'is-short'}`);
+      group.setAttribute('pointer-events', 'none');
+      const chip = svgEl('rect');
+      chip.setAttribute('x', String(at.x - width / 2));
+      chip.setAttribute('y', String(at.y - height / 2));
+      chip.setAttribute('width', String(width));
+      chip.setAttribute('height', String(height));
+      chip.setAttribute('rx', String(this.px(4)));
+      chip.setAttribute('class', 'pattern-seam-gap-chip');
+      chip.setAttribute('stroke-width', String(this.px(1)));
+      group.appendChild(chip);
+      const label = svgEl('text');
+      label.setAttribute('x', String(at.x));
+      label.setAttribute('y', String(at.y));
+      label.setAttribute('class', 'pattern-seam-gap-value');
+      label.setAttribute('font-size', String(this.px(fontPx)));
+      label.setAttribute('text-anchor', 'middle');
+      // Centred on the cap height rather than the baseline: the chip is only the
+      // height of a line of text.
+      label.setAttribute('dominant-baseline', 'central');
+      label.textContent = text;
+      group.appendChild(label);
+      this.svg.appendChild(group);
+    }
+  }
+
+  /**
+   * Where a sewn edge's number sits: off its midpoint, along the outward normal,
+   * so it hangs beside the fabric rather than over it.
+   */
+  private seamLengthGapAnchor(piece: PatternPiece, ref: SeamEdgeRef): Vec2 | null {
+    // Sampled through the span rather than by edge: a straight edge samples to
+    // its two ends alone, which would put the number on a corner.
+    const samples = sampleEdgeSpanByPointIds(
+      piece,
+      ref.fromPointId,
+      ref.toPointId,
+      ref.t0,
+      ref.t1,
+      24
+    );
+    if (!samples || samples.length < 2) return null;
+    const mid = samples[Math.floor(samples.length / 2)]!;
+    const before = samples[Math.max(0, Math.floor(samples.length / 2) - 1)]!;
+    const after = samples[Math.min(samples.length - 1, Math.floor(samples.length / 2) + 1)]!;
+    const centre = polygonCentroid(piece.points.map((p) => p.anchor));
+    const tx = after.x - before.x;
+    const ty = after.y - before.y;
+    const tangent = Math.hypot(tx, ty);
+    let nx: number;
+    let ny: number;
+    if (tangent > 1e-6) {
+      nx = -ty / tangent;
+      ny = tx / tangent;
+    } else {
+      const away = Math.hypot(mid.x - centre.x, mid.y - centre.y) || 1;
+      nx = (mid.x - centre.x) / away;
+      ny = (mid.y - centre.y) / away;
+    }
+    // Which side of the edge is "outside": the one facing away from the piece.
+    if ((mid.x - centre.x) * nx + (mid.y - centre.y) * ny < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+    const offset = this.px(12);
+    return { x: mid.x + nx * offset, y: mid.y + ny * offset };
   }
 
   /**

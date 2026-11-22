@@ -3722,6 +3722,41 @@ optgroup {
   pointer-events: none;
 }
 
+/*
+ * A sewn edge that does not match its partner: the signed difference, beside the
+ * edge it belongs to. Amber for the side that has to give, blue for the side that
+ * is short — the same warm/cool pair the sew tool already uses for a source and
+ * a target.
+ */
+.pattern-seam-gap {
+  pointer-events: none;
+}
+
+.pattern-seam-gap-chip {
+  fill: rgba(28, 26, 23, 0.88);
+}
+
+.pattern-seam-gap.is-long .pattern-seam-gap-chip {
+  stroke: rgba(232, 176, 75, 0.55);
+}
+
+.pattern-seam-gap.is-short .pattern-seam-gap-chip {
+  stroke: rgba(143, 193, 232, 0.5);
+}
+
+.pattern-seam-gap-value {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+.pattern-seam-gap.is-long .pattern-seam-gap-value {
+  fill: #e8b04b;
+}
+
+.pattern-seam-gap.is-short .pattern-seam-gap-value {
+  fill: #8fc1e8;
+}
+
 .sim-canvas {
   width: 100%;
   height: 100%;
