@@ -25,11 +25,13 @@ import { SelectionOverlay } from './SelectionOverlay';
 import { ClothSewTool } from './ClothSewTool';
 import { PlacementGesture, type PlacementCommit } from './placementGesture';
 import { carryParticles, poseFitsCloth } from './particleCarryOver';
-import { MOVE_ICON, POINTS_ICON, ROTATE_ICON, SEW_ICON } from './viewportIcons';
+import { FABRIC_ICON, MOVE_ICON, POINTS_ICON, ROTATE_ICON, SEW_ICON } from './viewportIcons';
 import { viewportOwnsKey } from './viewportKeyGuard';
 import { ViewportShadingControl } from './ViewportShadingControl';
 import type { Environment } from '../render/environment';
 import type { MaterialLibrary } from '../render/materials';
+import type { FabricLibrary } from '../fabrics/library';
+import { renderFabricPalette } from '../fabrics/palette';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import {
   buildIncidentTriangles,
@@ -83,6 +85,10 @@ export type SimViewportRuntimeOptions = {
   environment?: Environment | null;
   /** Shared scene materials; without one the demo's own colours are used. */
   materials?: MaterialLibrary | null;
+  /** Studio fabric library, for per-piece materials and the Fabric tool. */
+  fabrics?: FabricLibrary | null;
+  /** Give these pieces one fabric variant (null clears it). */
+  onAssignFabric?: (pieceIds: string[], fabricId: string | null) => void;
 };
 
 export type SharedGpu = {
@@ -141,6 +147,10 @@ export class SimViewportRuntime {
   private pointsToggle: HTMLButtonElement | null = null;
   /** Sew tool toggle + the shared edge highlighting / picking behaviour. */
   private sewToggle: HTMLButtonElement | null = null;
+  /** Fabric tool toggle and the palette ribbon it brings up. */
+  private fabricToggle: HTMLButtonElement | null = null;
+  private fabricRibbon: HTMLElement | null = null;
+  private fabricEnabled = false;
   private sewTool: ClothSewTool | null = null;
   private pointsLayer: HTMLDivElement | null = null;
   private pointOverlay: PatternPointOverlay | null = null;
@@ -274,6 +284,10 @@ export class SimViewportRuntime {
     this.sewTool = null;
     this.sewToggle?.remove();
     this.sewToggle = null;
+    this.fabricToggle?.remove();
+    this.fabricToggle = null;
+    this.fabricRibbon?.remove();
+    this.fabricRibbon = null;
     this.pointsLayer?.remove();
     this.pointsLayer = null;
     this.pointOverlay?.destroy();
@@ -349,6 +363,11 @@ export class SimViewportRuntime {
       this.materialsUnsubscribe?.();
       this.materialsUnsubscribe = materials.onChange(() => this.invalidate());
     }
+    const fabrics = this.options.fabrics ?? null;
+    if (fabrics) {
+      renderer.attachFabrics(fabrics);
+      this.syncFabricAssignments();
+    }
     const environment = this.options.environment ?? null;
     if (environment) {
       renderer.attachEnvironment(environment);
@@ -375,6 +394,7 @@ export class SimViewportRuntime {
       onDeleteSeam: (seamId) => this.options.onDeleteSeam?.(seamId),
     });
     this.mountSewToggle();
+    this.mountFabricToggle();
     this.bindPointer();
     // A paused viewport is rendered on demand, so a layout change (resize,
     // fullscreen switch, split) has to ask for a redraw explicitly.
@@ -805,6 +825,7 @@ export class SimViewportRuntime {
     this.canvas.style.cursor = this.selectedPieceIds.size > 0 ? 'default' : 'grab';
     this.invalidate();
     this.options.onSelectionChange?.([...this.selectedPieceIds]);
+    if (this.fabricEnabled) this.refreshFabricRibbon();
   }
 
   /** Select whole pieces by id — the split view's 2D → 3D sync. */
@@ -968,8 +989,10 @@ export class SimViewportRuntime {
       params,
       this.device,
       this.avatarBody,
-      pattern ?? undefined
+      pattern ?? undefined,
+      (pieceId) => this.fabricPhysicsForPiece(pieceId)
     );
+    this.syncFabricAssignments();
     // Markers and their outward orientation must be sampled from the rest pose,
     // before any saved drape is applied on top.
     this.computePointMarkers();
@@ -1523,6 +1546,120 @@ export class SimViewportRuntime {
 
   isSewEnabled(): boolean {
     return this.sewTool?.isEnabled() ?? false;
+  }
+
+  /**
+   * Fabric tool: a palette of the studio's fabrics, applied to the picked
+   * pieces. Picking and dragging stay exactly as they were — the tool is the
+   * ribbon, not a new way to press the cloth.
+   */
+  private mountFabricToggle(): void {
+    this.fabricToggle?.remove();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sim-fabric-toggle';
+    button.innerHTML = `${FABRIC_ICON}<span>Fabric</span>`;
+    button.setAttribute('aria-pressed', 'false');
+    button.title = 'Fabric — pick pieces, then choose a fabric in the ribbon';
+    button.addEventListener('pointerdown', (e) => e.stopPropagation());
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.setFabricEnabled(!this.fabricEnabled);
+    });
+    (this.toolsColumn ?? this.host).appendChild(button);
+    this.fabricToggle = button;
+    this.syncFabricToggle();
+  }
+
+  setFabricEnabled(enabled: boolean): void {
+    this.fabricEnabled = enabled;
+    this.syncFabricToggle();
+    this.canvas.style.cursor = enabled
+      ? 'default'
+      : this.selectedPieceIds.size > 0
+        ? 'default'
+        : 'grab';
+    if (enabled) this.mountFabricRibbon();
+    else this.hideFabricRibbon();
+    this.invalidate();
+  }
+
+  isFabricEnabled(): boolean {
+    return this.fabricEnabled;
+  }
+
+  private syncFabricToggle(): void {
+    if (!this.fabricToggle) return;
+    this.fabricToggle.classList.toggle('is-active', this.fabricEnabled);
+    this.fabricToggle.setAttribute('aria-pressed', String(this.fabricEnabled));
+  }
+
+  private mountFabricRibbon(): void {
+    if (!this.fabricRibbon) {
+      const ribbon = document.createElement('div');
+      ribbon.className = 'sim-fabric-ribbon';
+      ribbon.addEventListener('pointerdown', (e) => e.stopPropagation());
+      this.host.appendChild(ribbon);
+      this.fabricRibbon = ribbon;
+    }
+    this.fabricRibbon.hidden = false;
+    this.refreshFabricRibbon();
+  }
+
+  private hideFabricRibbon(): void {
+    if (this.fabricRibbon) this.fabricRibbon.hidden = true;
+  }
+
+  private refreshFabricRibbon(): void {
+    if (!this.fabricRibbon) return;
+    const pieces = [...this.selectedPieceIds]
+      .map((id) => this.pattern?.pieces.find((piece) => piece.id === id))
+      .filter((piece): piece is NonNullable<typeof piece> => !!piece)
+      .map((piece) => ({ id: piece.id, name: piece.name, fabricId: piece.fabricId ?? null }));
+    renderFabricPalette(this.fabricRibbon, this.options.fabrics ?? null, {
+      pieces,
+      emptyLabel: 'Pick a piece',
+      onAssign: (pieceIds, fabricId) => {
+        this.options.onAssignFabric?.(pieceIds, fabricId);
+        this.refreshFabricRibbon();
+      },
+      onAssignOne: (pieceId, fabricId) => {
+        this.options.onAssignFabric?.([pieceId], fabricId);
+        this.refreshFabricRibbon();
+      },
+    });
+  }
+
+  /** The fabric physics of a piece, for the cloth builder. */
+  private fabricPhysicsForPiece(pieceId: string) {
+    const piece = this.pattern?.pieces.find((entry) => entry.id === pieceId);
+    return piece ? this.options.fabrics?.physicsForPiece(piece) ?? null : null;
+  }
+
+  /** Which variant each piece is made of, for the renderer's per-piece draws. */
+  private syncFabricAssignments(): void {
+    if (!this.renderer) return;
+    const assignments = new Map<string, string>();
+    for (const piece of this.pattern?.pieces ?? []) {
+      if (piece.fabricId) assignments.set(piece.id, piece.fabricId);
+    }
+    const fabrics = this.options.fabrics ?? null;
+    if (fabrics) this.renderer.attachFabrics(fabrics);
+    this.renderer.setFabricAssignments(assignments);
+  }
+
+  /**
+   * The library or an assignment changed. Physics are re-baked in place and the
+   * renderer is told which piece wears what — no remesh, no drape reset.
+   */
+  refreshFabrics(applyPhysics = true): void {
+    this.syncFabricAssignments();
+    if (applyPhysics) {
+      this.cloth?.applyFabricPhysics?.((pieceId) => this.fabricPhysicsForPiece(pieceId));
+    }
+    if (this.fabricEnabled) this.refreshFabricRibbon();
+    this.invalidate();
   }
 
   private syncSewToggle(): void {

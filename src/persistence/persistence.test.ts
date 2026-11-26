@@ -335,6 +335,7 @@ describe('mesh geometry pack/unpack', () => {
     const restored = unpackMeshGeometry(packed);
     expect(restored.vertices.length).toBe(geom.vertices.length);
     expect(restored.triangles.length).toBe(geom.triangles.length);
+    expect(restored.uvs).toEqual(geom.uvs);
   });
 });
 

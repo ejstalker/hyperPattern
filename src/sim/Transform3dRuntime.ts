@@ -27,7 +27,13 @@ import { createViewportRenderer } from './SimViewportRuntime';
 import { SelectionOverlay } from './SelectionOverlay';
 import { ClothSewTool } from './ClothSewTool';
 import { viewportOwnsKey } from './viewportKeyGuard';
-import { MOVE_ICON, ROTATE_ICON, SNAP_ICON, SEW_ICON } from './viewportIcons';
+import {
+  FABRIC_ICON,
+  MOVE_ICON,
+  ROTATE_ICON,
+  SNAP_ICON,
+  SEW_ICON,
+} from './viewportIcons';
 import {
   arrangementBelongsTo,
   eulerDegToQuat,
@@ -38,6 +44,8 @@ import {
 import { ViewportShadingControl } from './ViewportShadingControl';
 import type { Environment } from '../render/environment';
 import type { MaterialLibrary } from '../render/materials';
+import type { FabricLibrary } from '../fabrics/library';
+import { renderFabricPalette } from '../fabrics/palette';
 import {
   buildQuadrantLayout,
   pickQuadrant,
@@ -97,6 +105,10 @@ export type Transform3dRuntimeOptions = {
   environment?: Environment | null;
   /** Shared scene materials; without one the demo's own colours are used. */
   materials?: MaterialLibrary | null;
+  /** Studio fabric library, for per-piece materials and the Fabric tool. */
+  fabrics?: FabricLibrary | null;
+  /** Give these pieces one fabric variant (null clears it). */
+  onAssignFabric?: (pieceIds: string[], fabricId: string | null) => void;
 };
 
 export class Transform3dRuntime {
@@ -117,6 +129,10 @@ export class Transform3dRuntime {
   private selectionOverlay: SelectionOverlay | null = null;
   /** The Move and Rotate mode buttons, and the column the tools sit in. */
   private toolsColumn: HTMLElement | null = null;
+  /** Fabric tool toggle and the palette ribbon it brings up. */
+  private fabricToggle: HTMLButtonElement | null = null;
+  private fabricRibbon: HTMLElement | null = null;
+  private fabricEnabled = false;
   private moveToggle: HTMLButtonElement | null = null;
   private rotateToggle: HTMLButtonElement | null = null;
   private snapToggle: HTMLButtonElement | null = null;
@@ -247,6 +263,10 @@ export class Transform3dRuntime {
     this.snapToggle = null;
     this.sewToggle?.remove();
     this.sewToggle = null;
+    this.fabricToggle?.remove();
+    this.fabricToggle = null;
+    this.fabricRibbon?.remove();
+    this.fabricRibbon = null;
   }
 
   getSelectedPieceId(): string | null {
@@ -487,6 +507,11 @@ export class Transform3dRuntime {
       this.materialsUnsubscribe?.();
       this.materialsUnsubscribe = materials.onChange(() => this.invalidate());
     }
+    const fabrics = this.options.fabrics ?? null;
+    if (fabrics) {
+      renderer.attachFabrics(fabrics);
+      this.syncFabricAssignments();
+    }
     const environment = this.options.environment ?? null;
     if (environment) {
       renderer.attachEnvironment(environment);
@@ -512,6 +537,7 @@ export class Transform3dRuntime {
     this.mountTransformToggle();
     this.mountSnapToggle();
     this.mountSewToggle();
+    this.mountFabricToggle();
     this.bindPointer();
     this.bindKeyboard();
     if (typeof ResizeObserver !== 'undefined') {
@@ -532,6 +558,102 @@ export class Transform3dRuntime {
    * dragging still orbits, which is how you get to the other side of a garment.
    * The behaviour itself lives in `ClothSewTool`, shared with the drape viewport.
    */
+  /** Fabric tool: pick pieces as usual, then choose a fabric in the ribbon. */
+  private mountFabricToggle(): void {
+    this.fabricToggle?.remove();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sim-fabric-toggle';
+    button.innerHTML = `${FABRIC_ICON}<span>Fabric</span>`;
+    button.setAttribute('aria-pressed', 'false');
+    button.title = 'Fabric — pick pieces, then choose a fabric in the ribbon';
+    button.addEventListener('pointerdown', (e) => e.stopPropagation());
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.setFabricEnabled(!this.fabricEnabled);
+    });
+    (this.toolsColumn ?? this.host).appendChild(button);
+    this.fabricToggle = button;
+    this.syncFabricToggle();
+  }
+
+  setFabricEnabled(enabled: boolean): void {
+    this.fabricEnabled = enabled;
+    this.syncFabricToggle();
+    if (enabled) this.mountFabricRibbon();
+    else if (this.fabricRibbon) this.fabricRibbon.hidden = true;
+    this.invalidate();
+  }
+
+  isFabricEnabled(): boolean {
+    return this.fabricEnabled;
+  }
+
+  private syncFabricToggle(): void {
+    if (!this.fabricToggle) return;
+    this.fabricToggle.classList.toggle('is-active', this.fabricEnabled);
+    this.fabricToggle.setAttribute('aria-pressed', String(this.fabricEnabled));
+  }
+
+  private mountFabricRibbon(): void {
+    if (!this.fabricRibbon) {
+      const ribbon = document.createElement('div');
+      ribbon.className = 'sim-fabric-ribbon';
+      ribbon.addEventListener('pointerdown', (e) => e.stopPropagation());
+      this.host.appendChild(ribbon);
+      this.fabricRibbon = ribbon;
+    }
+    this.fabricRibbon.hidden = false;
+    this.refreshFabricRibbon();
+  }
+
+  private refreshFabricRibbon(): void {
+    if (!this.fabricRibbon) return;
+    const pieces = [...this.selectedPieceIds]
+      .map((id) => this.pattern?.pieces.find((piece) => piece.id === id))
+      .filter((piece): piece is NonNullable<typeof piece> => !!piece)
+      .map((piece) => ({ id: piece.id, name: piece.name, fabricId: piece.fabricId ?? null }));
+    renderFabricPalette(this.fabricRibbon, this.options.fabrics ?? null, {
+      pieces,
+      emptyLabel: 'Pick a piece',
+      onAssign: (pieceIds, fabricId) => {
+        this.options.onAssignFabric?.(pieceIds, fabricId);
+        this.refreshFabricRibbon();
+      },
+      onAssignOne: (pieceId, fabricId) => {
+        this.options.onAssignFabric?.([pieceId], fabricId);
+        this.refreshFabricRibbon();
+      },
+    });
+  }
+
+  private fabricPhysicsForPiece(pieceId: string) {
+    const piece = this.pattern?.pieces.find((entry) => entry.id === pieceId);
+    return piece ? this.options.fabrics?.physicsForPiece(piece) ?? null : null;
+  }
+
+  private syncFabricAssignments(): void {
+    if (!this.renderer) return;
+    const assignments = new Map<string, string>();
+    for (const piece of this.pattern?.pieces ?? []) {
+      if (piece.fabricId) assignments.set(piece.id, piece.fabricId);
+    }
+    const fabrics = this.options.fabrics ?? null;
+    if (fabrics) this.renderer.attachFabrics(fabrics);
+    this.renderer.setFabricAssignments(assignments);
+  }
+
+  /** The library or an assignment changed: no remesh, no arrangement reset. */
+  refreshFabrics(applyPhysics = true): void {
+    this.syncFabricAssignments();
+    if (applyPhysics) {
+      this.cloth?.applyFabricPhysics?.((pieceId) => this.fabricPhysicsForPiece(pieceId));
+    }
+    if (this.fabricEnabled) this.refreshFabricRibbon();
+    this.invalidate();
+  }
+
   private mountSewToggle(): void {
     this.sewToggle?.remove();
     const button = document.createElement('button');
@@ -948,6 +1070,7 @@ export class Transform3dRuntime {
     this.syncCursor();
     this.invalidate();
     this.onSelectionChange?.([...this.selectedPieceIds], primary);
+    if (this.fabricEnabled) this.refreshFabricRibbon();
   }
 
   /** Select whole pieces by id — the split view's 2D → 3D sync. */
@@ -1104,6 +1227,7 @@ export class Transform3dRuntime {
     pattern?: PatternDocument | null
   ): void {
     if (!this.avatarBody) return;
+    this.pattern = pattern ?? null;
     this.cloth?.destroy();
     const geom =
       mesh && mesh.vertices.length >= 3 && mesh.triangles.length >= 3
@@ -1116,13 +1240,14 @@ export class Transform3dRuntime {
       ARRANGE_SIM_PARAMS,
       this.device,
       this.avatarBody,
-      pattern ?? undefined
+      pattern ?? undefined,
+      (pieceId) => this.fabricPhysicsForPiece(pieceId)
     );
+    this.syncFabricAssignments();
 
     // Index the new cloth's outline for the sew tool. The tags come from the
     // mesh, so a cloth without them (no pattern behind it) simply has nothing to
     // pick, and the tool says so rather than picking edges that are not there.
-    this.pattern = pattern ?? null;
     this.sewTool?.rebuild(geom);
     this.syncSewToggle();
 

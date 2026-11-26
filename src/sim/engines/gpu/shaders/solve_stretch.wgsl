@@ -33,6 +33,8 @@ struct Params {
 @group(0) @binding(4) var<storage, read> stretchRest: array<f32>;
 @group(0) @binding(5) var<storage, read_write> lambdas: array<f32>;
 @group(0) @binding(6) var<storage, read> slack: array<f32>;
+/** Fabric stiffness multiplier per constraint; 1 = the drape's own stiffness. */
+@group(0) @binding(7) var<storage, read> stiffness: array<f32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -86,7 +88,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // every substep, and that chatter is what keeps a gathered panel buzzing long
   // after it should have settled. Only a row with folds to give is softened —
   // everywhere else `softness` is 1 and the fabric keeps its own stiffness.
-  let base = max(params.compliance, 0.0) * params.invH2;
+  // A heavier, stiffer fabric has a smaller compliance, so the multiplier
+  // divides the drape's own value rather than scaling the correction.
+  let fabric = max(stiffness[id], 0.05);
+  let base = (max(params.compliance, 0.0) * params.invH2) / fabric;
   let softness = select(1.0, mix(max(params.crowdSoftness, 1.0), 1.0, crowd), crowds);
   let alphaTilde = base * softness;
   let lambda = lambdas[id];

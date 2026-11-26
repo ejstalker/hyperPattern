@@ -19,6 +19,8 @@ import type {
   UnitDisplay,
   Vec2,
 } from '../project/types';
+import type { FabricLibrary } from '../fabrics/library';
+import { renderFabricPalette } from '../fabrics/palette';
 import { formatLength, cmToDisplay, displayToCm } from '../project/types';
 import {
   PATTERN_TEXT_MIN_CM,
@@ -72,6 +74,7 @@ import {
   drawSeamConnectorPairs,
 } from '../mesh/meshSeamDraw';
 import { recordPieceSuccessors } from '../sim/pieceTransforms';
+import { splitPieceUv } from './uvMapping';
 import { isUnplaced } from '../project/containers';
 import { circlePiece, rectPiece, uid } from '../project/createDefault';
 import {
@@ -301,6 +304,10 @@ export type PatternEditorCallbacks = {
     clientY: number;
     pieceIds: string[];
   }) => void;
+  /** The studio's fabric library, for the Fabric tool's ribbon. */
+  getFabrics?: () => FabricLibrary | null;
+  /** Give these pieces one fabric variant (null clears it). */
+  onAssignFabric?: (pieceIds: string[], fabricId: string | null) => void;
 };
 
 /**
@@ -433,7 +440,8 @@ export type PatternTool =
   | 'cut'
   | 'modify'
   | 'sew'
-  | 'ruler';
+  | 'ruler'
+  | 'fabric';
 
 /**
  * What the Add tool is drawing: a pen stroke, a rectangle, a circle, or a box for
@@ -492,6 +500,7 @@ const TOOL_KEYS: Record<string, PatternTool> = {
   c: 'cut',
   s: 'sew',
   r: 'ruler',
+  f: 'fabric',
 };
 
 /** Inline icons, in the rail's own 16px line-art style. */
@@ -502,6 +511,9 @@ const ICONS = {
            <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" d="M10.6 4.5 L12.6 2.5"/>
            <circle cx="13" cy="2.1" r="1.15" fill="currentColor"/>
            <rect x="1.8" y="3.3" width="2.4" height="2.4" fill="currentColor"/>`,
+  // A folded swatch: the piece is being given a fabric.
+  fabric: `<path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M2.4 3.4h4.3l2 2.3h4.9v7.1H2.4z"/>
+           <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" d="M6.7 3.4v2.3h-4.3M9.8 7.6l2.2 1.7-2.2 1.6"/>`,
   // Scissors: material is cut away.
   sew: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 12.5 L12.5 3"/>
         <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="1.6 1.3" d="M2.8 8.2 L7.8 8.2"/>
@@ -988,6 +1000,8 @@ export class PatternEditor {
   private arrangeFields!: Record<'x' | 'y' | 'turn' | 'scale', HTMLInputElement>;
   /** The tool in hand's own options, top-left of the canvas. */
   private toolSettings: HTMLElement;
+  /** The Fabric tool's ribbon: every type and variant in the studio library. */
+  private fabricPaletteEl!: HTMLElement;
   private parallelCheck: HTMLInputElement;
   private cornerCheck: HTMLInputElement;
   private svg: SVGSVGElement;
@@ -1399,6 +1413,12 @@ export class PatternEditor {
           </svg>
           <span class="pattern-tool-key" aria-hidden="true">R</span>
         </button>
+        <button type="button" data-tool="fabric" data-tip="Fabric · pick pieces, then a fabric in the ribbon" aria-label="Fabric">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            ${ICONS.fabric}
+          </svg>
+          <span class="pattern-tool-key" aria-hidden="true">F</span>
+        </button>
       </div>
       <!-- Everything that changes how the work is *seen* rather than what it is:
            one menu in the corner, so the rail stays a row of tools. -->
@@ -1788,6 +1808,9 @@ export class PatternEditor {
           ${modeButtonsHtml(EDGE_PAIR_MODES, 'data-sew-mode')}
         </div>
       </div>
+      <div class="pattern-settings-set pattern-settings-set-fabric" data-settings-for="fabric" hidden>
+        <div class="fabric-palette pattern-fabric-palette" data-fabric-palette></div>
+      </div>
     `;
     this.viewport.appendChild(this.toolSettings);
 
@@ -1861,6 +1884,9 @@ export class PatternEditor {
       this.notifyReferenceChange();
       this.redraw();
     });
+    this.fabricPaletteEl = this.toolSettings.querySelector(
+      '[data-fabric-palette]'
+    ) as HTMLElement;
     this.sealOverlay(this.toolSettings);
     // The ruler's measurement picker is a dropdown of the ribbon, beside its two
     // tools: the library it lists is the one the tool is set to read.
@@ -3400,15 +3426,42 @@ export class PatternEditor {
       btn.classList.toggle('active', (btn as HTMLElement).dataset.tool === tool);
     }
     this.syncToolRail();
+    if (tool === 'fabric') this.refreshFabricPalette();
     this.applyCursor(null);
     this.redraw();
+  }
+
+  /**
+   * Repaint the Fabric ribbon from the studio library and the current pick.
+   * Public because the host calls it when the library itself was edited in the
+   * Fabrics library: the palette is a view of that library, not a copy.
+   */
+  refreshFabricPalette(): void {
+    if (!this.fabricPaletteEl) return;
+    const pieces = this.pattern.pieces
+      .filter((piece) =>
+        pieceRings(piece).some((ring) => ring.some((pt) => this.selectedIds.has(pt.id)))
+      )
+      .map((piece) => ({
+        id: piece.id,
+        name: piece.name,
+        fabricId: piece.fabricId ?? null,
+      }));
+    renderFabricPalette(this.fabricPaletteEl, this.cbs.getFabrics?.() ?? null, {
+      pieces,
+      emptyLabel: 'Pick a piece',
+      onAssign: (pieceIds, fabricId) => this.cbs.onAssignFabric?.(pieceIds, fabricId),
+      onAssignOne: (pieceId, fabricId) => this.cbs.onAssignFabric?.([pieceId], fabricId),
+    });
+    // A ribbon that just changed height moves the block panel under it.
+    this.syncToolSettings();
   }
 
   /** Cursor the active tool uses when nothing is under the pointer. */
   private baseCursor(): string {
     // Everything but Move works on the pattern rather than on what is already
     // picked, so it all reads as a crosshair.
-    return this.tool === 'move' ? 'default' : 'crosshair';
+    return this.tool === 'move' || this.tool === 'fabric' ? 'default' : 'crosshair';
   }
 
   /**
@@ -4297,6 +4350,7 @@ export class PatternEditor {
     if (sig === this.lastSelectionSig) return;
     this.lastSelectionSig = sig;
     this.cbs.onSelectionChange(ids);
+    if (this.tool === 'fabric') this.refreshFabricPalette();
   }
 
   private redraw(): void {
@@ -5468,6 +5522,7 @@ export class PatternEditor {
         .filter((ring) => pointInPolygon(ring[0]!.anchor, ringToPolyline(cutRing)))
         .map((ring) => ring.map((pt) => cloneBezierPoint(pt, () => uid('pt')))),
       grainline: grainlineInside(piece, cutRing),
+      fabricId: piece.fabricId,
     };
     if (cutOut.holes && cutOut.holes.length === 0) delete cutOut.holes;
 
@@ -5564,6 +5619,9 @@ export class PatternEditor {
       return result.reason;
     }
     const [a, b] = result.pieces;
+    // The halves keep their share of the piece's texture mapping.
+    a.uv = splitPieceUv(piece, a);
+    b.uv = splitPieceUv(piece, b);
     const idx = this.pattern.pieces.findIndex((p) => p.id === piece.id);
     if (idx < 0) {
       this.endHistoryGesture();
@@ -10670,6 +10728,29 @@ export class PatternEditor {
       return;
     }
 
+    // Fabric picks whole pieces, from their fill or any of their edges, and
+    // never edits a point: the ribbon is where the fabric is chosen, so all the
+    // click has to do is say which pieces it applies to.
+    if (this.tool === 'fabric') {
+      const piece = pieceId
+        ? this.pattern.pieces.find((entry) => entry.id === pieceId) ?? null
+        : null;
+      if (piece) {
+        if (e.shiftKey || e.metaKey || e.ctrlKey) this.toggleEntirePiece(piece);
+        else this.selectEntirePiece(piece);
+        this.selectedPointId = null;
+        this.applyCursor(null);
+        this.redraw();
+        e.preventDefault();
+      } else {
+        this.clearSelection();
+        this.selectedPieceId = null;
+        this.applyCursor(null);
+        this.redraw();
+      }
+      return;
+    }
+
     // The sew tool works on the *edges* of a piece, not on the shape inside it,
     // so it has to be offered the click before the block intercept below. A
     // block's outline is exactly what you sew its pieces together by; letting
@@ -11746,7 +11827,8 @@ export class PatternEditor {
       this.tool === 'sew' ||
       this.tool === 'cut' ||
       this.tool === 'ruler' ||
-      this.tool === 'add'
+      this.tool === 'add' ||
+      this.tool === 'fabric'
     );
   }
 

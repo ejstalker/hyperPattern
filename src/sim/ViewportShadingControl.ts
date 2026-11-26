@@ -22,6 +22,7 @@ import {
   type ShadingMode,
 } from '../render/environment';
 import { TONEMAP_MODES, tonemapLabel, type TonemapMode } from '../render/tonemapping';
+import { imageFileToDataUrl } from '../render/imageDataUrl';
 
 /** How each material reads in the panel. */
 const MATERIAL_ROWS: ReadonlyArray<{ id: MaterialId; label: string; derivedColor?: string }> = [
@@ -71,6 +72,13 @@ export class ViewportShadingControl {
     MaterialId,
     { color: HTMLInputElement; roughness: HTMLInputElement; roughnessOut: HTMLElement; metallic: HTMLInputElement; metallicOut: HTMLElement }
   >();
+  /** The cloth's albedo image chooser; other materials are solid colours only. */
+  private albedoImage: {
+    pick: HTMLButtonElement;
+    thumb: HTMLImageElement;
+    name: HTMLElement;
+    clear: HTMLButtonElement;
+  } | null = null;
   private unsubscribe: (() => void) | null = null;
   private materialsUnsubscribe: (() => void) | null = null;
   private opts: ShadingControlOptions;
@@ -291,6 +299,8 @@ export class ViewportShadingControl {
       const roughness = slider('Roughness', 'viewport-shading-material-roughness');
       const metallic = slider('Metallic', 'viewport-shading-material-metallic');
 
+      if (row.id === 'cloth') wrap.appendChild(this.buildAlbedoImageRow());
+
       list.appendChild(wrap);
       this.materialFields.set(row.id, {
         color,
@@ -318,6 +328,86 @@ export class ViewportShadingControl {
       }
     }
     this.syncMaterialFields();
+  }
+
+  /**
+   * The cloth's albedo image: a file becomes a downscaled data URL in the
+   * material, and the renderer samples it with the UVs from the Remesh node.
+   */
+  private buildAlbedoImageRow(): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'viewport-shading-material-texture';
+
+    const pick = document.createElement('button');
+    pick.type = 'button';
+    pick.className = 'viewport-shading-material-texture-pick';
+    pick.title = 'Use an image as the cloth albedo (mapped by the Remesh UVs)';
+
+    const thumb = document.createElement('img');
+    thumb.className = 'viewport-shading-material-texture-thumb';
+    thumb.alt = '';
+    thumb.hidden = true;
+
+    const name = document.createElement('span');
+    name.className = 'viewport-shading-material-texture-name';
+    name.textContent = 'Image…';
+    pick.append(thumb, name);
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'viewport-shading-material-texture-clear';
+    clear.title = 'Remove the image and use the colour';
+    clear.textContent = '×';
+    clear.hidden = true;
+
+    const file = document.createElement('input');
+    file.type = 'file';
+    file.accept = 'image/*';
+    file.className = 'viewport-shading-material-texture-file';
+    file.hidden = true;
+
+    pick.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      file.click();
+    });
+    file.addEventListener('change', () => {
+      const chosen = file.files?.[0];
+      file.value = '';
+      if (!chosen) return;
+      void this.applyAlbedoImage(chosen);
+    });
+    clear.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.opts.materials?.set('cloth', {
+        albedoImage: undefined,
+        albedoImageName: undefined,
+      });
+      this.opts.onInvalidate();
+    });
+
+    if (!this.opts.materials) {
+      pick.disabled = true;
+      clear.disabled = true;
+    }
+
+    wrap.append(pick, clear, file);
+    this.albedoImage = { pick, thumb, name, clear };
+    return wrap;
+  }
+
+  private async applyAlbedoImage(file: File): Promise<void> {
+    const materials = this.opts.materials;
+    if (!materials) return;
+    try {
+      const dataUrl = await imageFileToDataUrl(file);
+      materials.set('cloth', { albedoImage: dataUrl, albedoImageName: file.name });
+      this.opts.onInvalidate();
+    } catch (error) {
+      console.warn('Could not read the cloth albedo image', error);
+      this.albedoImage!.name.textContent = 'Could not read that image';
+    }
   }
 
   /** One button per operator: they all live in the shaders, picked by a uniform. */
@@ -354,13 +444,36 @@ export class ViewportShadingControl {
       fields.color.title =
         id === 'pedestal'
           ? `Pedestal — follows the reference model, ${Math.round(PEDESTAL_DARKENING * 100)}% darker`
-          : fields.color.title;
+          : id === 'cloth' && material.albedoImage
+            ? 'Cloth fallback colour — the albedo image is in use'
+            : fields.color.title;
       const roughness = Math.round(material.roughness * 100);
       const metallic = Math.round(material.metallic * 100);
       if (Number(fields.roughness.value) !== roughness) fields.roughness.value = String(roughness);
       if (Number(fields.metallic.value) !== metallic) fields.metallic.value = String(metallic);
       fields.roughnessOut.textContent = `${roughness}%`;
       fields.metallicOut.textContent = `${metallic}%`;
+      if (id === 'cloth') this.syncAlbedoImage(material.albedoImage, material.albedoImageName);
+    }
+  }
+
+  private syncAlbedoImage(image: string | undefined, imageName: string | undefined): void {
+    const ui = this.albedoImage;
+    if (!ui) return;
+    if (image) {
+      if (ui.thumb.getAttribute('src') !== image) ui.thumb.src = image;
+      ui.thumb.hidden = false;
+      ui.name.textContent = imageName || 'Image';
+      ui.pick.title = 'Replace the cloth albedo image';
+      ui.pick.classList.add('has-image');
+      ui.clear.hidden = false;
+    } else {
+      ui.thumb.hidden = true;
+      ui.thumb.removeAttribute('src');
+      ui.name.textContent = 'Image…';
+      ui.pick.title = 'Use an image as the cloth albedo (mapped by the Remesh UVs)';
+      ui.pick.classList.remove('has-image');
+      ui.clear.hidden = true;
     }
   }
 

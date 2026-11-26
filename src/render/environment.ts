@@ -2,11 +2,13 @@
  * Image-based lighting: the HDRI background and the light probe behind PBR
  * shading.
  *
- * A decoded equirectangular HDRI is turned into the four GPU resources a
- * physically based shader needs — a mip-mapped cubemap (background, and blurred
- * background by sampling a lower mip), a diffuse irradiance cubemap, a
- * roughness-prefiltered specular cubemap and a split-sum BRDF lookup table — all
- * once, then shared by every viewport, since they all render on one device.
+ * A decoded equirectangular HDRI is turned into the GPU resources the views
+ * need — a background latlong blurred by a separable Gaussian, a mip-mapped
+ * cubemap for the light probe, a diffuse irradiance cubemap, a
+ * roughness-prefiltered specular cubemap and a split-sum BRDF lookup table —
+ * all once, then shared by every viewport, since they all render on one device.
+ * The background's blur is built separately so tuning it never touches the
+ * probe's mips.
  *
  * The passes follow the layout used by ~/Documents/Dev/pbr-webgpu.
  */
@@ -61,30 +63,57 @@ export function shadingModeLabel(mode: ShadingMode): string {
 }
 
 /**
- * Background blur, 0..1, as a *fractional* mip level of the latlong image.
- *
- * The mip chain already averages wider and wider neighbourhoods, and the
- * sampler interpolates between two levels (and within a level), so the skybox
- * reads a smooth, continuous defocus from a single texture fetch per pixel. No
- * per-frame taps, and no stepping as the slider moves.
+ * Cap on the equirect mip chain: the lighting capture reads it with implicit
+ * LOD from a 512-texel cube face, and six halvings are already well past the
+ * footprint that pass can resolve. The background does not read these mips.
  */
-export function blurToMipLevel(blur: number, maxLevel: number): number {
-  return Math.min(1, Math.max(0, blur)) * Math.max(0, maxLevel);
-}
+const MAX_EQUIRECT_MIP = 6;
 
 /**
- * The softest level worth sampling. Level 6 leaves a 2k latlong about 32 texels
- * wide — a heavy defocus that still has a shape; past it the image is a wash.
- */
-const MAX_BLUR_MIP = 6;
-
-/**
- * How many levels the latlong chain needs: one per halving, capped at the
- * softest level the background can ask for.
+ * How many levels the latlong chain needs: one per halving, capped where the
+ * lighting capture stops resolving detail.
  */
 export function equirectMipLevelCount(width: number): number {
   if (!Number.isFinite(width) || width < 2) return 1;
-  return Math.min(Math.floor(Math.log2(width)) + 1, MAX_BLUR_MIP + 1);
+  return Math.min(Math.floor(Math.log2(width)) + 1, MAX_EQUIRECT_MIP + 1);
+}
+
+/** The background blur is worked at no more than this latlong width. */
+const BACKGROUND_BLUR_MAX_WIDTH = 1024;
+/** Half the taps in the separable Gaussian: 24 gives a 49-tap kernel. */
+const BACKGROUND_BLUR_HALF_TAPS = 24;
+/** Gaussian sigma at full blur, in texels of a 1024-wide latlong. */
+const BACKGROUND_BLUR_MAX_SIGMA = 12;
+
+/**
+ * A normalised 1D Gaussian: the centre weight then one per tap outwards. The
+ * kernel is truncated at 3 sigma (or the tap budget), so the visible result
+ * keeps varying smoothly with the slider instead of stepping.
+ */
+export function gaussianBlurKernel(
+  sigma: number,
+  halfTaps: number
+): { radius: number; weights: Float32Array } {
+  const weights = new Float32Array(halfTaps + 1);
+  const safeSigma = Number.isFinite(sigma) ? Math.max(0, sigma) : 0;
+  if (safeSigma <= 0.01 || halfTaps <= 0) {
+    weights[0] = 1;
+    return { radius: 0, weights };
+  }
+  const radius = Math.min(halfTaps, Math.max(1, Math.ceil(safeSigma * 3)));
+  const raw = new Float32Array(radius + 1);
+  let sum = 0;
+  for (let i = 0; i <= radius; i++) {
+    const x = i / safeSigma;
+    raw[i] = Math.exp(-0.5 * x * x);
+    sum += i === 0 ? raw[i]! : 2 * raw[i]!;
+  }
+  if (!(sum > 0)) {
+    weights[0] = 1;
+    return { radius: 0, weights };
+  }
+  for (let i = 0; i <= radius; i++) weights[i] = raw[i]! / sum;
+  return { radius, weights };
 }
 
 export const MIN_EXPOSURE = 0.2;
@@ -489,16 +518,14 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec2<f32> {
 `;
 
 /**
- * Skybox: unwraps the latlong HDRI around the camera, read from the defocused
- * level of its mip chain. The uniform block is shared with the fragment
- * shader, so the two structs must stay identical.
+ * Skybox: unwraps the latlong HDRI around the camera, read from a background
+ * texture that has already been Gaussian-blurred on the GPU. The uniform block
+ * is shared with the fragment shader, so the two structs must stay identical.
  */
 const BACKGROUND_VERTEX_SHADER = /* wgsl */ `
 struct Uniforms {
   inverseViewProj: mat4x4<f32>,
   eye: vec3<f32>,
-  /** Fractional mip level of the latlong image. */
-  blurLevel: f32,
   exposure: f32,
   /** Tone mapping operator, as a TONEMAP_MODES index. */
   tonemap: f32,
@@ -536,19 +563,15 @@ const BACKGROUND_FRAGMENT_SHADER = /* wgsl */ `
 struct Uniforms {
   inverseViewProj: mat4x4<f32>,
   eye: vec3<f32>,
-  /**
-   * Fractional mip level of the latlong image. The sampler interpolates
-   * between levels, so this is a soft defocus rather than a resample.
-   */
-  blurLevel: f32,
   exposure: f32,
   /** Tone mapping operator, as a TONEMAP_MODES index. */
   tonemap: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var hdri: texture_2d<f32>;
-@group(0) @binding(2) var hdriSampler: sampler;
+/** The latlong image after the separable Gaussian pass. */
+@group(0) @binding(1) var background: texture_2d<f32>;
+@group(0) @binding(2) var backgroundSampler: sampler;
 
 ${PBR_HELPERS}
 
@@ -559,13 +582,53 @@ ${toneMappingWgsl}
 @fragment
 fn main(@location(0) farPoint: vec3<f32>) -> @location(0) vec4<f32> {
   let direction = normalize(farPoint - uniforms.eye);
-  // One fetch: the mip chain holds the averages, the sampler blends between the
-  // levels either side of the blur level and bilinearly within each.
   let sampled = textureSampleLevel(
-    hdri, hdriSampler, latlongUv(direction), uniforms.blurLevel,
+    background, backgroundSampler, latlongUv(direction), 0.0,
   ).rgb;
   let mapped = toneMapping(sampled * uniforms.exposure, u32(uniforms.tonemap + 0.5));
   return vec4<f32>(pow(mapped, vec3<f32>(1.0 / 2.2)), 1.0);
+}
+`;
+
+/**
+ * One axis of a separable Gaussian blur.
+ *
+ * The weights are built on the CPU for the slider's sigma and uploaded as a
+ * uniform, so every pixel is a straight weighted sum of 2·radius+1 taps along
+ * one axis. Two passes (horizontal then vertical) convolve the image with a
+ * true Gaussian, which stays smooth as the radius grows.
+ */
+const BACKGROUND_BLUR_FRAGMENT_SHADER = /* wgsl */ `
+struct Params {
+  /** One texel step along the axis being blurred, in source UV. */
+  texelStep: vec2<f32>,
+  sigma: f32,
+  /** Farthest tap on each side of the centre. */
+  tapRadius: f32,
+  /** Gaussian weights: centre in x, then one more per tap outwards. */
+  weights: array<vec4<f32>, 7>,
+  /** Mip level of the source to read, for a downscale. */
+  sourceLod: f32,
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var source: texture_2d<f32>;
+@group(0) @binding(2) var sourceSampler: sampler;
+
+@fragment
+fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+  var color = textureSampleLevel(source, sourceSampler, uv, params.sourceLod).rgb
+    * params.weights[0].x;
+  let radius = u32(params.tapRadius + 0.5);
+  for (var i = 1u; i <= radius; i++) {
+    let weight = params.weights[i / 4u][i % 4u];
+    let offset = params.texelStep * f32(i);
+    color += textureSampleLevel(source, sourceSampler, uv + offset, params.sourceLod).rgb
+      * weight;
+    color += textureSampleLevel(source, sourceSampler, uv - offset, params.sourceLod).rgb
+      * weight;
+  }
+  return vec4<f32>(color, 1.0);
 }
 `;
 
@@ -593,9 +656,8 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 `;
 
 type RenderTargets = {
-  /** The latlong image itself — the background unwraps this directly. */
+  /** The latlong image itself, and the mip chain the lighting capture reads. */
   equirect: GPUTexture;
-  /** Its width, which decides how soft the background blur can go. */
   equirectWidth: number;
   cubemap: GPUTexture;
   irradiance: GPUTexture;
@@ -605,6 +667,13 @@ type RenderTargets = {
   irradianceView: GPUTextureView;
   prefilterView: GPUTextureView;
   brdfView: GPUTextureView;
+  /** The background latlong after the separable Gaussian blur. */
+  backgroundBlur: GPUTexture;
+  backgroundBlurView: GPUTextureView;
+  /** Ping-pong target for the horizontal half of that blur. */
+  backgroundTemp: GPUTexture;
+  backgroundBlurWidth: number;
+  backgroundBlurHeight: number;
 };
 
 /**
@@ -635,6 +704,10 @@ export class Environment {
   private prefilterPipeline: GPURenderPipeline;
   private brdfPipeline: GPURenderPipeline;
   private equirectMipPipeline: GPURenderPipeline;
+  private backgroundBlurPipeline: GPURenderPipeline;
+  private backgroundBlurParams: GPUBuffer;
+  /** The blur texture no longer matches the slider. */
+  private backgroundBlurDirty = false;
   readonly backgroundPipeline: GPURenderPipeline;
 
   constructor(device: GPUDevice, format: GPUTextureFormat) {
@@ -678,6 +751,12 @@ export class Environment {
     this.prefilterUniform = device.createBuffer({
       // mat4x4 (64 bytes) + roughness (+ 12 bytes padding for the 16-byte rule).
       size: 80,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.backgroundBlurParams = device.createBuffer({
+      // step (8) + sigma (4) + radius (4) + 7 vec4 weights (112) + lod (4),
+      // padded to the 16-byte uniform rule.
+      size: 144,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.capturePipeline = device.createRenderPipeline({
@@ -758,6 +837,27 @@ export class Environment {
       primitive: { topology: 'triangle-list' },
     });
 
+    this.backgroundBlurPipeline = device.createRenderPipeline({
+      label: 'hdri background blur',
+      layout: 'auto',
+      vertex: {
+        module: device.createShaderModule({ code: QUAD_VERTEX_SHADER }),
+        entryPoint: 'main',
+        buffers: [
+          { arrayStride: 20, attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x3' },
+            { shaderLocation: 1, offset: 12, format: 'float32x2' },
+          ] },
+        ],
+      },
+      fragment: {
+        module: device.createShaderModule({ code: BACKGROUND_BLUR_FRAGMENT_SHADER }),
+        entryPoint: 'main',
+        targets: [{ format: 'rgba16float' }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
     this.brdfPipeline = device.createRenderPipeline({
       label: 'brdf lut',
       layout: 'auto',
@@ -831,7 +931,7 @@ export class Environment {
       layout,
       entries: [
         { binding: 0, resource: { buffer: uniformBuffer } },
-        { binding: 1, resource: targets.equirectView },
+        { binding: 1, resource: targets.backgroundBlurView },
         { binding: 2, resource: this.backgroundSampler },
       ],
     });
@@ -850,14 +950,16 @@ export class Environment {
     return { ...this.settings };
   }
 
-  /** Fractional mip level the background samples for the current blur. */
-  get backgroundBlurLevel(): number {
-    return blurToMipLevel(this.settings.blur, this.maxBlurLevel);
-  }
-
-  /** The softest level this image's chain can offer for a background blur. */
-  private get maxBlurLevel(): number {
-    return equirectMipLevelCount(this.targets?.equirectWidth ?? 0) - 1;
+  /**
+   * Rebuild the background's Gaussian if the slider moved since the last look.
+   *
+   * Called by the renderer just before it draws the background, so a drag that
+   * fires many input events only pays for one blur per frame.
+   */
+  prepareBackground(): void {
+    if (!this.backgroundBlurDirty) return;
+    this.backgroundBlurDirty = false;
+    if (this.targets) this.renderBackgroundBlur(this.targets);
   }
 
   /** Exposure shared by the background and the PBR shading. */
@@ -879,8 +981,9 @@ export class Environment {
     if (next === this.settings.blur) return;
     this.settings = { ...this.settings, blur: next };
     saveEnvironmentSettings(this.settings);
-    // The blur and the exposure are read when the background is drawn, so
-    // nothing has to be rebuilt — the views just need to redraw.
+    // The Gaussian is rebuilt on the next background draw; the light probe is
+    // untouched. The views only need to redraw.
+    this.backgroundBlurDirty = true;
     this.notify();
   }
 
@@ -989,7 +1092,7 @@ export class Environment {
       decoded.data,
       new Uint16Array(decoded.width * decoded.height * 4)
     );
-    // The background's blur *is* this mip chain, so build the whole thing.
+    // The lighting capture reads this chain with implicit LOD.
     const mipLevelCount = equirectMipLevelCount(decoded.width);
     const equirect = device.createTexture({
       label: 'hdri equirect',
@@ -1037,6 +1140,28 @@ export class Environment {
       label: 'brdf lut',
       size: { width: BRDF_SIZE, height: BRDF_SIZE },
       format: 'rg16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    // The background gets its own working copy: the Gaussian written into it
+    // must never feed back into the probe's mip chain.
+    const backgroundBlurWidth = Math.max(
+      1,
+      Math.min(decoded.width, BACKGROUND_BLUR_MAX_WIDTH)
+    );
+    const backgroundBlurHeight = Math.max(
+      1,
+      Math.round((backgroundBlurWidth * decoded.height) / Math.max(decoded.width, 1))
+    );
+    const backgroundBlur = device.createTexture({
+      label: 'hdri background blur',
+      size: { width: backgroundBlurWidth, height: backgroundBlurHeight },
+      format: 'rgba16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const backgroundTemp = device.createTexture({
+      label: 'hdri background blur temp',
+      size: { width: backgroundBlurWidth, height: backgroundBlurHeight },
+      format: 'rgba16float',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
     });
 
@@ -1098,7 +1223,7 @@ export class Environment {
       device.createBindGroup({ layout, entries: [] })
     );
 
-    return {
+    const targets: RenderTargets = {
       equirect,
       equirectWidth: decoded.width,
       cubemap,
@@ -1109,12 +1234,70 @@ export class Environment {
       irradianceView: irradiance.createView({ dimension: 'cube' }),
       prefilterView: prefilter.createView({ dimension: 'cube', mipLevelCount: PREFILTER_LEVELS }),
       brdfView: brdf.createView(),
+      backgroundBlur,
+      backgroundBlurView: backgroundBlur.createView(),
+      backgroundTemp,
+      backgroundBlurWidth,
+      backgroundBlurHeight,
     };
+    this.renderBackgroundBlur(targets);
+    this.backgroundBlurDirty = false;
+    return targets;
   }
 
   /**
-   * Downsample the latlong image one level at a time. Cheap and one-off: the
-   * result is what the background's blur control reads, so no frame pays for it.
+   * Convolve the background latlong with a separable Gaussian, one pass per
+   * axis. The slider sets sigma, so the blur radius is what grows — not the
+   * texel size — and the result stays smooth at every setting.
+   */
+  private renderBackgroundBlur(targets: RenderTargets): void {
+    const width = targets.backgroundBlurWidth;
+    const height = targets.backgroundBlurHeight;
+    // Sigma is a share of the image, so a smaller latlong blurs by the same
+    // angle as a 1024-wide one.
+    const sigma =
+      clamp01(this.settings.blur) * BACKGROUND_BLUR_MAX_SIGMA * (width / 1024);
+    const kernel = gaussianBlurKernel(sigma, BACKGROUND_BLUR_HALF_TAPS);
+    // Layout: step (0..1), sigma (2), radius (3), weights (4..31), source LOD
+    // (32) — padded to the 16-byte uniform rule.
+    const params = new Float32Array(36);
+    params[2] = sigma;
+    params[3] = kernel.radius;
+    params.set(kernel.weights, 4);
+
+    const bind = (layout: GPUBindGroupLayout, source: GPUTextureView) =>
+      this.device.createBindGroup({
+        layout,
+        entries: [
+          { binding: 0, resource: { buffer: this.backgroundBlurParams } },
+          { binding: 1, resource: source },
+          { binding: 2, resource: this.backgroundSampler },
+        ],
+      });
+
+    // Horizontal: the source is the latlong at mip 0. A downscale to the
+    // working width reads a matching level instead of aliasing.
+    params[0] = 1 / width;
+    params[1] = 0;
+    params[32] = Math.log2(Math.max(1, targets.equirectWidth / width));
+    this.device.queue.writeBuffer(this.backgroundBlurParams, 0, params);
+    this.drawQuad(targets.backgroundTemp, this.backgroundBlurPipeline, (layout) =>
+      bind(layout, targets.equirect.createView())
+    );
+
+    // Vertical: the intermediate is already at the working size and has no mips.
+    params[0] = 0;
+    params[1] = 1 / height;
+    params[32] = 0;
+    this.device.queue.writeBuffer(this.backgroundBlurParams, 0, params);
+    this.drawQuad(targets.backgroundBlur, this.backgroundBlurPipeline, (layout) =>
+      bind(layout, targets.backgroundTemp.createView())
+    );
+  }
+
+  /**
+   * Downsample the latlong image one level at a time for the lighting capture.
+   * The background never reads these levels; its blur has its own texture.
    */
   private buildEquirectMips(
     equirect: GPUTexture,
@@ -1244,6 +1427,7 @@ export class Environment {
     this.cubeVertices.destroy();
     this.quadVertices.destroy();
     this.prefilterUniform.destroy();
+    this.backgroundBlurParams.destroy();
     this.listeners.clear();
   }
 
@@ -1254,6 +1438,8 @@ export class Environment {
     targets.irradiance.destroy();
     targets.prefilter.destroy();
     targets.brdf.destroy();
+    targets.backgroundBlur.destroy();
+    targets.backgroundTemp.destroy();
   }
 }
 

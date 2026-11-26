@@ -132,6 +132,7 @@ export type PackedMeshGeometry = {
   triangles: Uint32Array;
   edgesFlat: Uint32Array;
   boundaryJson: string;
+  uvs: number[];
 };
 
 export function meshSettingsHash(settings: MeshSettings, patternId: string): string {
@@ -145,6 +146,7 @@ export function packMeshGeometry(geom: MeshGeometry): ArrayBuffer {
     triangles: new Uint32Array(geom.triangles),
     edgesFlat: new Uint32Array(geom.edges.flatMap(([a, b]) => [a, b])),
     boundaryJson: JSON.stringify(geom.boundary ?? geom.vertices.map(() => null)),
+    uvs: geom.uvs ?? [],
   };
   const json = JSON.stringify({
     v: Array.from(packed.vertices),
@@ -152,6 +154,7 @@ export function packMeshGeometry(geom: MeshGeometry): ArrayBuffer {
     t: Array.from(packed.triangles),
     e: Array.from(packed.edgesFlat),
     b: packed.boundaryJson,
+    uv: packed.uvs,
   });
   return new TextEncoder().encode(json).buffer;
 }
@@ -163,6 +166,7 @@ export function unpackMeshGeometry(data: ArrayBuffer): MeshGeometry {
     t: number[];
     e: number[];
     b: string;
+    uv?: number[];
   };
   const vertices: MeshGeometry['vertices'] = [];
   for (let i = 0; i < raw.v.length; i += 2) {
@@ -173,13 +177,15 @@ export function unpackMeshGeometry(data: ArrayBuffer): MeshGeometry {
     edges.push([raw.e[i], raw.e[i + 1]]);
   }
   const boundary = JSON.parse(raw.b) as MeshGeometry['boundary'];
-  return {
+  const geometry: MeshGeometry = {
     vertices,
     vertexPieceIds: raw.vp,
     triangles: raw.t,
     edges,
     boundary,
   };
+  if (raw.uv && raw.uv.length === vertices.length * 2) geometry.uvs = raw.uv;
+  return geometry;
 }
 
 export function poseTopologyHash(meshId: string, settingsHash: string, vertexCount: number): string {

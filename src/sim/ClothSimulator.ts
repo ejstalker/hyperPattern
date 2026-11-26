@@ -1,6 +1,7 @@
 import type { mat4, vec3 } from 'gl-matrix';
 import type { SdfVolume } from '../mesh/sdfVolume';
 import type { SimParams, SimPose } from '../project/types';
+import type { FabricPhysics } from '../fabrics/library';
 
 export type DrapeEngineKind = 'cpu-mass-spring' | 'gpu-xpbd';
 
@@ -115,6 +116,14 @@ export interface ClothSimulator extends ClothRenderExtras {
 
   /** Per-vertex RGB for strain visualization (same count as particles). */
   getColorBuffer?(): GPUBuffer | null;
+  /** Per-vertex texture coordinates (two f32 per particle), for the albedo image. */
+  getUvBuffer?(): GPUBuffer | null;
+  /** Replace the UVs in place — a piece's mapping changed, the cloth did not. */
+  setUvs?(uvs: Float32Array | readonly number[]): void;
+  /** Re-bake mass and spring stiffness after a piece's fabric changed. */
+  applyFabricPhysics?(
+    fabricForPiece: (pieceId: string) => FabricPhysics | null
+  ): void;
   /** Per-vertex opacity (one f32 per vertex) for frozen / ghosted pieces. */
   getAlphaBuffer?(): GPUBuffer | null;
   /** True while some piece is not fully opaque, so the blended pass is needed. */

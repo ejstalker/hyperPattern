@@ -9,9 +9,17 @@ import { identity } from '../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../project/types';
 import { CM_TO_WORLD } from './units';
 import { DEFAULT_MAX_SPEED } from '../project/createDefault';
-import { buildClothTopology, FALLBACK_PIECE_ID, type SeamBendConstraint } from './meshTopology';
+import {
+  buildClothTopology,
+  refreshFabricScales,
+  FALLBACK_PIECE_ID,
+  type ClothTopology,
+  type SeamBendConstraint,
+} from './meshTopology';
+import type { FabricPhysics } from '../fabrics/library';
 import { buildWireframeEdgeIndices } from './wireframeEdges';
 import { fillStrainColors, type StrainEdge } from './strainMap';
+import { uvsForGeometry } from '../pattern/uvMapping';
 import { perSubstepRetain } from './velocityDamping';
 
 /** @deprecated Import from `./units` instead. */
@@ -73,6 +81,14 @@ export class PatternCloth {
   private ghostedPieceIds = new Set<string>();
   private connections: SpringDamper[] = [];
   private bendSprings: SpringDamper[] = [];
+  /** Fabric stiffness multipliers, parallel to the spring arrays. */
+  private connectionStiffness: number[] = [];
+  private bendStiffness: number[] = [];
+  /** Fabric weight multiplier per particle, from the mesh's piece assignment. */
+  private massScales = new Float32Array(0);
+  /** The topology the cloth was built from, for in-place fabric changes. */
+  private topo: ClothTopology | null = null;
+  private fabricForPiece?: (pieceId: string) => FabricPhysics | null;
   private seamSprings: SpringDamper[] = [];
   private seamRestLengths: Array<{ initial: number; target: number }> = [];
   /** Particle index pairs for seam visualization (a,b,a,b,...). */
@@ -127,6 +143,9 @@ export class PatternCloth {
   private positionBuffer: GPUBuffer | null = null;
   private normalBuffer: GPUBuffer | null = null;
   private colorBuffer: GPUBuffer | null = null;
+  /** Texture coordinates, one two-float pair per particle (see `uvMapping`). */
+  private uvBuffer: GPUBuffer | null = null;
+  private uvData: Float32Array<ArrayBufferLike> = new Float32Array(0);
   /** Per-vertex opacity for the renderer (see `updatePieceAlpha`). */
   private alphaData: Float32Array | null = null;
   private alphaBuffer: GPUBuffer | null = null;
@@ -152,10 +171,12 @@ export class PatternCloth {
     params: SimParams,
     device: GPUDevice,
     avatar: AvatarBody,
-    pattern?: PatternDocument
+    pattern?: PatternDocument,
+    fabricForPiece?: (pieceId: string) => FabricPhysics | null
   ) {
     this.device = device;
     this.pattern = pattern;
+    this.fabricForPiece = fabricForPiece;
     this.springConst = params.springConst;
     this.dampingConst = params.dampingConst;
     this.gravityAcce = params.gravity;
@@ -191,7 +212,18 @@ export class PatternCloth {
   }
 
   private buildFromMesh(mesh: MeshGeometry, mass: number): void {
-    const topo = buildClothTopology(mesh, mass, this.pattern, { layoutY: 4.0 });
+    const topo = buildClothTopology(mesh, mass, this.pattern, {
+      layoutY: 4.0,
+      fabricForPiece: this.fabricForPiece,
+    });
+    this.topo = topo;
+    this.massScales = new Float32Array(topo.massScales);
+    this.uvData = uvsForGeometry(mesh, this.pattern);
+    // A malformed mesh falls back to cloth topology of its own; the UV buffer
+    // still needs one pair per particle so the draw stays in bounds.
+    if (this.uvData.length !== topo.numParticles * 2) {
+      this.uvData = new Float32Array(topo.numParticles * 2);
+    }
     this.vertexPieceIds = [...topo.vertexPieceIds];
     this.avgEdgeLength = topo.avgEdgeLength;
     this.edgeLengths = new Float32Array(topo.edgeLengths);
@@ -204,7 +236,13 @@ export class PatternCloth {
         topo.positions[i * 3 + 1],
         topo.positions[i * 3 + 2]
       );
-      const p = new Particle(pos, vec3.clone(up), this.particleMass, this.gravityAcce, this.floorY);
+      const p = new Particle(
+        pos,
+        vec3.clone(up),
+        this.particleMass * (topo.massScales[i] ?? 1),
+        this.gravityAcce,
+        this.floorY
+      );
       p.setEdgeLength(topo.edgeLengths[i] ?? this.avgEdgeLength);
       p.setFixed(false);
       this.particles.push(p);
@@ -214,12 +252,15 @@ export class PatternCloth {
     }
 
     this.stretchEdges = topo.stretch.map((s) => ({ i: s.i, j: s.j, rest: s.rest }));
+    this.connectionStiffness = [];
     for (const s of topo.stretch) {
+      const scale = s.stiffness ?? 1;
+      this.connectionStiffness.push(scale);
       this.connections.push(
         new SpringDamper(
           this.particles[s.i],
           this.particles[s.j],
-          this.springConst,
+          this.springConst * scale,
           this.dampingConst,
           s.rest
         )
@@ -228,15 +269,18 @@ export class PatternCloth {
 
     // Bend: springs across opposite verts of shared edges (cheap dihedral proxy).
     this.bendSprings = [];
+    this.bendStiffness = [];
     const bendK = this.springConst * Math.max(0, this.bendSpringScale);
     for (const b of topo.bend) {
       const rest = vec3.distance(this.particles[b.i0].position, this.particles[b.i3].position);
       if (rest < 1e-6) continue;
+      const scale = b.stiffness ?? 1;
+      this.bendStiffness.push(scale);
       this.bendSprings.push(
         new SpringDamper(
           this.particles[b.i0],
           this.particles[b.i3],
-          bendK,
+          bendK * scale,
           this.dampingConst * 0.5,
           rest
         )
@@ -313,6 +357,14 @@ export class PatternCloth {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     this.syncStrainColors(true);
+
+    this.uvBuffer = this.device.createBuffer({
+      size: Math.max(this.uvData.byteLength, 8),
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    new Float32Array(this.uvBuffer.getMappedRange()).set(this.uvData);
+    this.uvBuffer.unmap();
 
     this.alphaData = new Float32Array(this.particles.length).fill(1);
     this.alphaBuffer = this.device.createBuffer({
@@ -455,6 +507,22 @@ export class PatternCloth {
     return this.colorBuffer;
   }
 
+  getUvBuffer(): GPUBuffer | null {
+    return this.uvBuffer;
+  }
+
+  /** Swap in UVs recomputed for an edited piece mapping, without rebuilding the cloth. */
+  setUvs(uvs: Float32Array | readonly number[]): void {
+    const data = uvs instanceof Float32Array ? uvs : Float32Array.from(uvs);
+    if (data.length !== this.particles.length * 2) return;
+    this.uvData = data;
+    if (!this.uvBuffer) return;
+    // Fresh view so writeBuffer accepts ArrayBuffer (not SharedArrayBuffer typing).
+    const upload = new Float32Array(data.length);
+    upload.set(data);
+    this.device.queue.writeBuffer(this.uvBuffer, 0, upload);
+  }
+
   setDragging(dragging: boolean): void {
     this.dragging = dragging;
     if (dragging) this.zeroVelocities();
@@ -462,6 +530,35 @@ export class PatternCloth {
 
   isDragging(): boolean {
     return this.dragging;
+  }
+
+  /**
+   * Re-evaluate every piece's fabric after its assignment changed. Positions,
+   * velocities and the mesh stay exactly as they are; only masses and spring
+   * constants move.
+   */
+  applyFabricPhysics(fabricForPiece?: (pieceId: string) => FabricPhysics | null): void {
+    if (fabricForPiece) this.fabricForPiece = fabricForPiece;
+    if (!this.topo || !this.fabricForPiece) return;
+    refreshFabricScales(this.topo, this.particleMass, this.fabricForPiece);
+    this.massScales = new Float32Array(this.topo.massScales);
+    this.particles.forEach((p, i) =>
+      p.setMass(this.particleMass * (this.massScales[i] ?? 1))
+    );
+    this.connectionStiffness = this.topo.stretch.map((edge) => edge.stiffness ?? 1);
+    this.connections.forEach((c, i) =>
+      c.setSpringConst(this.springConst * (this.connectionStiffness[i] ?? 1))
+    );
+    const bendK = this.springConst * Math.max(0, this.bendSpringScale);
+    this.bendStiffness = [];
+    let bendIndex = 0;
+    for (const b of this.topo.bend) {
+      const rest = vec3.distance(this.particles[b.i0].position, this.particles[b.i3].position);
+      if (rest < 1e-6) continue;
+      this.bendStiffness.push(b.stiffness ?? 1);
+      this.bendSprings[bendIndex]?.setSpringConst(bendK * (b.stiffness ?? 1));
+      bendIndex++;
+    }
   }
 
   getVertexPieceIds(): readonly string[] {
@@ -981,17 +1078,19 @@ export class PatternCloth {
     vec3.set(this.windVelocity, params.wind[0], params.wind[1], params.wind[2]);
     if (params.mass > 0 && this.particles.length > 0) {
       this.particleMass = params.mass / this.particles.length;
-      for (const p of this.particles) p.setMass(this.particleMass);
+      this.particles.forEach((p, i) =>
+        p.setMass(this.particleMass * (this.massScales[i] ?? 1))
+      );
     }
-    for (const c of this.connections) {
-      c.setSpringConst(this.springConst);
+    this.connections.forEach((c, i) => {
+      c.setSpringConst(this.springConst * (this.connectionStiffness[i] ?? 1));
       c.setDampingConst(this.dampingConst);
-    }
+    });
     const bendK = this.springConst * Math.max(0, this.bendSpringScale);
-    for (const c of this.bendSprings) {
-      c.setSpringConst(bendK);
+    this.bendSprings.forEach((c, i) => {
+      c.setSpringConst(bendK * (this.bendStiffness[i] ?? 1));
       c.setDampingConst(this.dampingConst * 0.5);
-    }
+    });
     for (const c of this.seamBendSprings) {
       c.setSpringConst(bendK);
       c.setDampingConst(this.dampingConst * 0.5);
@@ -1121,6 +1220,7 @@ export class PatternCloth {
     this.positionBuffer?.destroy();
     this.normalBuffer?.destroy();
     this.colorBuffer?.destroy();
+    this.uvBuffer?.destroy();
     this.alphaBuffer?.destroy();
     this.indexBuffer?.destroy();
     this.wireframeEdgeBuffer?.destroy();

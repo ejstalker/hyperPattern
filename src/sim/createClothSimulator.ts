@@ -4,6 +4,7 @@ import type { ClothSimulator, DrapeEngineKind } from './ClothSimulator';
 import { CpuMassSpringEngine } from './engines/CpuMassSpringEngine';
 import { XpbdGpuEngine } from './engines/gpu/XpbdGpuEngine';
 import { DEFAULT_DRAPE_ENGINE } from '../project/createDefault';
+import type { FabricPhysics } from '../fabrics/library';
 
 export function resolveEngineKind(params: SimParams, force?: DrapeEngineKind): DrapeEngineKind {
   if (force) return force;
@@ -20,10 +21,11 @@ export function createClothSimulator(
   params: SimParams,
   device: GPUDevice,
   avatar: AvatarBody,
-  pattern?: PatternDocument
+  pattern?: PatternDocument,
+  fabricForPiece?: (pieceId: string) => FabricPhysics | null
 ): ClothSimulator {
   if (kind === 'gpu-xpbd') {
-    return new XpbdGpuEngine(mesh, params, device, avatar, pattern);
+    return new XpbdGpuEngine(mesh, params, device, avatar, pattern, fabricForPiece);
   }
-  return new CpuMassSpringEngine(mesh, params, device, avatar, pattern);
+  return new CpuMassSpringEngine(mesh, params, device, avatar, pattern, fabricForPiece);
 }

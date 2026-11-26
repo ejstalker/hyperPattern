@@ -3,6 +3,7 @@ import type { AvatarBody } from '../../mesh/AvatarBody';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../../project/types';
 import type { ClothCollider, ClothFloor, ClothSimulator } from '../ClothSimulator';
 import { PatternCloth } from '../PatternCloth';
+import type { FabricPhysics } from '../../fabrics/library';
 
 /**
  * Thin adapter: existing CPU mass-spring solver behind ClothSimulator.
@@ -15,9 +16,14 @@ export class CpuMassSpringEngine implements ClothSimulator {
     params: SimParams,
     device: GPUDevice,
     avatar: AvatarBody,
-    pattern?: PatternDocument
+    pattern?: PatternDocument,
+    fabricForPiece?: (pieceId: string) => FabricPhysics | null
   ) {
-    this.cloth = new PatternCloth(mesh, params, device, avatar, pattern);
+    this.cloth = new PatternCloth(mesh, params, device, avatar, pattern, fabricForPiece);
+  }
+
+  applyFabricPhysics(fabricForPiece: (pieceId: string) => FabricPhysics | null): void {
+    this.cloth.applyFabricPhysics(fabricForPiece);
   }
 
   destroy(): void {
@@ -182,6 +188,14 @@ export class CpuMassSpringEngine implements ClothSimulator {
 
   getColorBuffer(): GPUBuffer | null {
     return this.cloth.getColorBuffer();
+  }
+
+  getUvBuffer(): GPUBuffer | null {
+    return this.cloth.getUvBuffer();
+  }
+
+  setUvs(uvs: Float32Array | readonly number[]): void {
+    this.cloth.setUvs(uvs);
   }
 
   setStrainMapEnabled(enabled: boolean): void {

@@ -36,6 +36,21 @@ struct LightingUniforms {
 @group(1) @binding(2) var irradianceMap: texture_cube<f32>;
 @group(1) @binding(3) var prefilterMap: texture_cube<f32>;
 
+// Cloth albedo image, in the same group layout as the simple shader. The UVs
+// come from the Remesh node's per-piece mapping; the white fallback texture
+// keeps the group valid with no image loaded, and `options.x` says whether to
+// sample it at all.
+@group(2) @binding(0) var albedoSampler: sampler;
+@group(2) @binding(1) var albedoTexture: texture_2d<f32>;
+@group(2) @binding(2) var<uniform> albedoOptions: vec4<f32>;
+
+fn albedoFor(base: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    if (albedoOptions.x < 0.5) {
+        return base;
+    }
+    return textureSample(albedoTexture, albedoSampler, uv).rgb;
+}
+
 const PI = 3.14159265359;
 /** Last roughness level in the prefiltered chain — matches PREFILTER_MAX_LOD. */
 const MAX_REFLECTION_LOD = 3.0;
@@ -152,11 +167,13 @@ struct FragmentInputColor {
     @location(0) fragNormal: vec3<f32>,
     @location(1) fragWorldPos: vec3<f32>,
     @location(2) fragColor: vec3<f32>,
+    @location(3) fragUv: vec2<f32>,
 }
 
 @fragment
 fn mainColored(input: FragmentInputColor) -> @location(0) vec4<f32> {
-    let albedo = mix(lighting.diffuseColor, input.fragColor, lighting.useVertexColor);
+    let base = mix(lighting.diffuseColor, input.fragColor, lighting.useVertexColor);
+    let albedo = albedoFor(base, input.fragUv);
     return vec4<f32>(shade(input.fragNormal, input.fragWorldPos, albedo), 1.0);
 }
 
@@ -165,6 +182,7 @@ struct FragmentInputColorAlpha {
     @location(1) fragWorldPos: vec3<f32>,
     @location(2) fragColor: vec3<f32>,
     @location(3) fragAlpha: f32,
+    @location(4) fragUv: vec2<f32>,
 }
 
 /**
@@ -178,7 +196,8 @@ fn clothAlphaFragment(input: FragmentInputColorAlpha, blendedPass: bool) -> vec4
     if (translucent != blendedPass) {
         discard;
     }
-    let albedo = mix(lighting.diffuseColor, input.fragColor, lighting.useVertexColor);
+    let base = mix(lighting.diffuseColor, input.fragColor, lighting.useVertexColor);
+    let albedo = albedoFor(base, input.fragUv);
     return vec4<f32>(
         shade(input.fragNormal, input.fragWorldPos, albedo),
         select(1.0, input.fragAlpha, translucent),

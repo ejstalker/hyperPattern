@@ -311,6 +311,46 @@ optgroup {
   pointer-events: none;
 }
 
+/* The texture mapping overlay: a box per piece, or one shared reference box.
+   Its edges are the image's 0..1 frame, so dragging it slides the image and
+   its corner grips scale it. */
+.mesh-uv-box {
+  fill: color-mix(in srgb, var(--accent) 7%, transparent);
+  stroke: var(--accent);
+  stroke-width: 1.2;
+  stroke-dasharray: 5 4;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+  cursor: move;
+}
+
+.mesh-uv-handle {
+  fill: var(--bg-elev);
+  stroke: var(--accent);
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+}
+
+.mesh-uv-handle.is-nw,
+.mesh-uv-handle.is-se {
+  cursor: nwse-resize;
+}
+
+.mesh-uv-handle.is-ne,
+.mesh-uv-handle.is-sw {
+  cursor: nesw-resize;
+}
+
+.mesh-uv-label {
+  fill: var(--accent);
+  stroke: var(--bg);
+  paint-order: stroke;
+  font-family: var(--mono);
+  pointer-events: none;
+  user-select: none;
+}
+
 .mesh-seam-line {
   stroke: var(--seam);
   stroke-linecap: round;
@@ -4427,6 +4467,67 @@ optgroup {
   opacity: 0.7;
 }
 
+.viewport-shading-material-texture {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.viewport-shading-material-texture-pick {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px dashed var(--border);
+  border-radius: 3px;
+  background: none;
+  color: var(--muted);
+  font: 10px var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.viewport-shading-material-texture-pick:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.viewport-shading-material-texture-pick.has-image {
+  border-style: solid;
+  color: var(--ink);
+}
+
+.viewport-shading-material-texture-thumb {
+  width: 18px;
+  height: 18px;
+  object-fit: cover;
+  border-radius: 2px;
+  flex: none;
+}
+
+.viewport-shading-material-texture-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewport-shading-material-texture-clear {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: none;
+  color: var(--muted);
+  font: 11px/16px var(--mono);
+  cursor: pointer;
+}
+
+.viewport-shading-material-texture-clear:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
 .viewport-shading-material-field {
   display: grid;
   grid-template-columns: 58px 1fr 34px;
@@ -5115,6 +5216,80 @@ body:has(.node-fullscreen-overlay) .text-style-bar {
 
 .inspector-section-hint {
   margin: 0 0 10px;
+}
+
+/* Per-piece texture mapping in the Remesh inspector. */
+.inspector-uvs {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px 4px;
+  margin: 0 0 10px;
+}
+
+.inspector-uvs > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.inspector-uv-mode {
+  display: flex;
+  margin: 8px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.studio-inspector .inspector-uv-mode button {
+  flex: 1;
+  margin: 0;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.studio-inspector .inspector-uv-mode button + button {
+  border-left: 1px solid var(--border);
+}
+
+.studio-inspector .inspector-uv-mode button.is-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.inspector-uv-piece {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+  border-top: 1px solid var(--border);
+  padding: 8px 0 4px;
+  margin-top: 6px;
+}
+
+.inspector-uv-name {
+  grid-column: 1 / -1;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.inspector-uv-piece label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 0;
+  font-size: 10px;
+}
+
+.inspector-uv-piece input {
+  width: 100%;
+  min-width: 0;
 }
 
 .inspector-label-row {
@@ -7715,5 +7890,492 @@ textarea:focus-visible {
 .pattern-editor.is-display
   .pattern-tool-settings
   button[data-add-mode]:not([data-add-mode='text']) {
+  display: none !important;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Fabrics: the studio library, and the palette every editor assigns from.     */
+/* ------------------------------------------------------------------------- */
+
+.fabric-modal {
+  width: min(860px, 94vw);
+  height: min(720px, 88vh);
+  display: flex;
+  flex-direction: column;
+}
+
+.fabric-layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 220px 1fr;
+}
+
+.fabric-types {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+}
+
+.fabric-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 10px 8px 14px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.fabric-list-buttons {
+  display: flex;
+  gap: 3px;
+}
+
+.fabric-list-buttons button {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.fabric-list-buttons button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.fabric-list-buttons button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.fabric-list-buttons button.is-danger:hover:not(:disabled) {
+  border-color: #c45c4a;
+  color: #f0a091;
+}
+
+.fabric-type-list,
+.fabric-variant-list {
+  min-height: 0;
+  overflow: auto;
+  padding: 0 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.fabric-type-list {
+  flex: 1;
+}
+
+.fabric-type-tab,
+.fabric-variant-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+
+.fabric-type-tab:hover,
+.fabric-variant-tab:hover {
+  background: #3a342c;
+}
+
+.fabric-type-tab.is-active,
+.fabric-variant-tab.is-active {
+  background: #3a342c;
+  border-color: var(--accent);
+}
+
+.fabric-type-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fabric-type-tab.is-active .fabric-type-name {
+  color: #f1cf65;
+}
+
+.fabric-type-meta {
+  font: 10px var(--mono);
+  color: var(--muted);
+}
+
+.fabric-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.fabric-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.fabric-note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.fabric-name,
+.fabric-color {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.fabric-name input[type='text'] {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 12px var(--mono);
+}
+
+.fabric-color input[type='color'] {
+  width: 42px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.fabric-physics {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fabric-slider {
+  display: grid;
+  grid-template-columns: 130px 1fr 64px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.fabric-slider input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.fabric-slider input[type='number'] {
+  width: 64px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 11px var(--mono);
+}
+
+.fabric-slider-label {
+  color: var(--muted);
+}
+
+.fabric-slider-value {
+  justify-self: end;
+  font: 11px var(--mono);
+  color: var(--muted);
+}
+
+.fabric-variant-tab {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.fabric-swatch {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border-radius: 3px;
+  border: 1px solid rgba(242, 235, 227, 0.25);
+}
+
+.fabric-variant-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fabric-variant-tex {
+  font: 9px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.fabric-variant-editor {
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+
+.fabric-look {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px 18px;
+}
+
+.fabric-texture {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.fabric-texture-label {
+  min-width: 52px;
+}
+
+.fabric-texture-thumb {
+  width: 38px;
+  height: 38px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.fabric-texture-none {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.fabric-texture button {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.fabric-texture button:hover {
+  border-color: var(--accent);
+}
+
+.fabric-texture-name {
+  font: 10px var(--mono);
+  color: var(--muted);
+}
+
+/* The palette: shared by the 2D ribbon and the two 3D viewports. */
+.fabric-palette {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 320px;
+  max-width: 560px;
+}
+
+.pattern-settings-set-fabric {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.fabric-palette-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fabric-palette-title {
+  color: var(--muted);
+  font-weight: 800;
+  font-size: .75rem;
+}
+
+.fabric-palette-count {
+  flex: 1;
+  font: 10px var(--mono);
+  color: var(--muted);
+}
+
+.fabric-palette-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.fabric-palette-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fabric-palette-type {
+  flex: 0 0 78px;
+  font: 10px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.fabric-palette-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.fabric-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px 3px 4px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--ink);
+  font: 10px var(--mono);
+  cursor: pointer;
+}
+
+.fabric-chip:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.fabric-chip.is-active {
+  border-color: #d4a017;
+  background: rgba(212, 160, 23, 0.18);
+  color: #f1cf65;
+}
+
+.fabric-chip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.fabric-chip-none {
+  padding: 3px 8px;
+}
+
+.fabric-chip-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1px solid rgba(242, 235, 227, 0.25);
+}
+
+.fabric-chip-tex {
+  color: var(--muted);
+}
+
+.fabric-palette-pieces {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  max-height: 150px;
+  overflow: auto;
+}
+
+.fabric-palette-pieces-label {
+  font: 10px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.fabric-palette-piece {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font: 10px var(--mono);
+}
+
+.fabric-palette-piece > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fabric-palette-piece select {
+  max-width: 190px;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 10px var(--mono);
+}
+
+.fabric-palette-empty {
+  font: 10px var(--mono);
+  color: var(--muted);
+}
+
+/* The 3D viewports' ribbon sits clear of the tool column and the gnomon. */
+.sim-fabric-ribbon {
+  position: absolute;
+  left: 50%;
+  top: 52px;
+  transform: translateX(-50%);
+  z-index: 8;
+  max-height: calc(100% - 120px);
+  overflow: auto;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(28, 26, 23, 0.94);
+  color: var(--ink);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.sim-fabric-ribbon[hidden] {
+  display: none !important;
+}
+
+/* On the board a 3D viewport is a thumbnail; the fabric palette belongs to the
+   full screen (or split) view where there is room for it, beside the tools. */
+.node-simViewport:not(.is-expanded) .sim-fabric-toggle,
+.node-transform3d:not(.is-expanded) .sim-fabric-toggle,
+.node-simViewport:not(.is-expanded) .sim-fabric-ribbon,
+.node-transform3d:not(.is-expanded) .sim-fabric-ribbon {
   display: none !important;
 }

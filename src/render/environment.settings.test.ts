@@ -5,8 +5,8 @@ import {
   DEFAULT_HDRI,
   DEFAULT_SHADING_MODE,
   SHADING_MODES,
-  blurToMipLevel,
   equirectMipLevelCount,
+  gaussianBlurKernel,
   loadEnvironmentSettings,
   nextShadingMode,
   shadingModeLabel,
@@ -27,17 +27,32 @@ describe('shading mode helpers', () => {
   });
 });
 
-describe('blurToMipLevel', () => {
-  it('maps the slider across the mip chain, sharp at zero', () => {
-    expect(blurToMipLevel(0, 8)).toBe(0);
-    expect(blurToMipLevel(1, 8)).toBe(8);
-    expect(blurToMipLevel(0.5, 8)).toBe(4);
+describe('gaussianBlurKernel', () => {
+  it('is a normalised gaussian with more taps as sigma grows', () => {
+    const small = gaussianBlurKernel(2, 24);
+    const large = gaussianBlurKernel(12, 24);
+    expect(small.radius).toBe(6);
+    expect(large.radius).toBe(24);
+    const sum = (kernel: ReturnType<typeof gaussianBlurKernel>) =>
+      kernel.weights[0]! +
+      2 * kernel.weights.slice(1, kernel.radius + 1).reduce((n, w) => n + w, 0);
+    expect(sum(small)).toBeCloseTo(1);
+    expect(sum(large)).toBeCloseTo(1);
+    // The centre is the heaviest weight, and weights fall away from it.
+    for (const kernel of [small, large]) {
+      for (let i = 1; i <= kernel.radius; i++) {
+        expect(kernel.weights[i]!).toBeLessThan(kernel.weights[i - 1]!);
+      }
+    }
   });
 
-  it('clamps out-of-range input and copes with no chain', () => {
-    expect(blurToMipLevel(-2, 8)).toBe(0);
-    expect(blurToMipLevel(4, 8)).toBe(8);
-    expect(blurToMipLevel(1, 0)).toBe(0);
+  it('collapses to a single centre tap at zero blur', () => {
+    for (const sigma of [0, -1, Number.NaN]) {
+      const kernel = gaussianBlurKernel(sigma, 24);
+      expect(kernel.radius).toBe(0);
+      expect(kernel.weights[0]).toBe(1);
+      expect(kernel.weights.slice(1).every((w) => w === 0)).toBe(true);
+    }
   });
 });
 

@@ -40,7 +40,9 @@ import type {
   PatternFrameNode,
   PatternPiece,
   PatternText,
+  PatternUvMode,
   PieceTransform3d,
+  PieceUvTransform,
   ProjectDocument,
   SeamEdgeRef,
   SimInstance,
@@ -95,6 +97,13 @@ import {
 } from '../project/clipboard';
 import { remapSeamAllowance, sameSeamBindingPair } from '../pattern/geometry';
 import { patternGeometrySignature } from '../pattern/geometrySignature';
+import {
+  computedUvsForGeometry,
+  defaultSharedUvBox,
+  isDefaultPieceUv,
+  normalizePieceUv,
+  sharedUvBoxFor,
+} from '../pattern/uvMapping';
 import { DEFAULT_SEAM_GAP_CM, resolveSeamParticlePairs } from '../mesh/triangulate';
 import { generateBlockPieces } from '../pattern/blocks/generate';
 import { getBlockDefinition } from '../pattern/blocks/registry';
@@ -105,6 +114,8 @@ import {
   type AvatarReport,
 } from './AvatarModal';
 import { AvatarPreview } from '../avatar/AvatarPreview';
+import { FabricsModal } from './FabricsModal';
+import { loadFabricLibrary, type FabricLibrary } from '../fabrics/library';
 import { buildMeasurementRulers } from '../avatar/rulerOverlay';
 import { cachedMeasurementLibrary, loadMeasurementLibrary } from '../persistence/measurementLibrary';
 import {
@@ -746,6 +757,10 @@ export class StudioApp {
   private inspectorTipEl: HTMLDivElement | null = null;
   /** Avatar editor dialog, when open. */
   private avatarModal: AvatarModal | null = null;
+  private fabricsModal: FabricsModal | null = null;
+  /** The studio's fabrics: global, beside the scene materials. */
+  private fabrics: FabricLibrary = loadFabricLibrary();
+  private fabricPhysicsRevision = this.fabrics.physicsRevision;
   private avatarPreview: AvatarPreview | null = null;
   private avatarPreviewCanvas: HTMLCanvasElement | null = null;
   private avatarRulersVisible = true;
@@ -1860,6 +1875,11 @@ export class StudioApp {
     // Flushes any pending write before the dialog is torn down.
     this.avatarModal?.close();
     this.avatarModal = null;
+    const fabrics = this.fabricsModal;
+    this.fabricsModal = null;
+    fabrics?.close();
+    this.modalRoot.hidden = true;
+    this.modalRoot.innerHTML = '';
     this.avatarPreview?.destroy();
     this.avatarPreview = null;
     this.avatarPreviewCanvas = null;
@@ -1892,6 +1912,78 @@ export class StudioApp {
     });
     this.avatarModal = modal;
     void modal.open();
+  }
+
+  private openFabricsEditor(): void {
+    this.modalRoot.hidden = false;
+    const modal = new FabricsModal(this.modalRoot, {
+      onClose: () => {
+        this.fabricsModal = null;
+        this.closeModal();
+      },
+      onChange: (library) => {
+        this.fabrics = library;
+        const physics = library.physicsRevision !== this.fabricPhysicsRevision;
+        this.fabricPhysicsRevision = library.physicsRevision;
+        this.refreshFabricsEverywhere(physics);
+        this.setStatus(`Fabrics · ${library.types.length} types, ${library.variants.length} variants`);
+      },
+    });
+    this.fabricsModal = modal;
+    modal.open(this.fabrics);
+  }
+
+  /**
+   * Give pieces a fabric. The geometry does not move, so the meshes are left
+   * alone: physics are re-baked in place and the renderer is told which piece
+   * wears which variant.
+   */
+  private assignFabricToPieces(pieceIds: string[], fabricId: string | null): void {
+    const wanted = new Set(pieceIds);
+    const targets: Array<{ piece: { fabricId?: string } }> = [];
+    for (const pattern of this.project.patterns) {
+      for (const piece of pattern.pieces) {
+        if (wanted.has(piece.id) && (piece.fabricId ?? null) !== fabricId) {
+          targets.push({ piece });
+        }
+      }
+    }
+    if (targets.length === 0) return;
+    this.pushUndo();
+    for (const { piece } of targets) {
+      if (fabricId) piece.fabricId = fabricId;
+      else delete piece.fabricId;
+    }
+    this.markDirty();
+    this.refreshFabricsEverywhere();
+    const variant = this.fabrics.variantById(fabricId);
+    const type = this.fabrics.typeById(variant?.typeId);
+    const name = variant
+      ? `${type?.name ?? 'Fabric'} · ${variant.name}`
+      : 'no fabric';
+    this.setStatus(
+      `Set ${targets.length} piece${targets.length === 1 ? '' : 's'} to ${name}`
+    );
+  }
+
+  /** Repaint every palette and re-bake every cloth after the library changed. */
+  private refreshFabricsEverywhere(applyPhysics = true): void {
+    // A variant deleted from the library leaves its pieces on the drape's own
+    // material rather than on an id nothing can answer for.
+    let pruned = false;
+    for (const pattern of this.project.patterns) {
+      for (const piece of pattern.pieces) {
+        if (piece.fabricId && !this.fabrics.hasVariant(piece.fabricId)) {
+          delete piece.fabricId;
+          pruned = true;
+        }
+      }
+    }
+    if (pruned) this.markDirty();
+    this.canvasEditor?.refreshFabricPalette();
+    for (const editor of this.editors.values()) editor.refreshFabricPalette();
+    for (const runtime of this.simRuntimes.values()) runtime.refreshFabrics(applyPhysics);
+    for (const runtime of this.transformRuntimes.values()) runtime.refreshFabrics(applyPhysics);
   }
 
   private disposeAvatarPreview(canvas: HTMLCanvasElement): void {
@@ -2379,6 +2471,7 @@ export class StudioApp {
         <button type="button" data-act="redo" role="menuitem" disabled>Redo<span class="app-menu-key">⇧⌘Z</span></button>
         <div class="app-menu-sep"></div>
         <button type="button" data-act="avatars" role="menuitem">Avatars…</button>
+        <button type="button" data-act="fabrics" role="menuitem">Fabrics…</button>
         <div class="app-menu-sep"></div>
         <span class="app-menu-label">Display units</span>
         <button type="button" data-unit="cm" role="menuitemradio">Centimetres<span class="app-menu-key">cm</span></button>
@@ -2491,6 +2584,9 @@ export class StudioApp {
       case 'measurements':
       case 'avatars':
         this.openAvatarEditor();
+        break;
+      case 'fabrics':
+        this.openFabricsEditor();
         break;
     }
   }
@@ -3083,6 +3179,8 @@ export class StudioApp {
       // Add menu — not something the pattern sheet holds.
       canPlaceObject: (kind) => kind !== 'image',
       onPiecesDropped: (drop) => this.handOverDroppedPieces(null, drop),
+      getFabrics: () => this.fabrics,
+      onAssignFabric: (pieceIds, fabricId) => this.assignFabricToPieces(pieceIds, fabricId),
     });
     this.canvasSurface = host;
     this.syncCanvasSurfaceView();
@@ -5618,6 +5716,8 @@ export class StudioApp {
         onAddObject: (kind, box) => this.addObjectToContainer(node, kind, box),
         canPlaceObject: (kind) => kind === 'text' || kind === 'image' || kind === 'group',
         onTextSelectionChange: () => this.syncTextStyleBar(),
+        getFabrics: () => this.fabrics,
+        onAssignFabric: (pieceIds, fabricId) => this.assignFabricToPieces(pieceIds, fabricId),
         // Groups are drafting structure, like rulers: they are saved and listed in
         // the 2D chip, and they never invalidate a mesh of their own.
         onGroupChange: () => {
@@ -5662,7 +5762,34 @@ export class StudioApp {
       body.appendChild(previewHost);
       const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
       if (!mesh.geometry) this.remeshFromPattern(mesh, pattern);
-      const preview = new MeshPreview(previewHost, mesh, this.project.displayUnit, pattern ?? null);
+      const meshDocId = node.meshId;
+      const livePatternForUv = (): PatternDocument | null => {
+        const liveMesh = this.project.meshes.find((m) => m.id === meshDocId);
+        return (
+          (liveMesh && this.project.patterns.find((p) => p.id === liveMesh.patternId)) ?? null
+        );
+      };
+      const preview = new MeshPreview(
+        previewHost,
+        mesh,
+        this.project.displayUnit,
+        pattern ?? null,
+        {
+          onUvEditStart: () => this.pushUndo(),
+          // Mid-drag the preview redraws its own boxes; the cloth UV buffers are
+          // what the other views need. Other previews catch up on release.
+          onUvChanged: () => {
+            const live = livePatternForUv();
+            if (live) this.refreshPatternUvs(live, { previews: false });
+          },
+          onUvEditEnd: () => {
+            const live = livePatternForUv();
+            if (live) this.refreshPatternUvs(live);
+            void this.persistLocal({ quiet: true });
+            this.renderInspector();
+          },
+        }
+      );
       this.meshPreviews.set(node.id, preview);
     } else if (node.type === 'simViewport') {
       const sim = this.project.sims.find((s) => s.id === node.simId)!;
@@ -5999,6 +6126,8 @@ export class StudioApp {
             this.syncSplitSelectionFrom3d('simViewport', sim.id, pieceIds),
           environment: this.environment,
           materials: this.materials,
+          fabrics: this.fabrics,
+          onAssignFabric: (pieceIds, fabricId) => this.assignFabricToPieces(pieceIds, fabricId),
           onSewEdges: (a, b) => this.sewEdgesFromView(this.patternForSim(sim.id), a, b),
           onReverseSeam: (seamId) => this.reverseSeamFromView(this.patternForSim(sim.id), seamId),
           onDeleteSeam: (seamId) => this.deleteSeamFromView(this.patternForSim(sim.id), seamId),
@@ -6086,6 +6215,8 @@ export class StudioApp {
           },
           environment: this.environment,
           materials: this.materials,
+          fabrics: this.fabrics,
+          onAssignFabric: (pieceIds, fabricId) => this.assignFabricToPieces(pieceIds, fabricId),
           onSewEdges: (a, b) => this.sewEdgesFromView(this.patternForTransform(transform.id), a, b),
           onReverseSeam: (seamId) =>
             this.reverseSeamFromView(this.patternForTransform(transform.id), seamId),
@@ -6984,6 +7115,44 @@ export class StudioApp {
       this.remeshFromPattern(mesh, pattern);
     }
     return mesh.geometry;
+  }
+
+  /**
+   * Recompute texture coordinates after the pattern's mapping changed.
+   *
+   * This is deliberately not a remesh: the vertices have not moved, so the
+   * cloth keeps its drape and every viewport showing one of the pattern's
+   * meshes just swaps its UV buffer. `previews` is false mid-drag, because the
+   * preview being dragged has already redrawn its own boxes.
+   */
+  private refreshPatternUvs(
+    pattern: PatternDocument,
+    opts: { previews?: boolean } = {}
+  ): void {
+    const cooked = this.cookedPattern(pattern) ?? pattern;
+    for (const mesh of this.project.meshes) {
+      if (mesh.patternId !== pattern.id || !mesh.geometry) continue;
+      const uvs = computedUvsForGeometry(mesh.geometry, cooked);
+      mesh.geometry.uvs = uvs;
+      const data = Float32Array.from(uvs);
+      for (const sim of this.project.sims) {
+        if (this.meshForSim(sim.id)?.id !== mesh.id) continue;
+        this.simRuntimes.get(sim.id)?.cloth?.setUvs?.(data);
+      }
+      for (const transform of this.project.transforms) {
+        if (transform.meshId !== mesh.id) continue;
+        this.transformRuntimes.get(transform.id)?.cloth?.setUvs?.(data);
+      }
+    }
+    if (opts.previews !== false) {
+      for (const [nodeId, preview] of this.meshPreviews) {
+        const node = this.canvasNode(nodeId);
+        if (node?.type !== 'meshFrame') continue;
+        const mesh = this.project.meshes.find((m) => m.id === node.meshId);
+        if (mesh?.patternId === pattern.id) preview.setPattern(pattern);
+      }
+    }
+    this.markDirty();
   }
 
   private remesh(meshId: string, opts: { recordUndo?: boolean } = {}): void {
@@ -8045,7 +8214,7 @@ export class StudioApp {
     this.syncTextStyleBar();
     const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
     if (!node) {
-      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom. Shift- or ⌘/Ctrl-click a node, or ⌘/Ctrl-drag the board, to select several at once, then ⌘/Ctrl+D to duplicate the whole set — links between the copies stay between the copies. ⌫ / Delete removes the selection.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · Shift-click pieces to multi-select (drag or rotate the group around their shared pivot) · empty drag to orbit · Shift-drag empty space to raise/lower orbit · Move/Rotate toggle · R = 90° local X · Snap to quadrant reveals the two 2 × 8 grids: click a piece, then click a cell to centre it there · wheel zoom.<br/>Sim: drag fabric to move · Shift-click to multi-select · Play to simulate drape · Draw pattern points shows the pattern's anchor points on the fabric — click one to edit it in a small overlay (Cancel/Apply above it; Apply remeshes and rebuilds the drape).</p>`;
+      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom. Shift- or ⌘/Ctrl-click a node, or ⌘/Ctrl-drag the board, to select several at once, then ⌘/Ctrl+D to duplicate the whole set — links between the copies stay between the copies. ⌫ / Delete removes the selection.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · Shift-click pieces to multi-select (drag or rotate the group around their shared pivot) · empty drag to orbit · Shift-drag empty space to raise/lower orbit · Move/Rotate toggle · R = 90° local X · Snap to quadrant reveals the two 2 × 8 grids: click a piece, then click a cell to centre it there · Fabric opens a palette of the studio's fabrics for the picked pieces · wheel zoom.<br/>Sim: drag fabric to move · Shift-click to multi-select · Play to simulate drape · Draw pattern points shows the pattern's anchor points on the fabric — click one to edit it in a small overlay (Cancel/Apply above it; Apply remeshes and rebuilds the drape) · Fabric opens a palette of the studio's fabrics for the picked pieces.</p>`;
       this.decorateInspector();
       return;
     }
@@ -8460,6 +8629,46 @@ export class StudioApp {
       const patterns = this.project.patterns
         .map((p) => `<option value="${p.id}" ${p.id === mesh.patternId ? 'selected' : ''}>${p.name}</option>`)
         .join('');
+      const sourcePattern = this.project.patterns.find((p) => p.id === mesh.patternId);
+      const uvPieces = (sourcePattern?.pieces ?? []).filter(
+        (piece) => piece.closed && piece.points.length >= 3
+      );
+      const uvMode: PatternUvMode = sourcePattern?.uvMode === 'shared' ? 'shared' : 'individual';
+      const uvEdited =
+        uvMode === 'shared' ||
+        !!sourcePattern?.uvSharedBox ||
+        uvPieces.some((piece) => !isDefaultPieceUv(piece.uv));
+      const pieceNameCounts = new Map<string, number>();
+      const pieceLabels = new Map<string, string>();
+      for (const piece of uvPieces) {
+        const count = (pieceNameCounts.get(piece.name) ?? 0) + 1;
+        pieceNameCounts.set(piece.name, count);
+        pieceLabels.set(piece.id, count > 1 ? `${piece.name} (${count})` : piece.name);
+      }
+      const uvRows = uvPieces
+        .map((piece) => {
+          const uv = normalizePieceUv(piece.uv);
+          return `
+            <div class="inspector-uv-piece" data-uv-piece="${escapeAttr(piece.id)}">
+              <span class="inspector-uv-name">${this.escapeHtml(pieceLabels.get(piece.id) ?? piece.name)}</span>
+              <label>U offset<input type="number" step="0.05" data-uv-field="offsetX" value="${round3(uv.offsetX)}" /></label>
+              <label>V offset<input type="number" step="0.05" data-uv-field="offsetY" value="${round3(uv.offsetY)}" /></label>
+              <label>U scale<input type="number" step="0.05" data-uv-field="scaleX" value="${round3(uv.scaleX)}" /></label>
+              <label>V scale<input type="number" step="0.05" data-uv-field="scaleY" value="${round3(uv.scaleY)}" /></label>
+            </div>`;
+        })
+        .join('');
+      const sharedBox = sourcePattern ? sharedUvBoxFor(sourcePattern) : null;
+      const sharedRow = sharedBox
+        ? `
+            <div class="inspector-uv-piece" data-uv-shared>
+              <span class="inspector-uv-name">Shared reference box (cm)</span>
+              <label>X<input type="number" step="0.5" data-uv-shared-field="x" value="${round3(sharedBox.x)}" /></label>
+              <label>Y<input type="number" step="0.5" data-uv-shared-field="y" value="${round3(sharedBox.y)}" /></label>
+              <label>Width<input type="number" step="0.5" min="0.1" data-uv-shared-field="widthCm" value="${round3(sharedBox.widthCm)}" /></label>
+              <label>Height<input type="number" step="0.5" min="0.1" data-uv-shared-field="heightCm" value="${round3(sharedBox.heightCm)}" /></label>
+            </div>`
+        : '';
       this.inspector.innerHTML = `
         <h3>${mesh.name}</h3>
         <label>Name <input id="meshName" value="${mesh.name}" /></label>
@@ -8485,6 +8694,24 @@ export class StudioApp {
           <input id="meshLloyd" type="range" min="0" max="8" step="1" value="${s.lloydIterations}" ${s.algorithm !== 'centroidal' ? 'disabled' : ''} />
           <span id="meshLloydVal">${s.lloydIterations}</span>
         </label>
+        ${
+          uvPieces.length
+            ? `<details class="inspector-uvs" ${uvEdited ? 'open' : ''}>
+          <summary>Texture UVs</summary>
+          <div class="inspector-uv-mode" role="group" aria-label="UV mapping mode">
+            <button type="button" data-uv-mode="individual" class="${uvMode === 'individual' ? 'is-active' : ''}" aria-pressed="${uvMode === 'individual'}">Individual</button>
+            <button type="button" data-uv-mode="shared" class="${uvMode === 'shared' ? 'is-active' : ''}" aria-pressed="${uvMode === 'shared'}">Shared</button>
+          </div>
+          <p class="muted inspector-section-hint">${
+            uvMode === 'shared'
+              ? 'Every piece samples one image through the shared reference box — drag its box in the preview to move it, or its corners to scale it. Alt-drag pans the preview.'
+              : 'Each piece maps its own box into the albedo image: drag a piece’s box in the preview to slide the image, or its corners to scale it. Alt-drag pans the preview.'
+          }</p>
+          ${uvMode === 'shared' ? sharedRow : uvRows}
+          <button type="button" id="meshUvReset">Reset UVs</button>
+        </details>`
+            : ''
+        }
         <button type="button" id="meshRemesh">Remesh</button>
         <p class="muted">Top-down preview. Remesh after changing settings, then Rebuild on the sim.</p>
         ${this.deleteButtonHtml()}
@@ -8544,6 +8771,81 @@ export class StudioApp {
         this.remesh(mesh.id, { recordUndo: false })
       );
       this.inspector.querySelector('#meshRemesh')?.addEventListener('click', () => this.remesh(mesh.id));
+      for (const input of Array.from(
+        this.inspector.querySelectorAll<HTMLInputElement>('input[data-uv-field]')
+      )) {
+        let armed = false;
+        input.addEventListener('pointerdown', () => {
+          if (armed) return;
+          armed = true;
+          this.pushUndo();
+        });
+        input.addEventListener('change', () => {
+          armed = false;
+          void this.persistLocal({ quiet: true });
+        });
+        input.addEventListener('input', () => {
+          if (!sourcePattern) return;
+          const row = input.closest('[data-uv-piece]') as HTMLElement | null;
+          const piece = sourcePattern.pieces.find((p) => p.id === row?.dataset.uvPiece);
+          const field = input.dataset.uvField as keyof PieceUvTransform | undefined;
+          const value = parseFloat(input.value);
+          if (!piece || !field || !Number.isFinite(value)) return;
+          piece.uv = { ...normalizePieceUv(piece.uv), [field]: value };
+          this.refreshPatternUvs(sourcePattern);
+        });
+      }
+      for (const input of Array.from(
+        this.inspector.querySelectorAll<HTMLInputElement>('input[data-uv-shared-field]')
+      )) {
+        let armed = false;
+        input.addEventListener('pointerdown', () => {
+          if (armed) return;
+          armed = true;
+          this.pushUndo();
+        });
+        input.addEventListener('change', () => {
+          armed = false;
+          void this.persistLocal({ quiet: true });
+        });
+        input.addEventListener('input', () => {
+          if (!sourcePattern) return;
+          const field = input.dataset.uvSharedField as 'x' | 'y' | 'widthCm' | 'heightCm';
+          const value = parseFloat(input.value);
+          if (!field || !Number.isFinite(value)) return;
+          const next = { ...sharedUvBoxFor(sourcePattern), [field]: value };
+          // A zero-width box has no inside to map into.
+          if (next.widthCm <= 0.01 || next.heightCm <= 0.01) return;
+          sourcePattern.uvSharedBox = next;
+          this.refreshPatternUvs(sourcePattern);
+        });
+      }
+      for (const button of Array.from(
+        this.inspector.querySelectorAll<HTMLButtonElement>('button[data-uv-mode]')
+      )) {
+        button.addEventListener('click', () => {
+          if (!sourcePattern) return;
+          const mode = button.dataset.uvMode as PatternUvMode;
+          if (mode === uvMode) return;
+          this.pushUndo();
+          sourcePattern.uvMode = mode;
+          if (mode === 'shared' && !sourcePattern.uvSharedBox) {
+            sourcePattern.uvSharedBox = defaultSharedUvBox(sourcePattern.pieces);
+          }
+          this.refreshPatternUvs(sourcePattern);
+          void this.persistLocal({ quiet: true });
+          this.renderInspector();
+        });
+      }
+      this.inspector.querySelector('#meshUvReset')?.addEventListener('click', () => {
+        if (!sourcePattern) return;
+        this.pushUndo();
+        for (const piece of sourcePattern.pieces) delete piece.uv;
+        delete sourcePattern.uvSharedBox;
+        this.refreshPatternUvs(sourcePattern);
+        void this.persistLocal({ quiet: true });
+        this.renderInspector();
+      });
       this.bindDeleteButton(node.id);
       return;
     }
@@ -8565,7 +8867,7 @@ export class StudioApp {
         <p class="muted">${
           display
             ? 'Display view shows the finished pieces, seam allowance and all, with nothing to grab. Switch it off here or from the frame’s top-right button to draw on the pattern again.'
-            : 'Tools: <b>V</b> Move · <b>A</b> Add (pen, rectangle, circle, block, SVG) · <b>M</b> Modify (extrude, join, bridge) · <b>C</b> Cut (line, circle, inset, curve, loop, dart) · <b>S</b> Sew (1:1, many : many) · <b>R</b> Ruler (ruler, measure line). Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.'
+            : 'Tools: <b>V</b> Move · <b>A</b> Add (pen, rectangle, circle, block, SVG) · <b>M</b> Modify (extrude, join, bridge) · <b>C</b> Cut (line, circle, inset, curve, loop, dart) · <b>S</b> Sew (1:1, many : many) · <b>R</b> Ruler (ruler, measure line) · <b>F</b> Fabric (pick pieces, then a fabric in the ribbon). Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.'
         }</p>
         ${this.deleteButtonHtml()}
       `;

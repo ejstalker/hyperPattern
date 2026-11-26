@@ -141,3 +141,30 @@ describe('a piece with a hole in it', () => {
     expect(hole.maxY).toBeLessThan(panel.maxY);
   });
 });
+
+describe('a piece’s fabric travels with the piece', () => {
+  const square = (): PatternPiece => ({
+    id: 'front',
+    name: 'Front',
+    closed: true,
+    fabricId: 'wool-charcoal',
+    points: [
+      { id: 'a', anchor: { x: 0, y: 0 }, handleIn: null, handleOut: null, handlesParallel: false },
+      { id: 'b', anchor: { x: 10, y: 0 }, handleIn: null, handleOut: null, handlesParallel: false },
+      { id: 'c', anchor: { x: 10, y: 10 }, handleIn: null, handleOut: null, handlesParallel: false },
+      { id: 'd', anchor: { x: 0, y: 10 }, handleIn: null, handleOut: null, handlesParallel: false },
+    ],
+  });
+
+  it('keeps the assignment on a duplicate', () => {
+    let n = 0;
+    expect(clonePatternPiece(square(), () => `id-${n++}`).fabricId).toBe('wool-charcoal');
+  });
+
+  it('keeps the assignment on a mirror', () => {
+    let n = 0;
+    expect(
+      mirrorClonePatternPiece(square(), 'x', () => `id-${n++}`).fabricId
+    ).toBe('wool-charcoal');
+  });
+});

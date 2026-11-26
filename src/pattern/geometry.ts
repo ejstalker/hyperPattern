@@ -799,6 +799,8 @@ export function clonePatternPiece(
         }
       : undefined,
     seamAllowance: remapSeamAllowance(piece.seamAllowance, pointIdMap),
+    uv: piece.uv ? { ...piece.uv } : undefined,
+    fabricId: piece.fabricId,
   };
 }
 
@@ -881,6 +883,8 @@ export function mirrorClonePatternPiece(
     // Mirroring reverses the winding, so the allowance travels with the points
     // it was set on rather than with the edge numbers.
     seamAllowance: remapSeamAllowance(piece.seamAllowance, pointIdMap),
+    uv: piece.uv ? { ...piece.uv } : undefined,
+    fabricId: piece.fabricId,
   };
 }
 

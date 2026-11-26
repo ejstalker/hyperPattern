@@ -19,6 +19,15 @@ export type MaterialParams = {
   roughness: number;
   /** 0 = dielectric, 1 = metal. */
   metallic: number;
+  /**
+   * Texture used as the albedo in place of `color`, as a browser-loadable data
+   * URL. `color` stays alongside it so clearing the image falls back to the
+   * colour the material had. Only the cloth reads this: its UVs come from the
+   * Remesh node's per-piece mapping.
+   */
+  albedoImage?: string;
+  /** What the image file was called, for the shading panel. */
+  albedoImageName?: string;
 };
 
 export const MATERIAL_IDS: readonly MaterialId[] = ['cloth', 'reference', 'pedestal'];
@@ -57,11 +66,18 @@ export function normalizeMaterial(
   value: Partial<MaterialParams> | undefined,
   fallback: MaterialParams
 ): MaterialParams {
-  return {
+  const material: MaterialParams = {
     color: clampColor(value?.color, fallback.color),
     roughness: clamp01(value?.roughness as number, fallback.roughness),
     metallic: clamp01(value?.metallic as number, fallback.metallic),
   };
+  if (typeof value?.albedoImage === 'string' && value.albedoImage.length > 0) {
+    material.albedoImage = value.albedoImage;
+    if (typeof value.albedoImageName === 'string' && value.albedoImageName.length > 0) {
+      material.albedoImageName = value.albedoImageName;
+    }
+  }
+  return material;
 }
 
 export function loadMaterialSettings(): Record<MaterialId, MaterialParams> {
@@ -173,6 +189,8 @@ function sameMaterial(a: MaterialParams, b: MaterialParams): boolean {
     a.metallic === b.metallic &&
     a.color[0] === b.color[0] &&
     a.color[1] === b.color[1] &&
-    a.color[2] === b.color[2]
+    a.color[2] === b.color[2] &&
+    a.albedoImage === b.albedoImage &&
+    a.albedoImageName === b.albedoImageName
   );
 }

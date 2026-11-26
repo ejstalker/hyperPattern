@@ -7,6 +7,7 @@ import type {
   Vec2,
 } from './types';
 import { edgeLengthByPointIds, pieceRings, ringEdgeCount } from '../pattern/geometry';
+import { splitPieceUv } from '../pattern/uvMapping';
 
 /**
  * Geometry attributes.
@@ -384,6 +385,9 @@ export function carryAttributesThroughSplit(
   children.forEach((child, index) => {
     const map = pointMaps[index];
     if (!map) return;
+    // A cut child keeps sampling the part of the image its half used to show.
+    child.uv = splitPieceUv(parent, child);
+    child.fabricId = parent.fabricId;
     const attrs: PieceAttributes = {};
     const pieceBag = cleanBag(parent.attributes?.piece);
     if (pieceBag) attrs.piece = { ...pieceBag };

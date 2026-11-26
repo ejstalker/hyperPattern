@@ -137,9 +137,22 @@ If you see “WebGPU is not supported,” update the browser and confirm WebGPU 
   **reference model** and the **cloth**. The **pedestal** always takes the reference colour 25 %
   darker — its swatch is read-only — while its roughness/metallic are its own. Colours are stored
   linear (the colour picker converts), so what you pick is what the PBR shader uses.
-- Materials live in a shared library that the renderer asks per surface (`forPiece(pieceId)`); every
-  piece uses the cloth material today, which is the single seam a future materials node after Remesh
-  will use to hand out per-piece materials and textures.
+- Materials live in a shared library that the renderer asks per surface (`forPiece(pieceId)`); a piece
+  with a fabric variant takes that variant's colour, roughness, metallic and albedo texture, and an
+  unassigned piece keeps the cloth material.
+- **Fabrics** (hamburger menu → Fabrics…) are the studio's material library: each **type** carries the
+  physics multipliers — weight (particle mass), stretch resistance and fold resistance — and its
+  **variants** carry the look (colour, roughness, metallic and an optional albedo image). The library
+  ships with Silk, Linen and Wool, each with two variants, and persists in `localStorage` beside the
+  scene materials.
+- A piece's fabric variant is `PatternPiece.fabricId`; it survives copies, mirrors, cuts and the
+  project file. The **Fabric** tool (key **F** in 2D, the Fabric button in either 3D viewport) picks
+  whole pieces and shows a palette ribbon; picking a variant applies it to every picked piece, and
+  with several pieces picked the ribbon lists each one so they can be given different variants.
+- Physics are baked once per build: `buildClothTopology` writes a mass multiplier per particle and a
+  stiffness multiplier per stretch/bend constraint from the piece's fabric. Changing an assignment
+  calls `applyFabricPhysics`, which re-bakes masses and spring constants in place on both the CPU and
+  GPU engines without remeshing or resetting the drape.
 - **Tonemapping** (second collapsed section of the same panel): *Reinhard*, *Uncharted 2*, *ACES*
   (default) or *Lottes* — the four operators from `~/Documents/Dev/pbr-webgpu`, ported verbatim into
   `src/shaders/tonemapping.wgsl`. All four are compiled into the PBR and background shaders and picked
@@ -211,6 +224,8 @@ If you see “WebGPU is not supported,” update the browser and confirm WebGPU 
 | Change shading (wireframe / simple / PBR) | Shading button, top-right of any 3D viewport |
 | Pick an HDRI / blur it / set exposure / pick a tonemapper | Shading panel (caret next to the shading button) |
 | Set material colour / roughness / metallic | Shading panel → Materials |
+| Edit the global fabric library (types, physics, variants, textures) | Hamburger menu → **Fabrics…** |
+| Assign a fabric to pieces | **F** (2D) or the **Fabric** button (3D) → pick pieces → pick a variant in the ribbon; with several picked, use each piece's row for different variants |
 | Exit fullscreen | Esc or ✕ |
 
 Pattern viewport: ⌘/Ctrl-wheel (or a plain wheel, or a trackpad scroll) zooms the pattern, the **Zoom** button types an exact percent of the default framing (or steps it 1% at a time), and **Fit to pattern** frames the work; Alt-drag pans inside the editor. **Lock zoom**, in the zoom popover, holds the level where it is — the wheel and the zoom controls stop moving it, while panning stays free.

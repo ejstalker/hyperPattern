@@ -29,12 +29,14 @@ struct VertexInputColor {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
+    @location(4) uv: vec2<f32>,
 }
 
 struct VertexOutputColor {
     @builtin(position) position: vec4<f32>,
     @location(0) fragNormal: vec3<f32>,
     @location(1) fragColor: vec3<f32>,
+    @location(2) fragUv: vec2<f32>,
 }
 
 @vertex
@@ -43,6 +45,7 @@ fn mainColored(input: VertexInputColor) -> VertexOutputColor {
     output.position = uniforms.viewProj * uniforms.model * vec4<f32>(input.position, 1.0);
     output.fragNormal = (uniforms.model * vec4<f32>(input.normal, 0.0)).xyz;
     output.fragColor = input.color;
+    output.fragUv = input.uv;
     return output;
 }
 
@@ -53,6 +56,7 @@ struct VertexInputColorAlpha {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
     @location(3) alpha: f32,
+    @location(4) uv: vec2<f32>,
 }
 
 struct VertexOutputColorAlpha {
@@ -60,6 +64,7 @@ struct VertexOutputColorAlpha {
     @location(0) fragNormal: vec3<f32>,
     @location(1) fragColor: vec3<f32>,
     @location(2) fragAlpha: f32,
+    @location(3) fragUv: vec2<f32>,
 }
 
 @vertex
@@ -69,5 +74,6 @@ fn mainColorAlpha(input: VertexInputColorAlpha) -> VertexOutputColorAlpha {
     output.fragNormal = (uniforms.model * vec4<f32>(input.normal, 0.0)).xyz;
     output.fragColor = input.color;
     output.fragAlpha = input.alpha;
+    output.fragUv = input.uv;
     return output;
 }

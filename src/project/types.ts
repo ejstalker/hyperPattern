@@ -55,6 +55,44 @@ export type PieceAttributes = {
   piece?: AttributeBag;
 };
 
+/**
+ * How a piece's own box maps into a texture.
+ *
+ * A vertex's UV runs 0..1 across the outline's bounding box (u along x, v along
+ * y — pattern y down, texture v down) and is then scaled and slid by these
+ * numbers. The transform lives on the piece rather than on the mesh, so it
+ * travels through cuts, copies and modifiers with the piece it describes; the
+ * Remesh node is where it is edited and where the mesh's UVs are baked from it.
+ */
+export type PieceUvTransform = {
+  /** Added after scaling. */
+  offsetX: number;
+  offsetY: number;
+  /** Multiplied before the offset; 1 keeps the piece's box at 0..1. */
+  scaleX: number;
+  scaleY: number;
+};
+
+/**
+ * A rectangle in pattern centimetres that one shared texture mapping uses as
+ * its UV 0..1 frame — the "reference box" of shared mode.
+ */
+export type UvBox = {
+  x: number;
+  y: number;
+  widthCm: number;
+  heightCm: number;
+};
+
+/**
+ * How a pattern's pieces read the albedo image.
+ *
+ * `individual` (the default) gives every piece its own box and its own `uv`
+ * transform. `shared` maps every vertex from one `uvSharedBox`, so panels that
+ * meet sample one continuous image.
+ */
+export type PatternUvMode = 'individual' | 'shared';
+
 export type PatternPiece = {
   id: string;
   name: string;
@@ -72,6 +110,16 @@ export type PatternPiece = {
   holes?: BezierPoint[][];
   grainline?: { from: Vec2; to: Vec2 };
   seamAllowance?: SeamAllowance;
+  /**
+   * Texture mapping for this piece (see `PieceUvTransform`). Absent means the
+   * identity: the piece's box fills the image, top-left to top-left.
+   */
+  uv?: PieceUvTransform;
+  /**
+   * The fabric variant this piece is made of (see `src/fabrics/library.ts`).
+   * Absent means the drape's own material and physics.
+   */
+  fabricId?: string;
   /**
    * Geometry attributes (see `src/project/attributes.ts`): named values on the
    * piece, its points and its edges. Held here so a document that never runs a
@@ -211,6 +259,13 @@ export type PatternDocument = {
   name: string;
   pieces: PatternPiece[];
   seams: SeamBinding[];
+  /** Per-piece or one shared texture mapping (see `PatternUvMode`). Absent = individual. */
+  uvMode?: PatternUvMode;
+  /**
+   * Shared mode's reference box: UV 0..1 spans this rectangle in pattern
+   * centimetres. Absent means the union of the pieces' own boxes.
+   */
+  uvSharedBox?: UvBox;
   /** Drafting reference rulers (see `PatternRuler`). */
   rulers?: PatternRuler[];
   /**
@@ -430,6 +485,12 @@ export type MeshGeometry = {
   triangles: number[];
   /** Unique undirected edges [a,b] for springs */
   edges: Array<[number, number]>;
+  /**
+   * Parallel to vertices, two floats each: the texture coordinate the piece
+   * mapping gives that vertex. Baked by the remesh from each piece's `uv`, so
+   * the cloth renderer reads it straight into its vertex buffer.
+   */
+  uvs?: number[];
   /**
    * Parallel to vertices: seam/edge tag for boundary verts, null for interior.
    * Used to resolve sew constraints after triangulation.

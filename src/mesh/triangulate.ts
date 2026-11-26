@@ -24,6 +24,14 @@ import type {
   Vec2,
 } from '../project/types';
 import type { MeshAlgorithm, MeshGeometry, MeshSettings } from '../project/types';
+import {
+  patternUsesSharedUvs,
+  pieceMeshUvs,
+  planarMeshUvs,
+  sharedMeshUvs,
+  sharedUvBoxFor,
+} from '../pattern/uvMapping';
+import type { UvBox } from '../project/types';
 
 export const DEFAULT_MESH_SETTINGS: MeshSettings = {
   algorithm: 'delaunay',
@@ -254,6 +262,11 @@ function compactMeshGeometry(mesh: MeshGeometry): MeshGeometry {
     origIndex.push(i);
   }
 
+  const uvs =
+    mesh.uvs && mesh.uvs.length === mesh.vertices.length * 2
+      ? origIndex.flatMap((oi) => [mesh.uvs![oi * 2]!, mesh.uvs![oi * 2 + 1]!])
+      : mesh.uvs;
+
   return {
     vertices,
     triangles: mesh.triangles.map((i) => remap[i]),
@@ -262,6 +275,7 @@ function compactMeshGeometry(mesh: MeshGeometry): MeshGeometry {
       ? origIndex.map((oi) => mesh.vertexPieceIds![oi])
       : undefined,
     boundary: mesh.boundary ? origIndex.map((oi) => mesh.boundary![oi]) : undefined,
+    uvs,
   };
 }
 
@@ -437,7 +451,9 @@ export function triangulate(poly: Vec2[], settings: MeshSettings, holes: Vec2[][
       mesh = triangulateDelaunay(polygon, holes, settings);
       break;
   }
-  return compactMeshGeometry(mesh);
+  const compacted = compactMeshGeometry(mesh);
+  if (!compacted.uvs) compacted.uvs = planarMeshUvs(compacted.vertices);
+  return compacted;
 }
 
 /** Merge multiple independent mesh islands (one per pattern piece) into one MeshGeometry. */
@@ -447,6 +463,7 @@ function mergeMeshes(meshes: MeshGeometry[]): MeshGeometry {
   const triangles: number[] = [];
   const edges: Array<[number, number]> = [];
   const boundary: Array<SeamVertexTag | null> = [];
+  const uvs: number[] = [];
   let hasBoundary = false;
   for (const m of meshes) {
     const offset = vertices.length;
@@ -455,6 +472,11 @@ function mergeMeshes(meshes: MeshGeometry[]): MeshGeometry {
       vertexPieceIds.push(...m.vertexPieceIds);
     } else {
       for (let i = 0; i < m.vertices.length; i++) vertexPieceIds.push(null);
+    }
+    if (m.uvs?.length === m.vertices.length * 2) {
+      uvs.push(...m.uvs);
+    } else {
+      uvs.push(...planarMeshUvs(m.vertices));
     }
     for (const idx of m.triangles) triangles.push(idx + offset);
     for (const [a, b] of m.edges) edges.push([a + offset, b + offset]);
@@ -471,6 +493,7 @@ function mergeMeshes(meshes: MeshGeometry[]): MeshGeometry {
     triangles,
     edges,
     boundary: hasBoundary ? boundary : undefined,
+    uvs,
   };
 }
 
@@ -745,7 +768,8 @@ function tagFromForcedSamples(
 function triangulatePieceSeamAware(
   piece: PatternPiece,
   settings: MeshSettings,
-  seamPlans: Map<string, SeamEdgePlan>
+  seamPlans: Map<string, SeamEdgePlan>,
+  sharedBox: UvBox | null
 ): MeshGeometry {
   const poly = pieceToPolygon(piece);
   const holes = pieceHolePolygons(piece);
@@ -757,6 +781,9 @@ function triangulatePieceSeamAware(
     const mesh = triangulate(poly, settings, holes);
     mesh.vertexPieceIds = mesh.vertices.map(() => piece.id);
     mesh.boundary = tagFromForcedSamples(piece, mesh.vertices, forced, tol, true);
+    mesh.uvs = sharedBox
+      ? sharedMeshUvs(mesh.vertices, sharedBox)
+      : pieceMeshUvs(piece, mesh.vertices);
     return mesh;
   }
 
@@ -810,7 +837,11 @@ function triangulatePieceSeamAware(
   mesh.vertexPieceIds = mesh.vertices.map(() => piece.id);
   // No nearest-edge fallback: only forced samples tag the boundary (exact seam counts).
   mesh.boundary = tagFromForcedSamples(piece, mesh.vertices, forced, tol, false);
-  return compactMeshGeometry(mesh);
+  const compacted = compactMeshGeometry(mesh);
+  compacted.uvs = sharedBox
+    ? sharedMeshUvs(compacted.vertices, sharedBox)
+    : pieceMeshUvs(piece, compacted.vertices);
+  return compacted;
 }
 
 /**
@@ -832,7 +863,11 @@ export function triangulatePattern(
 
   if (pieces.length === 0) {
     const poly = patternToPolygons(pattern)[0];
-    return triangulate(poly, settings);
+    const mesh = triangulate(poly, settings);
+    if (patternUsesSharedUvs(pattern)) {
+      mesh.uvs = sharedMeshUvs(mesh.vertices, sharedUvBoxFor(pattern));
+    }
+    return mesh;
   }
 
   const seamPlans =
@@ -840,7 +875,10 @@ export function triangulatePattern(
       ? buildSeamEdgePlans(pattern, settings.boundarySpacingCm)
       : new Map<string, SeamEdgePlan>();
 
-  const meshes = pieces.map((piece) => triangulatePieceSeamAware(piece, settings, seamPlans));
+  const sharedBox = patternUsesSharedUvs(pattern) ? sharedUvBoxFor(pattern) : null;
+  const meshes = pieces.map((piece) =>
+    triangulatePieceSeamAware(piece, settings, seamPlans, sharedBox)
+  );
   return mergeMeshes(meshes);
 }
 

@@ -2,6 +2,7 @@ import { vec3 } from 'gl-matrix';
 import { boundsOf } from '../pattern/geometry';
 import { resolveSeamParticlePairs } from '../mesh/triangulate';
 import type { MeshGeometry, PatternDocument } from '../project/types';
+import type { FabricPhysics } from '../fabrics/library';
 import { CM_TO_WORLD } from './units';
 
 export const FALLBACK_PIECE_ID = '__cloth__';
@@ -18,8 +19,18 @@ export type StretchConstraint = {
    * inextensible exactly as it has always been.
    */
   slack?: number;
+  /** This edge's stretch-stiffness multiplier from the pieces it joins. */
+  stiffness?: number;
 };
-export type BendConstraint = { i0: number; i1: number; i2: number; i3: number; restAngle: number };
+export type BendConstraint = {
+  i0: number;
+  i1: number;
+  i2: number;
+  i3: number;
+  restAngle: number;
+  /** Fold-stiffness multiplier from the pieces it spans. */
+  stiffness?: number;
+};
 /** Long-range / attach: particle i capped to maxDist from slot position. */
 export type LraConstraint = {
   particleId: number;
@@ -46,6 +57,8 @@ export type SeamBendConstraint = {
   j: number;
   /** Diagonal length with the seam lying flat (the shorter of the two rows). */
   rest: number;
+  /** Fold-stiffness multiplier from the pieces it spans. */
+  stiffness?: number;
 };
 
 export type SeamDistanceConstraint = {
@@ -66,6 +79,8 @@ export type ClothTopology = {
   edgeLengths: Float32Array;
   indices: Uint32Array;
   vertexPieceIds: string[];
+  /** Fabric weight multiplier per particle (1 = the drape's own mass). */
+  massScales: Float32Array;
   stretch: StretchConstraint[];
   bend: BendConstraint[];
   /** Attach slot world positions (xyz). Non-seam LRA only. */
@@ -321,6 +336,8 @@ export function buildClothTopology(
     particleDiameterScalar?: number;
     longRangeStretchiness?: number;
     layoutY?: number;
+    /** Physics multipliers for the piece a particle belongs to. */
+    fabricForPiece?: (pieceId: string) => FabricPhysics | null;
   }
 ): ClothTopology {
   const diameterScalar = opts?.particleDiameterScalar ?? 1.5;
@@ -362,6 +379,27 @@ export function buildClothTopology(
   const particleMass = mass / Math.max(n, 1);
   const invMass = particleMass > 0 ? 1 / particleMass : 0;
 
+  // Fabric weight and stiffness are baked into the particles and springs here,
+  // once: a piece of wool is heavier and harder to fold for the whole drape, and
+  // the solver never has to ask which piece a point belongs to again.
+  const fabricCache = new Map<string, FabricPhysics | null>();
+  const physicsFor = (pieceId: string): FabricPhysics | null => {
+    if (!opts?.fabricForPiece) return null;
+    if (!fabricCache.has(pieceId)) fabricCache.set(pieceId, opts.fabricForPiece(pieceId));
+    return fabricCache.get(pieceId) ?? null;
+  };
+  const weightFor = (pieceId: string): number =>
+    Math.min(20, Math.max(0.05, physicsFor(pieceId)?.weight ?? 1));
+  const stiffnessFor = (pieceId: string): number =>
+    Math.min(20, Math.max(0.05, physicsFor(pieceId)?.stiffness ?? 1));
+  const bendFor = (pieceId: string): number =>
+    Math.min(20, Math.max(0.05, physicsFor(pieceId)?.bend ?? 1));
+  const massScales = new Float32Array(n);
+  const constraintStiffness = (a: number, b: number): number =>
+    (stiffnessFor(pieceIds[a] ?? FALLBACK_PIECE_ID) +
+      stiffnessFor(pieceIds[b] ?? FALLBACK_PIECE_ID)) *
+    0.5;
+
   let avgEdge = 0;
   for (const [a, b] of edges) {
     avgEdge +=
@@ -382,7 +420,8 @@ export function buildClothTopology(
     initialPositions[i * 3] = x;
     initialPositions[i * 3 + 1] = y;
     initialPositions[i * 3 + 2] = z;
-    inverseMasses[i] = invMass;
+    massScales[i] = weightFor(pieceIds[i] ?? FALLBACK_PIECE_ID);
+    inverseMasses[i] = invMass / massScales[i]!;
   }
 
   // Per-particle local edge length. A global average is wrong for strips that
@@ -417,10 +456,16 @@ export function buildClothTopology(
     const dy = positions[a * 3 + 1] - positions[b * 3 + 1];
     const dz = positions[a * 3 + 2] - positions[b * 3 + 2];
     const rest = Math.hypot(dx, dy, dz);
-    stretch.push({ i: a, j: b, rest });
+    stretch.push({ i: a, j: b, rest, stiffness: constraintStiffness(a, b) });
   }
 
   const bend = buildBendConstraints(positions, triangles);
+  for (const constraint of bend) {
+    constraint.stiffness =
+      (bendFor(pieceIds[constraint.i0] ?? FALLBACK_PIECE_ID) +
+        bendFor(pieceIds[constraint.i3] ?? FALLBACK_PIECE_ID)) *
+      0.5;
+  }
 
   // Seams as pairwise distance constraints (not mutual stale-slot LRAs).
   const seamPairsRaw = resolveSeamParticlePairs(pattern ?? undefined, {
@@ -481,6 +526,12 @@ export function buildClothTopology(
   }
 
   const seamBend = buildSeamBendConstraints(positions, triangles, seamPairs);
+  for (const constraint of seamBend) {
+    constraint.stiffness =
+      (bendFor(pieceIds[constraint.i] ?? FALLBACK_PIECE_ID) +
+        bendFor(pieceIds[constraint.j] ?? FALLBACK_PIECE_ID)) *
+      0.5;
+  }
 
   const { offsets, neighbors } = buildOneRing(n, edges);
 
@@ -492,6 +543,7 @@ export function buildClothTopology(
     edgeLengths,
     indices: windOutward(triangles),
     vertexPieceIds: pieceIds,
+    massScales,
     stretch,
     bend,
     attachSlots: new Float32Array(slotList),
@@ -505,4 +557,55 @@ export function buildClothTopology(
     particleMass,
     numParticles: n,
   };
+}
+
+/**
+ * Re-bake fabric weight and stiffness after a piece's assignment changed.
+ *
+ * The mesh did not move, so nothing is rebuilt: the particles keep their
+ * positions and velocities and only their mass and their springs' constants
+ * change. `baseParticleMass` is the drape's own mass per particle, before any
+ * fabric multiplier.
+ */
+export function refreshFabricScales(
+  topo: ClothTopology,
+  baseParticleMass: number,
+  fabricForPiece?: (pieceId: string) => FabricPhysics | null
+): void {
+  if (!fabricForPiece) return;
+  const cache = new Map<string, FabricPhysics | null>();
+  const physicsFor = (pieceId: string): FabricPhysics | null => {
+    if (!cache.has(pieceId)) cache.set(pieceId, fabricForPiece(pieceId));
+    return cache.get(pieceId) ?? null;
+  };
+  const weightFor = (pieceId: string): number =>
+    Math.min(20, Math.max(0.05, physicsFor(pieceId)?.weight ?? 1));
+  const stiffnessFor = (pieceId: string): number =>
+    Math.min(20, Math.max(0.05, physicsFor(pieceId)?.stiffness ?? 1));
+  const bendFor = (pieceId: string): number =>
+    Math.min(20, Math.max(0.05, physicsFor(pieceId)?.bend ?? 1));
+  const baseInvMass = baseParticleMass > 0 ? 1 / baseParticleMass : 0;
+  for (let i = 0; i < topo.numParticles; i++) {
+    const scale = weightFor(topo.vertexPieceIds[i] ?? FALLBACK_PIECE_ID);
+    topo.massScales[i] = scale;
+    topo.inverseMasses[i] = baseInvMass / scale;
+  }
+  for (const edge of topo.stretch) {
+    edge.stiffness =
+      (stiffnessFor(topo.vertexPieceIds[edge.i] ?? FALLBACK_PIECE_ID) +
+        stiffnessFor(topo.vertexPieceIds[edge.j] ?? FALLBACK_PIECE_ID)) *
+      0.5;
+  }
+  for (const bend of topo.bend) {
+    bend.stiffness =
+      (bendFor(topo.vertexPieceIds[bend.i0] ?? FALLBACK_PIECE_ID) +
+        bendFor(topo.vertexPieceIds[bend.i3] ?? FALLBACK_PIECE_ID)) *
+      0.5;
+  }
+  for (const seamBend of topo.seamBend) {
+    seamBend.stiffness =
+      (bendFor(topo.vertexPieceIds[seamBend.i] ?? FALLBACK_PIECE_ID) +
+        bendFor(topo.vertexPieceIds[seamBend.j] ?? FALLBACK_PIECE_ID)) *
+      0.5;
+  }
 }

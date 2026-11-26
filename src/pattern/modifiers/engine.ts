@@ -947,6 +947,8 @@ function clonePiece(piece: PatternPiece): PatternPiece {
   if (piece.grainline) copy.grainline = { from: { ...piece.grainline.from }, to: { ...piece.grainline.to } };
   if (piece.seamAllowance) copy.seamAllowance = structuredClone(piece.seamAllowance);
   if (piece.attributes) copy.attributes = structuredClone(piece.attributes);
+  if (piece.uv) copy.uv = { ...piece.uv };
+  if (piece.fabricId) copy.fabricId = piece.fabricId;
   return copy;
 }
 

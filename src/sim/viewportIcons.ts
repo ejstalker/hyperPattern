@@ -23,3 +23,6 @@ export const SEW_ICON = `<svg class="sim-tool-icon" viewBox="0 0 16 16" width="1
 
 /** A quadrant grid with a cell picked: snapping a piece into place. */
 export const SNAP_ICON = `<svg class="sim-tool-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" ${stroke}><rect x="2.3" y="2.3" width="11.4" height="11.4" rx="1.4"/><path d="M8 2.3v11.4M2.3 8h11.4"/><rect x="8" y="2.3" width="5.7" height="5.7" fill="currentColor" stroke="none" opacity="0.55"/></svg>`;
+
+/** A folded swatch: giving the picked pieces a fabric. */
+export const FABRIC_ICON = `<svg class="sim-tool-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" ${stroke}><path d="M2.4 3.4h4.3l2 2.3h4.9v7.1H2.4z"/><path d="M6.7 3.4v2.3H2.4M9.8 7.6l2.2 1.7-2.2 1.6"/></svg>`;

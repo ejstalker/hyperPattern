@@ -1,5 +1,14 @@
-import type { MeshDocument, MeshGeometry, PatternDocument, UnitDisplay, Vec2 } from '../project/types';
+import type {
+  MeshDocument,
+  MeshGeometry,
+  PatternDocument,
+  PatternUvMode,
+  UvBox,
+  UnitDisplay,
+  Vec2,
+} from '../project/types';
 import { boundsOf } from '../pattern/geometry';
+import { pieceUvForBox, sharedUvBoxFor, uvBoxForPiece } from '../pattern/uvMapping';
 import { buildGridGroup, viewScaleFor, type GridBox } from '../pattern/grid';
 import { meshEdgePath, meshSurfacePath, meshViewScale } from './meshPaint';
 import { buildPatternPointMarkers } from '../sim/patternPointMarkers';
@@ -19,6 +28,35 @@ const MAX_VIEW = 600;
 /** Half the diameter of a pattern-point marker, matching the drape viewport. */
 const MARKER_RADIUS_PX = 6.5;
 const MARKER_STROKE_PX = 1.5;
+
+/** UV box handles and labels are drawn at screen size, not pattern size. */
+const UV_HANDLE_PX = 8;
+const UV_LABEL_PX = 11;
+/** The smallest reference box a corner drag may leave, in centimetres. */
+const UV_MIN_BOX_CM = 0.4;
+
+export type MeshPreviewUvCallbacks = {
+  /** A UV drag is about to change the pattern — the host snapshots undo. */
+  onUvEditStart?: () => void;
+  /** The mapping changed mid-drag; refresh cloth UVs (the preview redraws itself). */
+  onUvChanged?: () => void;
+  /** The drag ended: persist, redraw other previews and refresh the inspector. */
+  onUvEditEnd?: () => void;
+};
+
+type UvCorner = 'nw' | 'ne' | 'sw' | 'se';
+
+type UvDrag = {
+  pointerId: number;
+  kind: 'move' | 'scale';
+  /** null = the shared reference box. */
+  pieceId: string | null;
+  start: Vec2;
+  startBox: UvBox;
+  corner?: UvCorner;
+  /** Set on the first movement, so a click alone leaves undo history alone. */
+  started: boolean;
+};
 
 /** The mesh's flat colours, matching what the SVG classes used to paint. */
 const MESH_SURFACE_FILL = '#35302a';
@@ -68,16 +106,20 @@ export class MeshPreview {
   private pan:
     | { pointerId: number; clientX: number; clientY: number; viewX: number; viewY: number }
     | null = null;
+  private uvDrag: UvDrag | null = null;
+  private uvCallbacks: MeshPreviewUvCallbacks;
 
   constructor(
     host: HTMLElement,
     mesh: MeshDocument,
     unit: UnitDisplay,
-    pattern: PatternDocument | null = null
+    pattern: PatternDocument | null = null,
+    uvCallbacks: MeshPreviewUvCallbacks = {}
   ) {
     this.mesh = mesh;
     this.pattern = pattern;
     this.unit = unit;
+    this.uvCallbacks = uvCallbacks;
     this.root = host;
     this.root.classList.add('mesh-preview');
     this.root.innerHTML = '';
@@ -131,6 +173,7 @@ export class MeshPreview {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.pan = null;
+    this.uvDrag = null;
   }
 
   setUnit(unit: UnitDisplay): void {
@@ -217,7 +260,8 @@ export class MeshPreview {
 
   private bindInteraction(): void {
     this.svg.addEventListener('pointerdown', (e) => {
-      // Left, middle, or Alt+left all pan — there is nothing else to click here.
+      // Left, middle, or Alt+left pan. A UV box stops its own presses first, so
+      // Alt is the way to pan while the box covers most of the view.
       if (e.button !== 0 && e.button !== 1) return;
       e.preventDefault();
       this.pan = {
@@ -236,6 +280,11 @@ export class MeshPreview {
       this.svg.style.cursor = 'grabbing';
     });
     this.svg.addEventListener('pointermove', (e) => {
+      if (this.uvDrag && e.pointerId === this.uvDrag.pointerId) {
+        e.preventDefault();
+        this.dragUv(e);
+        return;
+      }
       const pan = this.pan;
       if (!pan || e.pointerId !== pan.pointerId) return;
       const s = this.screenScale();
@@ -246,6 +295,18 @@ export class MeshPreview {
       this.redrawView(scale);
     });
     const end = (e: PointerEvent): void => {
+      if (this.uvDrag && e.pointerId === this.uvDrag.pointerId) {
+        const started = this.uvDrag.started;
+        this.uvDrag = null;
+        this.svg.style.cursor = '';
+        try {
+          this.svg.releasePointerCapture(e.pointerId);
+        } catch {
+          /* already released */
+        }
+        if (started) this.uvCallbacks.onUvEditEnd?.();
+        return;
+      }
       if (!this.pan || e.pointerId !== this.pan.pointerId) return;
       this.pan = null;
       this.root.classList.remove('is-panning');
@@ -285,6 +346,7 @@ export class MeshPreview {
     this.drawGrid();
     this.drawSeams(geom);
     this.drawPatternPoints(geom);
+    this.drawUvBoxes();
   }
 
   /**
@@ -309,6 +371,8 @@ export class MeshPreview {
       this.svg.querySelector('.mesh-points')?.remove();
       this.drawPatternPoints(geom);
     }
+    // Handles and labels are sized in screen pixels, so a zoom restates them.
+    this.drawUvBoxes();
   }
 
   private applyViewBox(): void {
@@ -351,6 +415,144 @@ export class MeshPreview {
       layer.appendChild(dot);
     }
     this.svg.appendChild(layer);
+  }
+
+  /**
+   * The texture mapping as boxes in pattern space — one per piece in individual
+   * mode, one shared reference box otherwise. Each is the rectangle whose
+   * corners are UV 0,0 and 1,1, so dragging it slides the image under the
+   * pieces and its corners scale the image.
+   */
+  private drawUvBoxes(): void {
+    this.svg.querySelector('.mesh-uv-layer')?.remove();
+    const pattern = this.pattern;
+    const scale = this.viewScale();
+    if (!pattern || !(scale > 0)) return;
+    const mode: PatternUvMode = pattern.uvMode === 'shared' ? 'shared' : 'individual';
+    const layer = document.createElementNS(SVG_NS, 'g');
+    layer.setAttribute('class', 'mesh-uv-layer');
+    if (mode === 'shared') {
+      this.appendUvBox(layer, sharedUvBoxFor(pattern), null, 'Shared UV', scale);
+    } else {
+      // Duplicate piece names would make two boxes indistinguishable, so the
+      // second occurrence of a name carries its number.
+      const counts = new Map<string, number>();
+      for (const piece of pattern.pieces) {
+        if (!piece.closed || piece.points.length < 3) continue;
+        const count = (counts.get(piece.name) ?? 0) + 1;
+        counts.set(piece.name, count);
+        const label = count > 1 ? `${piece.name} (${count})` : piece.name;
+        this.appendUvBox(layer, uvBoxForPiece(piece), piece.id, label, scale);
+      }
+    }
+    this.svg.appendChild(layer);
+  }
+
+  private appendUvBox(
+    layer: SVGGElement,
+    box: UvBox,
+    pieceId: string | null,
+    label: string,
+    scale: number
+  ): void {
+    const rect = document.createElementNS(SVG_NS, 'rect');
+    rect.setAttribute('x', String(box.x));
+    rect.setAttribute('y', String(box.y));
+    rect.setAttribute('width', String(box.widthCm));
+    rect.setAttribute('height', String(box.heightCm));
+    rect.setAttribute('class', 'mesh-uv-box');
+    rect.setAttribute('rx', String(2 / scale));
+    if (pieceId) rect.dataset.uvPiece = pieceId;
+    else rect.dataset.uvShared = 'true';
+    rect.addEventListener('pointerdown', (e) => this.beginUvDrag(e, pieceId, 'move', box));
+    layer.appendChild(rect);
+
+    const handles: Array<{ corner: UvCorner; x: number; y: number }> = [
+      { corner: 'nw', x: box.x, y: box.y },
+      { corner: 'ne', x: box.x + box.widthCm, y: box.y },
+      { corner: 'sw', x: box.x, y: box.y + box.heightCm },
+      { corner: 'se', x: box.x + box.widthCm, y: box.y + box.heightCm },
+    ];
+    const size = UV_HANDLE_PX / scale;
+    for (const handle of handles) {
+      const grip = document.createElementNS(SVG_NS, 'rect');
+      grip.setAttribute('x', String(handle.x - size / 2));
+      grip.setAttribute('y', String(handle.y - size / 2));
+      grip.setAttribute('width', String(size));
+      grip.setAttribute('height', String(size));
+      grip.setAttribute('class', `mesh-uv-handle is-${handle.corner}`);
+      grip.addEventListener('pointerdown', (e) =>
+        this.beginUvDrag(e, pieceId, 'scale', box, handle.corner)
+      );
+      layer.appendChild(grip);
+    }
+
+    const text = document.createElementNS(SVG_NS, 'text');
+    text.setAttribute('x', String(box.x));
+    text.setAttribute('y', String(box.y - 5 / scale));
+    text.setAttribute('class', 'mesh-uv-label');
+    text.setAttribute('font-size', String(UV_LABEL_PX / scale));
+    text.setAttribute('stroke-width', String(3 / scale));
+    text.textContent = label.length > 24 ? `${label.slice(0, 23)}…` : label;
+    layer.appendChild(text);
+  }
+
+  private beginUvDrag(
+    e: PointerEvent,
+    pieceId: string | null,
+    kind: 'move' | 'scale',
+    box: UvBox,
+    corner?: UvCorner
+  ): void {
+    // Alt is the pan escape hatch while a box covers most of the view.
+    if (e.button !== 0 || e.altKey || !this.pattern) return;
+    e.preventDefault();
+    e.stopPropagation();
+    this.uvDrag = {
+      pointerId: e.pointerId,
+      kind,
+      pieceId,
+      start: this.clientToPattern(e.clientX, e.clientY),
+      startBox: { ...box },
+      corner,
+      started: false,
+    };
+    try {
+      this.svg.setPointerCapture(e.pointerId);
+    } catch {
+      /* capture is best-effort */
+    }
+    this.svg.style.cursor = kind === 'move' ? 'grabbing' : 'nwse-resize';
+  }
+
+  private dragUv(e: PointerEvent): void {
+    const drag = this.uvDrag;
+    const pattern = this.pattern;
+    if (!drag || !pattern) return;
+    const pointer = this.clientToPattern(e.clientX, e.clientY);
+    if (!drag.started) {
+      drag.started = true;
+      this.uvCallbacks.onUvEditStart?.();
+    }
+    let box: UvBox;
+    if (drag.kind === 'move') {
+      box = {
+        ...drag.startBox,
+        x: drag.startBox.x + (pointer.x - drag.start.x),
+        y: drag.startBox.y + (pointer.y - drag.start.y),
+      };
+    } else {
+      box = resizeUvBox(drag.startBox, pointer, drag.corner ?? 'se');
+    }
+    if (drag.pieceId === null) {
+      pattern.uvSharedBox = box;
+    } else {
+      const piece = pattern.pieces.find((p) => p.id === drag.pieceId);
+      if (!piece) return;
+      piece.uv = pieceUvForBox(piece, box);
+    }
+    this.drawUvBoxes();
+    this.uvCallbacks.onUvChanged?.();
   }
 
   /** Paint the surface and the wireframe into the canvas, in pattern units. */
@@ -456,4 +658,32 @@ export class MeshPreview {
     drawMeshSeamConnectors(this.svg, this.pattern);
     drawMeshSeamBindings(this.svg, this.pattern);
   }
+}
+
+/** Resize `start` so `corner` lands on `pointer`, never inverting or collapsing it. */
+function resizeUvBox(start: UvBox, pointer: Vec2, corner: UvCorner): UvBox {
+  let x0 = start.x;
+  let y0 = start.y;
+  let x1 = start.x + start.widthCm;
+  let y1 = start.y + start.heightCm;
+  switch (corner) {
+    case 'nw':
+      x0 = Math.min(pointer.x, x1 - UV_MIN_BOX_CM);
+      y0 = Math.min(pointer.y, y1 - UV_MIN_BOX_CM);
+      break;
+    case 'ne':
+      x1 = Math.max(pointer.x, x0 + UV_MIN_BOX_CM);
+      y0 = Math.min(pointer.y, y1 - UV_MIN_BOX_CM);
+      break;
+    case 'sw':
+      x0 = Math.min(pointer.x, x1 - UV_MIN_BOX_CM);
+      y1 = Math.max(pointer.y, y0 + UV_MIN_BOX_CM);
+      break;
+    case 'se':
+    default:
+      x1 = Math.max(pointer.x, x0 + UV_MIN_BOX_CM);
+      y1 = Math.max(pointer.y, y0 + UV_MIN_BOX_CM);
+      break;
+  }
+  return { x: x0, y: y0, widthCm: x1 - x0, heightCm: y1 - y0 };
 }

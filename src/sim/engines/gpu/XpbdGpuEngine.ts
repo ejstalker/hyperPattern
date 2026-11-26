@@ -1,12 +1,19 @@
 import { vec3, quat, mat4 } from 'gl-matrix';
+import type { FabricPhysics } from '../../../fabrics/library';
 import type { AvatarBody } from '../../../mesh/AvatarBody';
 import { Ground } from '../../../Ground';
 import { Particle, contactHoldFromGrip } from '../../../physics/Particle';
 import { identity } from '../../../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../../../project/types';
 import type { ClothCollider, ClothFloor, ClothSimulator } from '../../ClothSimulator';
-import { buildClothTopology, FALLBACK_PIECE_ID, type ClothTopology } from '../../meshTopology';
+import {
+  buildClothTopology,
+  refreshFabricScales,
+  FALLBACK_PIECE_ID,
+  type ClothTopology,
+} from '../../meshTopology';
 import { buildWireframeEdgeIndices } from '../../wireframeEdges';
+import { uvsForGeometry } from '../../../pattern/uvMapping';
 import { colorConstraints, colorStretchConstraints } from '../../graphColoring';
 import { fillStrainColors, type StrainEdge } from '../../strainMap';
 import {
@@ -151,6 +158,7 @@ export class XpbdGpuEngine implements ClothSimulator {
   private floor: Ground;
   private floorY = 0;
   private topo: ClothTopology;
+  private fabricForPiece?: (pieceId: string) => FabricPhysics | null;
 
   private cpuPos: Float32Array;
   private cpuVel: Float32Array;
@@ -218,7 +226,18 @@ export class XpbdGpuEngine implements ClothSimulator {
   private stretchLambdaBuf!: GPUBuffer;
   /** Per stretch edge: the crowd floor of a gathered row, 1 = ordinary fabric. */
   private stretchSlackBuf!: GPUBuffer;
+  /** Per stretch edge: this edge's fabric stiffness multiplier. */
+  private stretchStiffnessBuf!: GPUBuffer;
+  /** Constraint source index in `topo` for each solve slot, and its stiffness. */
+  private stretchOrder!: Uint32Array;
+  private stretchStiffness!: Float32Array;
   private bendSlackBuf!: GPUBuffer;
+  /** Per bend edge: this fold's fabric bend multiplier. */
+  private bendStiffnessBuf!: GPUBuffer;
+  private bendOrder!: Uint32Array;
+  private seamBendStiffnessBuf!: GPUBuffer;
+  private seamBendOrder!: Uint32Array;
+  private seamBendStiffness!: Float32Array;
   /** Bend (cross-edge) constraints: opposite-vertex pair + rest distance. */
   private bendIdxBuf!: GPUBuffer;
   private bendRestBuf!: GPUBuffer;
@@ -249,6 +268,9 @@ export class XpbdGpuEngine implements ClothSimulator {
   private renderPosBuf!: GPUBuffer;
   private renderNrmBuf!: GPUBuffer;
   private colorBuffer!: GPUBuffer;
+  /** Texture coordinates, one two-float pair per particle. */
+  private uvBuffer!: GPUBuffer;
+  private uvData: Float32Array<ArrayBufferLike> = new Float32Array(0);
   private strainColorData!: Float32Array;
   /** Per-vertex opacity for the renderer (see `updatePieceAlpha`). */
   private alphaData!: Float32Array;
@@ -306,10 +328,12 @@ export class XpbdGpuEngine implements ClothSimulator {
     params: SimParams,
     device: GPUDevice,
     avatar: AvatarBody,
-    pattern?: PatternDocument
+    pattern?: PatternDocument,
+    fabricForPiece?: (pieceId: string) => FabricPhysics | null
   ) {
     this.device = device;
     this.avatar = avatar;
+    this.fabricForPiece = fabricForPiece;
     this.substeps = params.substeps ?? 8;
     this.iterations = params.constraintIterations ?? 4;
     this.gravity = params.gravity;
@@ -327,8 +351,13 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.topo = buildClothTopology(mesh, params.mass, pattern, {
       particleDiameterScalar: this.diameterScalar,
       longRangeStretchiness: params.longRangeStretchiness ?? 1.2,
+      fabricForPiece: this.fabricForPiece,
     });
     this.nParticles = this.topo.numParticles;
+    this.uvData = uvsForGeometry(mesh, pattern);
+    if (this.uvData.length !== this.nParticles * 2) {
+      this.uvData = new Float32Array(this.nParticles * 2);
+    }
     this.cpuPos = new Float32Array(this.topo.positions);
     this.cpuInitial = new Float32Array(this.topo.initialPositions);
     this.cpuVel = new Float32Array(this.nParticles * 3);
@@ -432,6 +461,20 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.stretchRestBuf = this.createBuf(stretchRest.byteLength, usage, 'xpbd-stretch-rest');
     this.stretchSlackBuf = this.createBuf(stretchSlack.byteLength, usage, 'xpbd-stretch-slack');
     this.writeBuf(this.stretchSlackBuf, stretchSlack);
+    const stretchStiffness = new Float32Array(Math.max(this.nStretch, 1));
+    this.stretchOrder = new Uint32Array(Math.max(this.nStretch, 1));
+    for (let slot = 0; slot < this.nStretch; slot++) {
+      const source = coloring.idx[slot]!;
+      this.stretchOrder[slot] = source;
+      stretchStiffness[slot] = this.topo.stretch[source]!.stiffness ?? 1;
+    }
+    this.stretchStiffness = stretchStiffness;
+    this.stretchStiffnessBuf = this.createBuf(
+      stretchStiffness.byteLength,
+      usage,
+      'xpbd-stretch-stiffness'
+    );
+    this.writeBuf(this.stretchStiffnessBuf, stretchStiffness);
     this.stretchLambdaBuf = this.createBuf(
       Math.max(this.nStretch, 1) * 4,
       usage,
@@ -468,6 +511,19 @@ export class XpbdGpuEngine implements ClothSimulator {
         this.cpuPos[b.i0 * 3 + 2] - this.cpuPos[b.i3 * 3 + 2]
       );
     }
+    const bendStiffness = new Float32Array(Math.max(this.nBend, 1));
+    this.bendOrder = new Uint32Array(Math.max(this.nBend, 1));
+    for (let slot = 0; slot < this.nBend; slot++) {
+      const source = bendColoring.idx[slot]!;
+      this.bendOrder[slot] = source;
+      bendStiffness[slot] = this.topo.bend[source]!.stiffness ?? 1;
+    }
+    this.bendStiffnessBuf = this.createBuf(
+      bendStiffness.byteLength,
+      usage,
+      'xpbd-bend-stiffness'
+    );
+    this.writeBuf(this.bendStiffnessBuf, bendStiffness);
     this.bendIdxBuf = this.createBuf(bendIdx.byteLength, usage, 'xpbd-bend-idx');
     this.bendRestBuf = this.createBuf(bendRest.byteLength, usage, 'xpbd-bend-rest');
     this.bendLambdaBuf = this.createBuf(Math.max(this.nBend, 1) * 4, usage, 'xpbd-bend-lambda');
@@ -508,6 +564,19 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.writeBuf(this.seamBendIdxBuf, seamBendIdx);
     this.writeBuf(this.seamBendRestBuf, seamBendRest);
     this.writeBuf(this.seamBendSlackBuf, new Float32Array(Math.max(this.nSeamBend, 1)).fill(1));
+    this.seamBendStiffness = new Float32Array(Math.max(this.nSeamBend, 1)).fill(1);
+    this.seamBendOrder = new Uint32Array(Math.max(this.nSeamBend, 1));
+    for (let slot = 0; slot < this.nSeamBend; slot++) {
+      this.seamBendOrder[slot] = seamBendColoring.idx[slot]!;
+      this.seamBendStiffness[slot] =
+        this.topo.seamBend[this.seamBendOrder[slot]!]?.stiffness ?? 1;
+    }
+    this.seamBendStiffnessBuf = this.createBuf(
+      this.seamBendStiffness.byteLength,
+      usage,
+      'xpbd-seam-bend-stiffness'
+    );
+    this.writeBuf(this.seamBendStiffnessBuf, this.seamBendStiffness);
 
     this.writeMassEdgeBuffer();
 
@@ -549,6 +618,12 @@ export class XpbdGpuEngine implements ClothSimulator {
       GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       'xpbd-render-color'
     );
+    this.uvBuffer = this.createBuf(
+      n * 8,
+      GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      'xpbd-render-uv'
+    );
+    this.writeBuf(this.uvBuffer, this.uvData);
     this.alphaData = new Float32Array(n).fill(1);
     this.alphaBuffer = this.createBuf(
       n * 4,
@@ -873,6 +948,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     restBuf: GPUBuffer,
     lambdaBuf: GPUBuffer,
     slackBuf: GPUBuffer,
+    stiffnessBuf: GPUBuffer,
     compliance: number,
     invH2: number,
     crowdSoftness = 1
@@ -905,6 +981,7 @@ export class XpbdGpuEngine implements ClothSimulator {
           { binding: 4, resource: { buffer: restBuf } },
           { binding: 5, resource: { buffer: lambdaBuf } },
           { binding: 6, resource: { buffer: slackBuf } },
+          { binding: 7, resource: { buffer: stiffnessBuf } },
         ])
       );
       pass.dispatchWorkgroups(groups(count));
@@ -921,6 +998,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.stretchRestBuf,
       this.stretchLambdaBuf,
       this.stretchSlackBuf,
+      this.stretchStiffnessBuf,
       this.stretchCompliance,
       invH2,
       SEAM_CROWD_SOFTNESS
@@ -937,6 +1015,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.bendRestBuf,
       this.bendLambdaBuf,
       this.bendSlackBuf,
+      this.bendStiffnessBuf,
       this.bendCompliance,
       invH2
     );
@@ -965,6 +1044,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.seamBendRestBuf,
       this.seamBendLambdaBuf,
       this.seamBendSlackBuf,
+      this.seamBendStiffnessBuf,
       closed ? this.bendCompliance : 1e6,
       invH2
     );
@@ -1396,6 +1476,18 @@ export class XpbdGpuEngine implements ClothSimulator {
     return this.colorBuffer;
   }
 
+  getUvBuffer(): GPUBuffer | null {
+    return this.uvBuffer;
+  }
+
+  /** Swap in UVs recomputed for an edited piece mapping, without rebuilding the cloth. */
+  setUvs(uvs: Float32Array | readonly number[]): void {
+    const data = uvs instanceof Float32Array ? uvs : Float32Array.from(uvs);
+    if (data.length !== this.nParticles * 2) return;
+    this.uvData = data;
+    this.writeBuf(this.uvBuffer, data);
+  }
+
   /**
    * The stitch overlay, for the stitches that are still live.
    *
@@ -1542,10 +1634,58 @@ export class XpbdGpuEngine implements ClothSimulator {
     if (Math.abs(mass - this.totalMass) > 1e-6) {
       this.totalMass = mass;
       const particleMass = mass / Math.max(1, this.nParticles);
-      const inv = particleMass > 0 ? 1 / particleMass : 0;
-      this.restInvMasses.fill(inv);
+      for (let i = 0; i < this.nParticles; i++) {
+        const scale = this.topo.massScales[i] ?? 1;
+        this.restInvMasses[i] = particleMass > 0 ? 1 / (particleMass * scale) : 0;
+      }
       this.ghostInvMass = ghostInverseMass(this.restInvMasses);
       this.applyFrozenMasses();
+    }
+  }
+
+  /**
+   * Re-bake every piece's fabric without rebuilding the cloth: masses are
+   * recomputed from the new weight multipliers and the per-constraint stiffness
+   * buffers are rewritten, so a change of fabric reads in the drape immediately
+   * instead of resetting it.
+   */
+  applyFabricPhysics(fabricForPiece: (pieceId: string) => FabricPhysics | null): void {
+    this.fabricForPiece = fabricForPiece;
+    refreshFabricScales(
+      this.topo,
+      this.totalMass / Math.max(1, this.nParticles),
+      this.fabricForPiece
+    );
+    for (let i = 0; i < this.nParticles; i++) {
+      const particleMass = this.totalMass / Math.max(1, this.nParticles);
+      const scale = this.topo.massScales[i] ?? 1;
+      this.restInvMasses[i] = particleMass > 0 ? 1 / (particleMass * scale) : 0;
+    }
+    this.ghostInvMass = ghostInverseMass(this.restInvMasses);
+    this.applyFrozenMasses();
+    this.writeStiffnessBuffers();
+  }
+
+  private writeStiffnessBuffers(): void {
+    for (let slot = 0; slot < this.nStretch; slot++) {
+      this.stretchStiffness[slot] =
+        this.topo.stretch[this.stretchOrder[slot]!]?.stiffness ?? 1;
+    }
+    this.writeBuf(this.stretchStiffnessBuf, this.stretchStiffness);
+    if (this.nBend > 0) {
+      const bend = new Float32Array(this.nBend);
+      for (let slot = 0; slot < this.nBend; slot++) {
+        bend[slot] = this.topo.bend[this.bendOrder[slot]!]?.stiffness ?? 1;
+      }
+      this.writeBuf(this.bendStiffnessBuf, bend);
+    }
+    if (this.nSeamBend > 0) {
+      const seamBend = new Float32Array(this.nSeamBend);
+      for (let slot = 0; slot < this.nSeamBend; slot++) {
+        seamBend[slot] =
+          this.topo.seamBend[this.seamBendOrder[slot]!]?.stiffness ?? 1;
+      }
+      this.writeBuf(this.seamBendStiffnessBuf, seamBend);
     }
   }
 
@@ -2080,6 +2220,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.renderPosBuf,
       this.renderNrmBuf,
       this.colorBuffer,
+      this.uvBuffer,
       this.indexBuffer,
       this.wireframeEdgeBuffer,
       this.stagingBuf,

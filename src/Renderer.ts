@@ -17,6 +17,7 @@ import { tonemapIndex } from './render/tonemapping';
 import { Environment, shadingModeLabel, type ShadingMode } from './render/environment';
 import { cylinderGeometry } from './render/cylinder';
 import { MaterialLibrary, PEDESTAL_DARKENING, type MaterialParams } from './render/materials';
+import { FabricLibrary, materialForVariant } from './fabrics/library';
 import type { ClothFloor } from './sim/ClothSimulator';
 
 export type RenderableCloth = Cloth | SimpleCloth | ClothSimulator;
@@ -42,6 +43,12 @@ const CLOTH_VERTEX_BUFFERS: GPUVertexBufferLayout[] = [
         attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x3' }],
     },
 ];
+
+/** Texture coordinates, appended after the color (and alpha, when present) buffer. */
+const CLOTH_UV_BUFFER: GPUVertexBufferLayout = {
+    arrayStride: 8,
+    attributes: [{ shaderLocation: 4, offset: 0, format: 'float32x2' }],
+};
 
 /**
  * Color target of the translucent-cloth pass: plain source-over blending, and
@@ -141,6 +148,40 @@ export class Renderer {
     private exposure = 1.0;
     /** Shared scene materials; without one the demo's own colours are used. */
     private materials: MaterialLibrary | null = null;
+    /** The studio's fabrics, and which variant each piece was given. */
+    private fabrics: FabricLibrary | null = null;
+    private fabricAssignments = new Map<string, string>();
+    /** Per-fabric albedo textures, created lazily as their variants are drawn. */
+    private fabricTextures = new Map<
+        string,
+        {
+            url: string | null;
+            loading: string | null;
+            texture: GPUTexture | null;
+            view: GPUTextureView | null;
+            options: GPUBuffer;
+            groups: WeakMap<GPURenderPipeline, GPUBindGroup>;
+        }
+    >();
+    /** Per-piece lighting blocks, grown when a drape has more pieces. */
+    private clothLightingBytes = 256;
+    /** Index runs per cloth, keyed by its index buffer (stable for a mesh). */
+    private clothRunsCache = new WeakMap<
+        GPUBuffer,
+        Array<{ pieceId: string; first: number; count: number }>
+    >();
+    private clothLightingGroups = new WeakMap<GPURenderPipeline, Map<number, GPUBindGroup>>();
+    /** Cloth albedo image and the group-2 bindings that carry it into the shaders. */
+    private albedoSampler: GPUSampler | null = null;
+    private albedoOptionsBuffer: GPUBuffer | null = null;
+    private defaultAlbedoTexture: GPUTexture | null = null;
+    private defaultAlbedoView: GPUTextureView | null = null;
+    private albedoTexture: GPUTexture | null = null;
+    private albedoTextureView: GPUTextureView | null = null;
+    /** URL currently uploaded (null = the white fallback), and the one loading. */
+    private albedoTextureUrl: string | null = null;
+    private albedoTextureLoading: string | null = null;
+    private albedoBindGroups = new WeakMap<GPURenderPipeline, GPUBindGroup>();
     /** Floor pedestal drawn in PBR mode, in place of the flat floor. */
     private cylinder: {
         radius: number;
@@ -222,6 +263,32 @@ export class Renderer {
             size: 256,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+
+        // Cloth albedo image: a sampler, the 1x1 white texture every draw binds
+        // until a real image is uploaded, and the flag that says which is live.
+        this.albedoSampler = this.device.createSampler({
+            magFilter: 'linear',
+            minFilter: 'linear',
+            addressModeU: 'repeat',
+            addressModeV: 'repeat',
+        });
+        this.albedoOptionsBuffer = this.device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.defaultAlbedoTexture = this.device.createTexture({
+            size: [1, 1, 1],
+            format: 'rgba8unorm-srgb',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        this.device.queue.writeTexture(
+            { texture: this.defaultAlbedoTexture },
+            new Uint8Array([255, 255, 255, 255]),
+            { bytesPerRow: 4 },
+            { width: 1, height: 1 }
+        );
+        this.defaultAlbedoView = this.defaultAlbedoTexture.createView();
+        this.writeAlbedoOptions();
         // The wireframe overlay shares this pass with the seam overlay; every
         // queue.writeBuffer lands before the whole command buffer, so the two
         // need separate uniforms to keep their own colours.
@@ -276,7 +343,7 @@ export class Renderer {
             vertex: {
                 module: this.vertexShader,
                 entryPoint: 'mainColored',
-                buffers: CLOTH_VERTEX_BUFFERS,
+                buffers: [...CLOTH_VERTEX_BUFFERS, CLOTH_UV_BUFFER],
             },
             fragment: {
                 module: this.fragmentShader,
@@ -300,6 +367,7 @@ export class Renderer {
                 arrayStride: 4,
                 attributes: [{ shaderLocation: 3, offset: 0, format: 'float32' }],
             },
+            CLOTH_UV_BUFFER,
         ];
         this.clothAlphaPipeline = this.device.createRenderPipeline({
             layout: 'auto',
@@ -465,6 +533,7 @@ export class Renderer {
                         arrayStride: 12,
                         attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x3' }],
                     },
+                    CLOTH_UV_BUFFER,
                 ],
             },
             fragment: {
@@ -490,6 +559,7 @@ export class Renderer {
                 arrayStride: 4,
                 attributes: [{ shaderLocation: 3, offset: 0, format: 'float32' }],
             },
+            CLOTH_UV_BUFFER,
         ];
         this.pbrClothAlphaPipeline = this.device.createRenderPipeline({
             layout: 'auto',
@@ -531,8 +601,8 @@ export class Renderer {
         });
 
         this.backgroundUniformBuffer = this.device.createBuffer({
-            // inverseViewProj (64) + eye (12) + blur level (4) + exposure (4)
-            // + tonemap mode (4), padded to the 16-byte uniform rule.
+            // inverseViewProj (64) + eye (12) + exposure (4) + tonemap mode (4),
+            // padded to the 16-byte uniform rule.
             size: 96,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
@@ -780,6 +850,377 @@ export class Renderer {
         this.materials = materials;
     }
 
+    /** Share the studio's fabric library; texture entries are created on demand. */
+    attachFabrics(fabrics: FabricLibrary): void {
+        this.fabrics = fabrics;
+    }
+
+    /** Which fabric variant each piece is made of, by piece id. */
+    setFabricAssignments(assignments: ReadonlyMap<string, string>): void {
+        if (assignments.size === this.fabricAssignments.size) {
+            let same = true;
+            for (const [pieceId, fabricId] of assignments) {
+                if (this.fabricAssignments.get(pieceId) !== fabricId) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return;
+        }
+        this.fabricAssignments = new Map(assignments);
+        this.clothLightingGroups = new WeakMap();
+    }
+
+    /** Whether a cloth albedo image is actually uploaded and sampling. */
+    private writeAlbedoOptions(): void {
+        if (!this.albedoOptionsBuffer) return;
+        const useTexture = this.albedoTextureView ? 1 : 0;
+        this.device.queue.writeBuffer(
+            this.albedoOptionsBuffer,
+            0,
+            new Float32Array([useTexture, 0, 0, 0])
+        );
+    }
+
+    /**
+     * Follow the cloth material's image. Called once per cloth draw: a change of
+     * URL starts a decode and keeps the current texture bound until it lands, so
+     * switching images never flashes the solid colour.
+     */
+    private syncAlbedoTexture(): void {
+        const url = this.materials?.get('cloth').albedoImage ?? null;
+        if (url === this.albedoTextureUrl) return;
+        if (url && url === this.albedoTextureLoading) return;
+        this.albedoTextureUrl = url;
+        if (!url) {
+            this.albedoTexture?.destroy();
+            this.albedoTexture = null;
+            this.albedoTextureView = null;
+            this.albedoBindGroups = new WeakMap();
+            this.writeAlbedoOptions();
+            return;
+        }
+        this.albedoTextureLoading = url;
+        void this.loadAlbedoTexture(url);
+    }
+
+    private async loadAlbedoTexture(url: string): Promise<void> {
+        try {
+            const response = await fetch(url);
+            const blob = await response.blob();
+            let bitmap = await createImageBitmap(blob);
+            const max = this.device.limits.maxTextureDimension2D;
+            if (bitmap.width > max || bitmap.height > max) {
+                const scale = max / Math.max(bitmap.width, bitmap.height);
+                const resized = await createImageBitmap(blob, {
+                    resizeWidth: Math.max(1, Math.round(bitmap.width * scale)),
+                    resizeHeight: Math.max(1, Math.round(bitmap.height * scale)),
+                    resizeQuality: 'high',
+                });
+                bitmap.close();
+                bitmap = resized;
+            }
+            // Another image was chosen while this one decoded.
+            if (this.albedoTextureUrl !== url) {
+                bitmap.close();
+                return;
+            }
+            const texture = this.device.createTexture({
+                size: [bitmap.width, bitmap.height, 1],
+                format: 'rgba8unorm-srgb',
+                usage:
+                    GPUTextureUsage.TEXTURE_BINDING |
+                    GPUTextureUsage.COPY_DST |
+                    GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            this.device.queue.copyExternalImageToTexture(
+                { source: bitmap },
+                { texture },
+                [bitmap.width, bitmap.height]
+            );
+            bitmap.close();
+            this.albedoTexture?.destroy();
+            this.albedoTexture = texture;
+            this.albedoTextureView = texture.createView();
+            this.albedoBindGroups = new WeakMap();
+            this.writeAlbedoOptions();
+        } catch (error) {
+            // Keep the URL recorded so a broken image is not fetched every frame;
+            // whatever texture was already bound stays bound.
+            console.warn('Could not load the cloth albedo image', error);
+            this.writeAlbedoOptions();
+        } finally {
+            if (this.albedoTextureLoading === url) this.albedoTextureLoading = null;
+        }
+    }
+
+    /**
+     * Follow every fabric variant's image. Entries are kept per variant so a
+     * piece made of wool never sees the silk texture, and a variant whose image
+     * was cleared falls back to its colour.
+     */
+    private syncFabricTextures(): void {
+        const fabrics = this.fabrics;
+        if (!fabrics) return;
+        const live = new Set(fabrics.variants.map((variant) => variant.id));
+        for (const id of [...this.fabricTextures.keys()]) {
+            if (!live.has(id)) {
+                const entry = this.fabricTextures.get(id);
+                entry?.texture?.destroy();
+                this.fabricTextures.delete(id);
+            }
+        }
+        for (const variant of fabrics.variants) this.ensureFabricTexture(variant);
+    }
+
+    private ensureFabricTexture(variant: {
+        id: string;
+        albedoImage?: string;
+    }): {
+        url: string | null;
+        loading: string | null;
+        texture: GPUTexture | null;
+        view: GPUTextureView | null;
+        options: GPUBuffer;
+        groups: WeakMap<GPURenderPipeline, GPUBindGroup>;
+    } {
+        let entry = this.fabricTextures.get(variant.id);
+        if (!entry) {
+            const options = this.device.createBuffer({
+                size: 16,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            this.device.queue.writeBuffer(options, 0, new Float32Array([0, 0, 0, 0]));
+            entry = {
+                url: null,
+                loading: null,
+                texture: null,
+                view: null,
+                options,
+                groups: new WeakMap(),
+            };
+            this.fabricTextures.set(variant.id, entry);
+        }
+        const url = variant.albedoImage ?? null;
+        if (url !== entry.url) {
+            entry.url = url;
+            entry.loading = null;
+            entry.texture?.destroy();
+            entry.texture = null;
+            entry.view = null;
+            entry.groups = new WeakMap();
+            this.device.queue.writeBuffer(entry.options, 0, new Float32Array([0, 0, 0, 0]));
+            if (url) {
+                entry.loading = url;
+                void this.loadFabricTexture(variant.id, url, entry);
+            }
+        }
+        return entry;
+    }
+
+    private async loadFabricTexture(
+        variantId: string,
+        url: string,
+        entry: {
+            url: string | null;
+            loading: string | null;
+            texture: GPUTexture | null;
+            view: GPUTextureView | null;
+            options: GPUBuffer;
+            groups: WeakMap<GPURenderPipeline, GPUBindGroup>;
+        }
+    ): Promise<void> {
+        try {
+            const response = await fetch(url);
+            const blob = await response.blob();
+            let bitmap = await createImageBitmap(blob);
+            const max = this.device.limits.maxTextureDimension2D;
+            if (bitmap.width > max || bitmap.height > max) {
+                const scale = max / Math.max(bitmap.width, bitmap.height);
+                const resized = await createImageBitmap(blob, {
+                    resizeWidth: Math.max(1, Math.round(bitmap.width * scale)),
+                    resizeHeight: Math.max(1, Math.round(bitmap.height * scale)),
+                    resizeQuality: 'high',
+                });
+                bitmap.close();
+                bitmap = resized;
+            }
+            if (entry.url !== url || this.fabricTextures.get(variantId) !== entry) {
+                bitmap.close();
+                return;
+            }
+            const texture = this.device.createTexture({
+                size: [bitmap.width, bitmap.height, 1],
+                format: 'rgba8unorm-srgb',
+                usage:
+                    GPUTextureUsage.TEXTURE_BINDING |
+                    GPUTextureUsage.COPY_DST |
+                    GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            this.device.queue.copyExternalImageToTexture(
+                { source: bitmap },
+                { texture },
+                [bitmap.width, bitmap.height]
+            );
+            bitmap.close();
+            entry.texture = texture;
+            entry.view = texture.createView();
+            entry.groups = new WeakMap();
+            this.device.queue.writeBuffer(entry.options, 0, new Float32Array([1, 0, 0, 0]));
+        } catch (error) {
+            console.warn('Could not load a fabric image', error);
+        } finally {
+            if (entry.loading === url) entry.loading = null;
+        }
+    }
+
+    /** Group 2 for a fabric variant on a given cloth pipeline. */
+    private fabricAlbedoBindGroup(
+        pipeline: GPURenderPipeline,
+        variantId: string
+    ): GPUBindGroup | null {
+        const variant = this.fabrics?.variantById(variantId);
+        if (!variant || !this.albedoSampler) return null;
+        const entry = this.ensureFabricTexture(variant);
+        const cached = entry.groups.get(pipeline);
+        if (cached) return cached;
+        const view = entry.view ?? this.defaultAlbedoView;
+        if (!view) return null;
+        const group = this.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(2),
+            entries: [
+                { binding: 0, resource: this.albedoSampler },
+                { binding: 1, resource: view },
+                { binding: 2, resource: { buffer: entry.options } },
+            ],
+        });
+        entry.groups.set(pipeline, group);
+        return group;
+    }
+
+    /** Group 2 for a cloth pipeline: sampler, image, and the use-image flag. */
+    private albedoBindGroup(pipeline: GPURenderPipeline): GPUBindGroup | null {
+        const cached = this.albedoBindGroups.get(pipeline);
+        if (cached) return cached;
+        const view = this.albedoTextureView ?? this.defaultAlbedoView;
+        if (!this.albedoSampler || !this.albedoOptionsBuffer || !view) return null;
+        const group = this.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(2),
+            entries: [
+                { binding: 0, resource: this.albedoSampler },
+                { binding: 1, resource: view },
+                { binding: 2, resource: { buffer: this.albedoOptionsBuffer } },
+            ],
+        });
+        this.albedoBindGroups.set(pipeline, group);
+        return group;
+    }
+
+    /**
+     * Contiguous index runs, one per piece. The topology builds each piece's
+     * triangles together, so a run is everything that piece draws — and a piece
+     * can therefore carry its own fabric inside a single cloth draw.
+     */
+    private clothRuns(cloth: RenderableCloth): Array<{
+        pieceId: string;
+        first: number;
+        count: number;
+    }> {
+        const simulator = cloth as ClothSimulator;
+        const indexBuffer = simulator.getIndexBuffer?.() ?? null;
+        const cached = indexBuffer ? this.clothRunsCache.get(indexBuffer) : undefined;
+        if (cached) return cached;
+        const ids = simulator.getVertexPieceIds?.();
+        const triangles = simulator.getTriangleIndices?.();
+        if (!ids || !triangles || triangles.length < 3) return [];
+        const runs: Array<{ pieceId: string; first: number; count: number }> = [];
+        let current: { pieceId: string; first: number; count: number } | null = null;
+        for (let first = 0; first + 2 < triangles.length; first += 3) {
+            const pieceId = ids[triangles[first]!] ?? '';
+            if (current && current.pieceId === pieceId) {
+                current.count += 3;
+            } else {
+                current = { pieceId, first, count: 3 };
+                runs.push(current);
+            }
+        }
+        if (indexBuffer) this.clothRunsCache.set(indexBuffer, runs);
+        return runs;
+    }
+
+    /**
+     * The material a piece is made of: its fabric variant when it has one, and
+     * the cloth material otherwise.
+     */
+    private pieceMaterial(pieceId: string): { material: MaterialParams; variantId: string | null } {
+        const variantId = this.fabricAssignments.get(pieceId) ?? null;
+        const variant = this.fabrics?.variantById(variantId) ?? null;
+        if (variant) return { material: materialForVariant(variant), variantId: variant.id };
+        return { material: this.clothMaterial(), variantId: null };
+    }
+
+    /** Write one material block per draw run, past the shared base block. */
+    private writeClothLightingBlocks(
+        base: Float32Array<ArrayBuffer>,
+        runs: ReadonlyArray<{ pieceId: string }>
+    ): void {
+        const blocks = runs.length + 1;
+        if (this.clothLightingBytes < blocks * 256) {
+            this.clothLightingBytes = blocks * 256;
+            this.lightingBuffer?.destroy();
+            this.lightingBuffer = this.device.createBuffer({
+                size: this.clothLightingBytes,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            this.clothLightingGroups = new WeakMap();
+        }
+        const buffer = this.lightingBuffer!;
+        this.device.queue.writeBuffer(buffer, 0, base);
+        runs.forEach((run, index) => {
+            const block = new Float32Array(base);
+            const { material } = this.pieceMaterial(run.pieceId);
+            block[20] = material.color[0];
+            block[21] = material.color[1];
+            block[22] = material.color[2];
+            block[27] = material.roughness;
+            block[29] = material.metallic;
+            this.device.queue.writeBuffer(buffer, (index + 1) * 256, block);
+        });
+    }
+
+    /** Group 0 for a cloth pipeline at one material block. */
+    private clothBindGroupAt(
+        pipeline: GPURenderPipeline,
+        offset: number
+    ): GPUBindGroup {
+        if (offset === 0) {
+            return this.createBindGroup(pipeline, this.uniformBuffer!, this.lightingBuffer!);
+        }
+        let byOffset = this.clothLightingGroups.get(pipeline);
+        const cached = byOffset?.get(offset);
+        if (cached) return cached;
+        const group = this.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.uniformBuffer! } },
+                {
+                    binding: 1,
+                    resource: {
+                        buffer: this.lightingBuffer!,
+                        offset,
+                        size: 256,
+                    },
+                },
+            ],
+        });
+        if (!byOffset) {
+            byOffset = new Map();
+            this.clothLightingGroups.set(pipeline, byOffset);
+        }
+        byOffset.set(offset, group);
+        return group;
+    }
+
     /** The material a surface is shaded with, falling back to the demo's colours. */
     private clothMaterial(): MaterialParams {
         return (
@@ -948,10 +1389,9 @@ export class Renderer {
         uniforms[16] = eye[0];
         uniforms[17] = eye[1];
         uniforms[18] = eye[2];
-        uniforms[19] = environment.backgroundBlurLevel;
-        uniforms[20] = environment.exposure;
+        uniforms[19] = environment.exposure;
         // A float slot holding a small integer: exact, and one array to write.
-        uniforms[21] = tonemapIndex(environment.tonemap);
+        uniforms[20] = tonemapIndex(environment.tonemap);
         this.device.queue.writeBuffer(this.backgroundUniformBuffer, 0, uniforms);
 
         if (!this.backgroundBindGroupCache) {
@@ -968,6 +1408,9 @@ export class Renderer {
     }
 
     render(cloth: RenderableCloth, camera: Camera): void {
+        // A moved blur slider rebuilds the background's Gaussian before any
+        // pass is encoded — the light probe itself is untouched.
+        this.environment?.prepareBackground();
         const viewProj = camera.getViewProjectMtx();
         const model = cloth.getModelMatrix();
 
@@ -1034,8 +1477,15 @@ export class Renderer {
             'getColorBuffer' in cloth && typeof (cloth as ClothSimulator).getColorBuffer === 'function'
                 ? (cloth as ClothSimulator).getColorBuffer?.() ?? null
                 : null;
+        const uvBuffer =
+            'getUvBuffer' in cloth && typeof (cloth as ClothSimulator).getUvBuffer === 'function'
+                ? (cloth as ClothSimulator).getUvBuffer?.() ?? null
+                : null;
+        // The colored pipelines declare both vertex buffers; a cloth without
+        // them (the demo's own) keeps the plain pipeline.
+        const colorReady = !!colorBuffer && !!uvBuffer;
         const useVertexColor =
-            !!colorBuffer &&
+            colorReady &&
             'isStrainMapEnabled' in cloth &&
             typeof (cloth as ClothSimulator).isStrainMapEnabled === 'function' &&
             !!(cloth as ClothSimulator).isStrainMapEnabled?.();
@@ -1045,7 +1495,7 @@ export class Renderer {
         // cloth is drawn twice and each pass keeps only its half of the pieces.
         const alphaCloth = 'hasTranslucentPieces' in cloth ? (cloth as ClothSimulator) : null;
         const alphaBuffer =
-            colorBuffer && alphaCloth?.hasTranslucentPieces?.()
+            colorReady && alphaCloth?.hasTranslucentPieces?.()
                 ? alphaCloth.getAlphaBuffer?.() ?? null
                 : null;
         // PBR-only tail of the same buffer: view vector, roughness, exposure,
@@ -1061,10 +1511,20 @@ export class Renderer {
         lightingData[29] = clothMaterial.metallic;
         lightingData[30] = tonemapIndex(this.environment?.tonemap);
 
-        // Write the buffer - WebGPU queue operations are automatically ordered
-        // However, to ensure the write completes before rendering, we'll write it and then
-        // create the encoder (which should ensure ordering)
-        this.device.queue.writeBuffer(this.lightingBuffer!, 0, lightingData);
+        // One material block per piece that has its own fabric, after the
+        // shared base block. With no fabric assignments this is the old single
+        // write and the old single draw.
+        const clothRuns =
+            this.fabrics && this.fabricAssignments.size > 0 ? this.clothRuns(cloth) : [];
+        if (clothRuns.length > 0) {
+            this.writeClothLightingBlocks(lightingData, clothRuns);
+        } else {
+            this.device.queue.writeBuffer(this.lightingBuffer!, 0, lightingData);
+        }
+
+        // Follow the material's images before any bind group is asked for one.
+        this.syncAlbedoTexture();
+        this.syncFabricTextures();
 
         // Get current texture from canvas
         const texture = this.context.getCurrentTexture();
@@ -1078,7 +1538,7 @@ export class Renderer {
         // Note: Bind groups just reference the buffer, they don't cache data
         const pbrPipeline = alphaBuffer
             ? this.pbrClothAlphaPipeline!
-            : colorBuffer && this.pbrClothPipeline
+            : colorReady && this.pbrClothPipeline
               ? this.pbrClothPipeline
               : this.pbrPipeline;
         // PBR needs the environment's textures bound: while the HDRI is still
@@ -1093,7 +1553,7 @@ export class Renderer {
             ? pbrPipeline!
             : alphaBuffer
               ? this.clothAlphaPipeline!
-              : colorBuffer && this.clothPipeline
+              : colorReady && this.clothPipeline
                 ? this.clothPipeline
                 : this.renderPipeline!;
         const clothBindGroup = this.createBindGroup(
@@ -1111,9 +1571,10 @@ export class Renderer {
         const clothBlendBindGroup = clothBlendPipeline
             ? this.createBindGroup(clothBlendPipeline, this.uniformBuffer!, this.lightingBuffer!)
             : null;
-        const blendEnvBindGroup = clothBlendPipeline
-            ? this.pbrEnvBindGroup(clothBlendPipeline)
-            : null;
+        const blendEnvBindGroup =
+            clothBlendPipeline && clothEnvBindGroup
+                ? this.pbrEnvBindGroup(clothBlendPipeline)
+                : null;
         
         const pass = encoder.beginRenderPass({
             colorAttachments: [
@@ -1165,29 +1626,56 @@ export class Renderer {
                 clothPipeline === this.pbrClothPipeline ||
                 clothPipeline === this.clothAlphaPipeline ||
                 clothPipeline === this.pbrClothAlphaPipeline;
+            // The UV buffer comes after color and, when present, alpha.
+            const uvSlot = alphaBuffer ? 4 : 3;
+            const clothAlbedoBindGroup = usesVertexColor
+                ? this.albedoBindGroup(clothPipeline)
+                : null;
             const bindClothBuffers = (bindGroup: GPUBindGroup) => {
                 pass.setBindGroup(0, bindGroup);
                 pass.setVertexBuffer(0, positionBuffer);
                 pass.setVertexBuffer(1, normalBuffer);
                 if (colorBuffer && usesVertexColor) pass.setVertexBuffer(2, colorBuffer);
                 if (alphaBuffer) pass.setVertexBuffer(3, alphaBuffer);
+                if (uvBuffer && usesVertexColor) pass.setVertexBuffer(uvSlot, uvBuffer);
                 pass.setIndexBuffer(indexBuffer, cloth.getIndexFormat());
             };
             if (clothEnvBindGroup) pass.setBindGroup(1, clothEnvBindGroup);
             pass.setPipeline(clothPipeline);
-            bindClothBuffers(clothBindGroup);
-            pass.drawIndexed(cloth.getIndexCount());
+            const drawRanges = (
+                pipeline: GPURenderPipeline,
+                translucent: boolean
+            ): void => {
+                if (clothRuns.length === 0) {
+                    const group = this.clothBindGroupAt(pipeline, 0);
+                    const albedo = this.albedoBindGroup(pipeline);
+                    if (albedo) pass.setBindGroup(2, albedo);
+                    bindClothBuffers(group);
+                    pass.drawIndexed(cloth.getIndexCount());
+                    return;
+                }
+                clothRuns.forEach((run, index) => {
+                    const group = this.clothBindGroupAt(pipeline, (index + 1) * 256);
+                    const { variantId } = this.pieceMaterial(run.pieceId);
+                    const albedo =
+                        (variantId && this.fabricAlbedoBindGroup(pipeline, variantId)) ||
+                        this.albedoBindGroup(pipeline);
+                    if (albedo) pass.setBindGroup(2, albedo);
+                    bindClothBuffers(group);
+                    pass.drawIndexed(run.count, 1, run.first);
+                });
+                void translucent;
+            };
+            drawRanges(clothPipeline, false);
 
             if (clothBlendPipeline && clothBlendBindGroup) {
                 const blendPipeline = clothBlendPipeline;
-                const blendBindGroup = clothBlendBindGroup;
                 // Second pass over the same vertices: the opaque half discards
                 // here, the dimmed half blends over the finished scene.
                 drawTranslucentCloth = () => {
                     if (blendEnvBindGroup) pass.setBindGroup(1, blendEnvBindGroup);
                     pass.setPipeline(blendPipeline);
-                    bindClothBuffers(blendBindGroup);
-                    pass.drawIndexed(cloth.getIndexCount());
+                    drawRanges(blendPipeline, true);
                 };
             }
         }
